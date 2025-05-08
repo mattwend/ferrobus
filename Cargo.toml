@@ -1,0 +1,12 @@
+[package]
+name = "mb-rs" # maybe tiny-mb since it's very small
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bincode = "1.3"
+serde = { version = "1.0", features = ["derive"] }
+thiserror = "2.0.12"
+tokio = { version = "1.4", features = ["io-util", "macros", "net", "rt-multi-thread"] } # remove macros and rt when switching to full library
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }# remove when switching to full library
