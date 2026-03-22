@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2025 tinymb contributors
+
 use bincode::Options;
 use serde::Serialize;
 use std::error::Error;
