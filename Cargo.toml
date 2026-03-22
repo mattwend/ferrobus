@@ -2,6 +2,7 @@
 name = "mb-rs" # maybe tiny-mb since it's very small
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
 
 [dependencies]
 backoff = { version = "0.4.0", features = ["tokio"] }
