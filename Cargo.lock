@@ -136,19 +136,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "mb-rs"
-version = "0.1.0"
-dependencies = [
- "backoff",
- "bincode",
- "serde",
- "thiserror",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "memchr"
 version = "2.7.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -402,6 +389,19 @@ checksum = "8b9ef9bad013ada3808854ceac7b46812a6465ba368859a37e2100283d2d719c"
 dependencies = [
  "cfg-if",
  "once_cell",
+]
+
+[[package]]
+name = "tiny-mb"
+version = "0.1.0"
+dependencies = [
+ "backoff",
+ "bincode",
+ "serde",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
