@@ -1,16 +1,15 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2025 tinymb contributors
 
-use backoff::{future::retry, Error as BackoffError, ExponentialBackoff};
-use std::{
-    net::IpAddr,
-    sync::{Arc, Mutex},
-};
+use backoff::{Error as BackoffError, ExponentialBackoff, future::retry};
+use std::net::IpAddr;
+use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::sync::Mutex;
 use tracing::debug;
 
-use crate::{error::ModbusError, tcp::build_modbus_tcp_adu, ModbusRequest, ModbusResponse};
+use crate::{ModbusRequest, ModbusResponse, error::ModbusError, tcp::build_modbus_tcp_adu};
 
 /// A Modbus TCP connection that sends and receives Modbus TCP frames.
 #[derive(Clone, Debug)]
@@ -92,9 +91,7 @@ impl ModbusTcpConnection {
 
         let op = || async {
             let mut response_buffer = [0u8; 256];
-            let mut stream = stream_mutex_clone.lock().map_err(|_| {
-                BackoffError::transient(ModbusError::LockError("Failed to lock TCP stream".into()))
-            })?;
+            let mut stream = stream_mutex_clone.lock().await;
 
             let adu = build_modbus_tcp_adu(transaction_id, unit_id, pdu)
                 .map_err(|e| BackoffError::permanent(ModbusError::AduBuildError(e.to_string())))?;
