@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2025 tinymb contributors
+
 use thiserror::Error;
 
 /// Custom error type for the Modbus library.
