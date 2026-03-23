@@ -5,8 +5,8 @@ use std::error::Error;
 use tracing::info;
 use tracing_subscriber::{filter::EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
-use mb_rs::tcp::ModbusTcpConnection;
-use mb_rs::ModbusRequest;
+use tiny_mb::ModbusRequest;
+use tiny_mb::tcp::ModbusTcpConnection;
 
 // TODO
 // * error types

@@ -297,7 +297,7 @@ mod tests {
         let values = vec![0x1111, 0x2222];
         let pdu = ModbusRequest::WriteMultipleRegisters {
             starting_address: 0x0001,
-            values: values,
+            values,
         };
 
         // Header: starting_address (0x0001) -> [0x00, 0x01], quantity (2) -> [0x00, 0x02]
