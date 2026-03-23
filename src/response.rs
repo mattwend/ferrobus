@@ -100,7 +100,7 @@ pub fn deserialize_modbus_response(response: &[u8]) -> Result<ModbusResponse, Bo
             if response.len() < 2 + byte_count {
                 return Err("Response length does not match byte count".into());
             }
-            if byte_count % 2 != 0 {
+            if !byte_count.is_multiple_of(2) {
                 return Err("Byte count is not even for register data".into());
             }
             let mut registers = Vec::new();
@@ -121,7 +121,7 @@ pub fn deserialize_modbus_response(response: &[u8]) -> Result<ModbusResponse, Bo
             if response.len() < 2 + byte_count {
                 return Err("Response length does not match byte count".into());
             }
-            if byte_count % 2 != 0 {
+            if !byte_count.is_multiple_of(2) {
                 return Err("Byte count is not even for register data".into());
             }
             let mut registers = Vec::new();

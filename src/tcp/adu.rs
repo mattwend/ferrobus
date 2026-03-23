@@ -5,7 +5,7 @@ use bincode::Options;
 use serde::Serialize;
 use std::error::Error;
 
-use crate::request::{serialize_modbus_request, ModbusRequest};
+use crate::request::{ModbusRequest, serialize_modbus_request};
 
 /// A Modbus TCP header used to build a Modbus TCP frame.
 ///
