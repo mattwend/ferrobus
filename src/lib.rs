@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2025 tinymb contributors
+
 pub mod error;
 pub use error::ModbusError;
 

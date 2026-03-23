@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2025 tinymb contributors
+
 use backoff::{future::retry, Error as BackoffError, ExponentialBackoff};
 use std::{
     net::IpAddr,
