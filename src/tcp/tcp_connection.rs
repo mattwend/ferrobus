@@ -43,38 +43,66 @@ impl ModbusTcpConnection {
         Ok(())
     }
 
+    async fn ensure_connected(
+        stream: &Arc<Mutex<Option<Arc<Mutex<TcpStream>>>>>,
+        address: IpAddr,
+        port: u16,
+    ) -> Result<(), ModbusError> {
+        let needs_connect = {
+            let stream_guard = stream.lock().await;
+            stream_guard.is_none()
+        };
+
+        if needs_connect {
+            let server_addr = format!("{}:{}", address, port);
+            let tcp_stream = TcpStream::connect(&server_addr).await?;
+            debug!("Connected to Modbus TCP server at {}", &server_addr);
+            let mut stream_guard = stream.lock().await;
+            *stream_guard = Some(Arc::new(Mutex::new(tcp_stream)));
+        }
+
+        Ok(())
+    }
+
+    fn response_body_len_from_header(header: &[u8; MBAP_HEADER_LEN]) -> Result<usize, ModbusError> {
+        let pdu_length = u16::from_be_bytes([header[4], header[5]]) as usize;
+        if pdu_length == 0 {
+            return Err(ModbusError::ResponseError(
+                "Invalid MBAP length: missing unit identifier and PDU".to_string(),
+            ));
+        }
+
+        let body_len = pdu_length - 1;
+        let total_length = MBAP_HEADER_LEN + body_len;
+        if total_length > MAX_MODBUS_TCP_FRAME {
+            return Err(ModbusError::ResponseError(format!(
+                "Response exceeds maximum frame size: {} > {}",
+                total_length, MAX_MODBUS_TCP_FRAME
+            )));
+        }
+
+        Ok(body_len)
+    }
+
     pub async fn send_message(
         &mut self,
         pdu: &ModbusRequest,
     ) -> Result<ModbusResponse, ModbusError> {
         let backoff = ExponentialBackoff::default();
-
-        let stream = Arc::new(Mutex::new(self.stream.take()));
-        let unit_id = self.unit_id;
+        let stream = Arc::new(Mutex::new(self.stream.clone()));
         let transaction_id = Arc::clone(&self.transaction_id);
         let address = self.address;
         let port = self.port;
+        let unit_id = self.unit_id;
 
         let result = retry(backoff, || {
             let pdu = pdu.clone();
             let stream = Arc::clone(&stream);
             let transaction_id = Arc::clone(&transaction_id);
             async move {
-                {
-                    let mut stream_guard = stream.lock().await;
-                    if stream_guard.is_none() {
-                        let server_addr = format!("{}:{}", address, port);
-                        let tcp_stream = TcpStream::connect(&server_addr).await.map_err(|e| {
-                            BackoffError::transient(ModbusError::ConnectionError(e))
-                        })?;
-                        *stream_guard = Some(Arc::new(Mutex::new(tcp_stream)));
-                    }
-                }
-
-                let stream_mutex = {
-                    let stream_guard = stream.lock().await;
-                    Arc::clone(stream_guard.as_ref().unwrap())
-                };
+                Self::ensure_connected(&stream, address, port)
+                    .await
+                    .map_err(BackoffError::transient)?;
 
                 let tid = {
                     let mut tid_guard = transaction_id.lock().await;
@@ -86,40 +114,44 @@ impl ModbusTcpConnection {
                 let adu = build_modbus_tcp_adu(tid, unit_id, &pdu);
                 debug!("Modbus TCP Frame: {:02X?}", adu);
 
-                let mut stream = stream_mutex.lock().await;
+                let stream_mutex = {
+                    let stream_guard = stream.lock().await;
+                    Arc::clone(stream_guard.as_ref().expect("connection ensured above"))
+                };
+                let mut socket = stream_mutex.lock().await;
 
-                stream.write_all(&adu).await.map_err(|e| {
-                    warn!("Write error: {}", e);
-                    BackoffError::transient(ModbusError::ConnectionError(e))
-                })?;
-
-                let mut header_buffer = [0u8; MBAP_HEADER_LEN];
-                stream.read_exact(&mut header_buffer).await.map_err(|e| {
-                    warn!("Read header error: {}", e);
-                    BackoffError::transient(ModbusError::ConnectionError(e))
-                })?;
-
-                let pdu_length = u16::from_be_bytes([header_buffer[4], header_buffer[5]]);
-                let total_length = MBAP_HEADER_LEN + pdu_length as usize;
-
-                if total_length > MAX_MODBUS_TCP_FRAME {
-                    return Err(BackoffError::permanent(ModbusError::ResponseError(
-                        format!(
-                            "Response exceeds maximum frame size: {} > {}",
-                            total_length, MAX_MODBUS_TCP_FRAME
-                        ),
-                    )));
+                if let Err(error) = socket.write_all(&adu).await {
+                    warn!("Write error: {}", error);
+                    drop(socket);
+                    let mut stream_guard = stream.lock().await;
+                    *stream_guard = None;
+                    return Err(BackoffError::transient(ModbusError::ConnectionError(error)));
                 }
 
-                let mut response_buffer = vec![0u8; total_length];
+                let mut header_buffer = [0u8; MBAP_HEADER_LEN];
+                if let Err(error) = socket.read_exact(&mut header_buffer).await {
+                    warn!("Read header error: {}", error);
+                    drop(socket);
+                    let mut stream_guard = stream.lock().await;
+                    *stream_guard = None;
+                    return Err(BackoffError::transient(ModbusError::ConnectionError(error)));
+                }
+
+                let body_len = Self::response_body_len_from_header(&header_buffer)
+                    .map_err(BackoffError::permanent)?;
+
+                let mut response_buffer = vec![0u8; MBAP_HEADER_LEN + body_len];
                 response_buffer[..MBAP_HEADER_LEN].copy_from_slice(&header_buffer);
-                stream
+                if let Err(error) = socket
                     .read_exact(&mut response_buffer[MBAP_HEADER_LEN..])
                     .await
-                    .map_err(|e| {
-                        warn!("Read body error: {}", e);
-                        BackoffError::transient(ModbusError::ConnectionError(e))
-                    })?;
+                {
+                    warn!("Read body error: {}", error);
+                    drop(socket);
+                    let mut stream_guard = stream.lock().await;
+                    *stream_guard = None;
+                    return Err(BackoffError::transient(ModbusError::ConnectionError(error)));
+                }
 
                 let received_transaction_id =
                     u16::from_be_bytes([response_buffer[0], response_buffer[1]]);
@@ -133,23 +165,38 @@ impl ModbusTcpConnection {
                 }
 
                 let pdu_bytes = &response_buffer[MBAP_HEADER_LEN..];
-                let resp = ModbusResponse::try_from(pdu_bytes).map_err(BackoffError::permanent)?;
-
-                let aligned =
-                    align_response_to_request(&pdu, resp).map_err(BackoffError::permanent)?;
-
-                Ok(aligned)
+                let response =
+                    ModbusResponse::try_from(pdu_bytes).map_err(BackoffError::permanent)?;
+                align_response_to_request(&pdu, response).map_err(BackoffError::permanent)
             }
         })
         .await;
 
-        if result.is_ok() {
-            let stream_guard = stream.lock().await;
-            if let Some(ref s) = *stream_guard {
-                self.stream = Some(Arc::clone(s));
-            }
-        }
-
+        self.stream = stream.lock().await.clone();
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn response_body_len_excludes_unit_id() {
+        let header = [0x00, 0x01, 0x00, 0x00, 0x00, 0x06, 0x11];
+        let body_len = ModbusTcpConnection::response_body_len_from_header(&header).unwrap();
+        assert_eq!(body_len, 5);
+    }
+
+    #[test]
+    fn response_body_len_rejects_zero_length() {
+        let header = [0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x11];
+        let error = ModbusTcpConnection::response_body_len_from_header(&header).unwrap_err();
+        match error {
+            ModbusError::ResponseError(message) => {
+                assert!(message.contains("Invalid MBAP length"));
+            }
+            other => panic!("Expected ResponseError, got {other:?}"),
+        }
     }
 }
