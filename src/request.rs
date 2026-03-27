@@ -1,10 +1,8 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2025 tinymb contributors
 
-use crate::error::ModbusError;
-
 /// Represents a Modbus request supporting various function codes.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ModbusRequest {
     /// Read Coils (Function code 1)
     ReadCoils {
@@ -78,7 +76,7 @@ fn pack_coils(coils: &[bool]) -> Vec<u8> {
 /// # Returns
 ///
 /// A vector of bytes containing the encoded Modbus PDU.
-pub fn serialize_modbus_request(pdu: &ModbusRequest) -> Result<Vec<u8>, ModbusError> {
+pub fn serialize_modbus_request(pdu: &ModbusRequest) -> Vec<u8> {
     let mut frame = Vec::new();
     match pdu {
         ModbusRequest::ReadCoils {
@@ -145,7 +143,7 @@ pub fn serialize_modbus_request(pdu: &ModbusRequest) -> Result<Vec<u8>, ModbusEr
             }
         }
     }
-    Ok(frame)
+    frame
 }
 
 #[cfg(test)]
@@ -163,7 +161,7 @@ mod tests {
         // starting_address 0x0010 -> [0x00, 0x10]
         // quantity 0x000A -> [0x00, 0x0A]
         let expected = vec![1u8, 0x00, 0x10, 0x00, 0x0A];
-        let result = serialize_modbus_request(&pdu).unwrap();
+        let result = serialize_modbus_request(&pdu);
         assert_eq!(result, expected);
     }
 
@@ -176,7 +174,7 @@ mod tests {
 
         // Expected: function code (2) then header.
         let expected = vec![2u8, 0x00, 0x20, 0x00, 0x05];
-        let result = serialize_modbus_request(&pdu).unwrap();
+        let result = serialize_modbus_request(&pdu);
         assert_eq!(result, expected);
     }
 
@@ -188,7 +186,7 @@ mod tests {
         };
 
         let expected = vec![3u8, 0x01, 0x00, 0x00, 0x03];
-        let result = serialize_modbus_request(&pdu).unwrap();
+        let result = serialize_modbus_request(&pdu);
         assert_eq!(result, expected);
     }
 
@@ -200,7 +198,7 @@ mod tests {
         };
 
         let expected = vec![4u8, 0x00, 0xFF, 0x00, 0x01];
-        let result = serialize_modbus_request(&pdu).unwrap();
+        let result = serialize_modbus_request(&pdu);
         assert_eq!(result, expected);
     }
 
@@ -213,7 +211,7 @@ mod tests {
 
         // Function code (5), then address (0x0010), then coil value (true -> 0xFF00).
         let expected = vec![5u8, 0x00, 0x10, 0xFF, 0x00];
-        let result = serialize_modbus_request(&pdu).unwrap();
+        let result = serialize_modbus_request(&pdu);
         assert_eq!(result, expected);
     }
 
@@ -226,7 +224,7 @@ mod tests {
 
         // Function code (5), then address (0x0010), then coil value (false -> 0x0000).
         let expected = vec![5u8, 0x00, 0x10, 0x00, 0x00];
-        let result = serialize_modbus_request(&pdu).unwrap();
+        let result = serialize_modbus_request(&pdu);
         assert_eq!(result, expected);
     }
 
@@ -239,7 +237,7 @@ mod tests {
 
         // Function code (6), then address (0x0010), then value (0x1234).
         let expected = vec![6u8, 0x00, 0x10, 0x12, 0x34];
-        let result = serialize_modbus_request(&pdu).unwrap();
+        let result = serialize_modbus_request(&pdu);
         assert_eq!(result, expected);
     }
 
@@ -263,7 +261,7 @@ mod tests {
             0x01, // byte count
             0x25, // coil byte
         ];
-        let result = serialize_modbus_request(&pdu).unwrap();
+        let result = serialize_modbus_request(&pdu);
         assert_eq!(result, expected);
     }
 
@@ -287,7 +285,7 @@ mod tests {
             0x11, 0x11, // first register
             0x22, 0x22, // second register
         ];
-        let result = serialize_modbus_request(&pdu).unwrap();
+        let result = serialize_modbus_request(&pdu);
         assert_eq!(result, expected);
     }
 }
