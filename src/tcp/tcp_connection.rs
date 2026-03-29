@@ -21,7 +21,7 @@ const RETRY_MAX_ELAPSED_TIME: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Debug)]
 pub struct ModbusTcpConnection {
-    stream: Option<Arc<Mutex<TcpStream>>>,
+    stream: Arc<Mutex<Option<Arc<Mutex<TcpStream>>>>>,
     address: IpAddr,
     port: u16,
     unit_id: u8,
@@ -31,7 +31,7 @@ pub struct ModbusTcpConnection {
 impl ModbusTcpConnection {
     pub fn new(address: IpAddr, port: u16, unit_id: u8, transaction_id: u16) -> Self {
         Self {
-            stream: None,
+            stream: Arc::new(Mutex::new(None)),
             address,
             port,
             unit_id,
@@ -39,11 +39,12 @@ impl ModbusTcpConnection {
         }
     }
 
-    pub async fn connect(&mut self) -> Result<(), ModbusError> {
+    pub async fn connect(&self) -> Result<(), ModbusError> {
         let server_addr = format!("{}:{}", self.address, self.port);
         let stream = TcpStream::connect(&server_addr).await?;
         debug!("Connected to Modbus TCP server at {}", &server_addr);
-        self.stream = Some(Arc::new(Mutex::new(stream)));
+        let mut stream_guard = self.stream.lock().await;
+        *stream_guard = Some(Arc::new(Mutex::new(stream)));
         Ok(())
     }
 
@@ -52,19 +53,13 @@ impl ModbusTcpConnection {
         address: IpAddr,
         port: u16,
     ) -> Result<(), ModbusError> {
-        let needs_connect = {
-            let stream_guard = stream.lock().await;
-            stream_guard.is_none()
-        };
-
-        if needs_connect {
+        let mut stream_guard = stream.lock().await;
+        if stream_guard.is_none() {
             let server_addr = format!("{}:{}", address, port);
             let tcp_stream = TcpStream::connect(&server_addr).await?;
             debug!("Connected to Modbus TCP server at {}", &server_addr);
-            let mut stream_guard = stream.lock().await;
             *stream_guard = Some(Arc::new(Mutex::new(tcp_stream)));
         }
-
         Ok(())
     }
 
@@ -94,18 +89,15 @@ impl ModbusTcpConnection {
             .build()
     }
 
-    pub async fn send_message(
-        &mut self,
-        pdu: &ModbusRequest,
-    ) -> Result<ModbusResponse, ModbusError> {
+    pub async fn send_message(&self, pdu: &ModbusRequest) -> Result<ModbusResponse, ModbusError> {
         let backoff = Self::retry_backoff();
-        let stream = Arc::new(Mutex::new(self.stream.clone()));
+        let stream = Arc::clone(&self.stream);
         let transaction_id = Arc::clone(&self.transaction_id);
         let address = self.address;
         let port = self.port;
         let unit_id = self.unit_id;
 
-        let result = retry(backoff, || {
+        retry(backoff, || {
             let pdu = pdu.clone();
             let stream = Arc::clone(&stream);
             let transaction_id = Arc::clone(&transaction_id);
@@ -180,10 +172,7 @@ impl ModbusTcpConnection {
                 align_response_to_request(&pdu, response).map_err(BackoffError::permanent)
             }
         })
-        .await;
-
-        self.stream = stream.lock().await.clone();
-        result
+        .await
     }
 }
 
