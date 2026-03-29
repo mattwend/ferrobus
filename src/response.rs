@@ -968,4 +968,116 @@ mod tests {
             Err(ModbusError::RequestResponseMismatch(_))
         ));
     }
+
+    #[test]
+    fn align_response_write_single_coil_match() {
+        let request = ModbusRequest::WriteSingleCoil {
+            address: 0x0010,
+            value: true,
+        };
+        let response = ModbusResponse::WriteSingleCoil {
+            address: 0x0010,
+            value: true,
+        };
+        let result = align_response_to_request(&request, response).unwrap();
+        assert_eq!(
+            result,
+            ModbusResponse::WriteSingleCoil {
+                address: 0x0010,
+                value: true
+            }
+        );
+    }
+
+    #[test]
+    fn align_response_write_single_register_match() {
+        let request = ModbusRequest::WriteSingleRegister {
+            address: 0x0010,
+            value: 0x1234,
+        };
+        let response = ModbusResponse::WriteSingleRegister {
+            address: 0x0010,
+            value: 0x1234,
+        };
+        let result = align_response_to_request(&request, response).unwrap();
+        assert_eq!(
+            result,
+            ModbusResponse::WriteSingleRegister {
+                address: 0x0010,
+                value: 0x1234
+            }
+        );
+    }
+
+    #[test]
+    fn align_response_read_holding_registers_match() {
+        let request = ModbusRequest::ReadHoldingRegisters {
+            starting_address: 0x0000,
+            quantity: 2,
+        };
+        let response = ModbusResponse::ReadHoldingRegisters {
+            registers: vec![0x0102, 0x0304],
+        };
+        let result = align_response_to_request(&request, response).unwrap();
+        assert_eq!(
+            result,
+            ModbusResponse::ReadHoldingRegisters {
+                registers: vec![0x0102, 0x0304]
+            }
+        );
+    }
+
+    #[test]
+    fn align_response_read_input_registers_match() {
+        let request = ModbusRequest::ReadInputRegisters {
+            starting_address: 0x0000,
+            quantity: 1,
+        };
+        let response = ModbusResponse::ReadInputRegisters {
+            registers: vec![0xABCD],
+        };
+        let result = align_response_to_request(&request, response).unwrap();
+        assert_eq!(
+            result,
+            ModbusResponse::ReadInputRegisters {
+                registers: vec![0xABCD]
+            }
+        );
+    }
+
+    #[test]
+    fn align_response_write_multiple_registers_match() {
+        let request = ModbusRequest::WriteMultipleRegisters {
+            starting_address: 0x0001,
+            values: vec![0x1111, 0x2222],
+        };
+        let response = ModbusResponse::WriteMultipleRegisters {
+            starting_address: 0x0001,
+            quantity: 2,
+        };
+        let result = align_response_to_request(&request, response).unwrap();
+        assert_eq!(
+            result,
+            ModbusResponse::WriteMultipleRegisters {
+                starting_address: 0x0001,
+                quantity: 2
+            }
+        );
+    }
+
+    #[test]
+    fn align_response_read_discrete_inputs_short() {
+        let request = ModbusRequest::ReadDiscreteInputs {
+            starting_address: 0x0000,
+            quantity: 10,
+        };
+        let response = ModbusResponse::ReadDiscreteInputs {
+            inputs: vec![false; 5],
+        };
+        let result = align_response_to_request(&request, response);
+        assert!(matches!(
+            result,
+            Err(ModbusError::RequestResponseMismatch(_))
+        ));
+    }
 }
