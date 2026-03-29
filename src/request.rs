@@ -288,4 +288,106 @@ mod tests {
         let result = serialize_modbus_request(&pdu);
         assert_eq!(result, expected);
     }
+
+    #[test]
+    fn test_pack_coils_empty() {
+        let bytes = pack_coils(&[]);
+        assert!(bytes.is_empty());
+    }
+
+    #[test]
+    fn test_pack_coils_single_coil() {
+        let bytes = pack_coils(&[true]);
+        assert_eq!(bytes, &[0x01]);
+    }
+
+    #[test]
+    fn test_pack_coils_exactly_eight() {
+        let coils = vec![true, false, true, false, true, false, true, false];
+        let bytes = pack_coils(&coils);
+        assert_eq!(bytes.len(), 1);
+        assert_eq!(bytes[0], 0x55);
+    }
+
+    #[test]
+    fn test_pack_coils_nine_bits() {
+        let coils = vec![true; 9];
+        let bytes = pack_coils(&coils);
+        assert_eq!(bytes.len(), 2);
+        assert_eq!(bytes[0], 0xFF);
+        assert_eq!(bytes[1], 0x01);
+    }
+
+    #[test]
+    fn test_pack_coils_alternating() {
+        let bytes = pack_coils(&[
+            true, false, true, false, true, false, true, false, true, false,
+        ]);
+        assert_eq!(bytes.len(), 2);
+        assert_eq!(bytes[0], 0x55);
+        assert_eq!(bytes[1], 0x01);
+    }
+
+    #[test]
+    fn test_write_multiple_coils_exactly_8_coils() {
+        let coils = vec![true, false, true, false, true, false, true, false];
+        let pdu = ModbusRequest::WriteMultipleCoils {
+            starting_address: 0x0000,
+            values: coils,
+        };
+        let result = serialize_modbus_request(&pdu);
+        assert_eq!(result[5], 1);
+        assert_eq!(result[6], 0x55);
+    }
+
+    #[test]
+    fn test_write_multiple_coils_9_coils() {
+        let coils = vec![true; 9];
+        let pdu = ModbusRequest::WriteMultipleCoils {
+            starting_address: 0x0000,
+            values: coils,
+        };
+        let result = serialize_modbus_request(&pdu);
+        assert_eq!(result[5], 2);
+        assert_eq!(result[6], 0xFF);
+        assert_eq!(result[7], 0x01);
+    }
+
+    #[test]
+    fn test_pack_coils_all_false() {
+        let bytes = pack_coils(&[false, false, false, false]);
+        assert_eq!(bytes, &[0x00]);
+    }
+
+    #[test]
+    fn test_write_multiple_registers_empty() {
+        let pdu = ModbusRequest::WriteMultipleRegisters {
+            starting_address: 0x0001,
+            values: vec![],
+        };
+        let expected = vec![
+            16u8, // function code
+            0x00, 0x01, // starting_address
+            0x00, 0x00, // quantity
+            0x00, // byte count
+        ];
+        let result = serialize_modbus_request(&pdu);
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_write_multiple_coils_empty() {
+        let pdu = ModbusRequest::WriteMultipleCoils {
+            starting_address: 0x0001,
+            values: vec![],
+        };
+        let expected = vec![
+            15u8, // function code
+            0x00, 0x01, // starting_address
+            0x00, 0x00, // quantity
+            0x00, // byte count
+        ];
+        let result = serialize_modbus_request(&pdu);
+        assert_eq!(result, expected);
+    }
 }

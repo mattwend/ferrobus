@@ -199,4 +199,44 @@ mod tests {
             other => panic!("Expected ResponseError, got {other:?}"),
         }
     }
+
+    #[test]
+    fn response_body_len_minimum_valid() {
+        let header = [0x00, 0x01, 0x00, 0x00, 0x00, 0x02, 0x11];
+        let body_len = ModbusTcpConnection::response_body_len_from_header(&header).unwrap();
+        assert_eq!(body_len, 1);
+    }
+
+    #[test]
+    fn response_body_len_maximum_frame() {
+        let header = [0x00, 0x01, 0x00, 0x00, 0x00, 0xFE, 0x11];
+        let body_len = ModbusTcpConnection::response_body_len_from_header(&header).unwrap();
+        assert_eq!(body_len, 253);
+    }
+
+    #[test]
+    fn response_body_len_rejects_oversized_frame() {
+        let header = [0x00, 0x01, 0x00, 0x00, 0x01, 0x00, 0x11];
+        let error = ModbusTcpConnection::response_body_len_from_header(&header).unwrap_err();
+        match error {
+            ModbusError::ResponseError(message) => {
+                assert!(message.contains("exceeds maximum frame size"));
+            }
+            other => panic!("Expected ResponseError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn response_body_len_single_byte_pdu() {
+        let header = [0x00, 0x01, 0x00, 0x00, 0x00, 0x03, 0x11];
+        let body_len = ModbusTcpConnection::response_body_len_from_header(&header).unwrap();
+        assert_eq!(body_len, 2);
+    }
+
+    #[test]
+    fn response_body_len_zero_length_pdu() {
+        let header = [0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x11];
+        let body_len = ModbusTcpConnection::response_body_len_from_header(&header).unwrap();
+        assert_eq!(body_len, 0);
+    }
 }

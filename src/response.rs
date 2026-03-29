@@ -163,31 +163,37 @@ pub fn align_response_to_request(
             Ok(response)
         }
         (
-            ModbusRequest::WriteMultipleCoils { values, .. },
+            ModbusRequest::WriteMultipleCoils {
+                starting_address,
+                values,
+            },
             ModbusResponse::WriteMultipleCoils {
-                quantity: resp_qty, ..
+                starting_address: response_address,
+                quantity: resp_qty,
             },
         ) => {
             let qty = values.len() as u16;
-            if qty != *resp_qty {
+            if starting_address != response_address || qty != *resp_qty {
                 return Err(ModbusError::RequestResponseMismatch(format!(
-                    "WriteMultipleCoils: wrote {} coils but server acknowledged {}",
-                    qty, resp_qty
+                    "WriteMultipleCoils: wrote address {starting_address} quantity {qty} but server acknowledged address {response_address} quantity {resp_qty}",
                 )));
             }
             Ok(response)
         }
         (
-            ModbusRequest::WriteMultipleRegisters { values, .. },
+            ModbusRequest::WriteMultipleRegisters {
+                starting_address,
+                values,
+            },
             ModbusResponse::WriteMultipleRegisters {
-                quantity: resp_qty, ..
+                starting_address: response_address,
+                quantity: resp_qty,
             },
         ) => {
             let qty = values.len() as u16;
-            if qty != *resp_qty {
+            if starting_address != response_address || qty != *resp_qty {
                 return Err(ModbusError::RequestResponseMismatch(format!(
-                    "WriteMultipleRegisters: wrote {} registers but server acknowledged {}",
-                    qty, resp_qty
+                    "WriteMultipleRegisters: wrote address {starting_address} quantity {qty} but server acknowledged address {response_address} quantity {resp_qty}",
                 )));
             }
             Ok(response)
@@ -686,6 +692,23 @@ mod tests {
     }
 
     #[test]
+    fn test_align_response_write_single_coil_address_mismatch() {
+        let request = ModbusRequest::WriteSingleCoil {
+            address: 0x0010,
+            value: true,
+        };
+        let response = ModbusResponse::WriteSingleCoil {
+            address: 0x0011,
+            value: true,
+        };
+        let result = align_response_to_request(&request, response);
+        assert!(matches!(
+            result,
+            Err(ModbusError::RequestResponseMismatch(_))
+        ));
+    }
+
+    #[test]
     fn test_align_response_write_single_register_address_mismatch() {
         let request = ModbusRequest::WriteSingleRegister {
             address: 0x0010,
@@ -734,5 +757,215 @@ mod tests {
         };
         let result = align_response_to_request(&request, response);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_deserialize_unsupported_function_code() {
+        let response = vec![7u8];
+        let result = deserialize_modbus_response(&response);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            ModbusError::DeserializationError(msg) => {
+                assert!(msg.contains("Unsupported function code"));
+            }
+            e => panic!("Expected DeserializationError, got {:?}", e),
+        }
+    }
+
+    #[test]
+    fn test_deserialize_write_single_coil_invalid_value() {
+        let response = vec![5u8, 0x00, 0x10, 0x01, 0x00];
+        let result = deserialize_modbus_response(&response);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            ModbusError::DeserializationError(msg) => {
+                assert!(msg.contains("Invalid coil value"));
+            }
+            e => panic!("Expected DeserializationError, got {:?}", e),
+        }
+    }
+
+    #[test]
+    fn test_deserialize_read_holding_registers_odd_byte_count() {
+        let response = vec![3u8, 3u8, 0x01, 0x02, 0x03];
+        let result = deserialize_modbus_response(&response);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            ModbusError::DeserializationError(msg) => {
+                assert!(msg.contains("not even"));
+            }
+            e => panic!("Expected DeserializationError, got {:?}", e),
+        }
+    }
+
+    #[test]
+    fn test_deserialize_read_coils_response_too_short_for_byte_count() {
+        let response = vec![1u8, 5u8, 0x01, 0x02];
+        let result = deserialize_modbus_response(&response);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            ModbusError::DeserializationError(msg) => {
+                assert!(msg.contains("does not match byte count"));
+            }
+            e => panic!("Expected DeserializationError, got {:?}", e),
+        }
+    }
+
+    #[test]
+    fn test_deserialize_read_holding_registers_response_too_short_for_byte_count() {
+        let response = vec![3u8, 4u8, 0x01, 0x02];
+        let result = deserialize_modbus_response(&response);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            ModbusError::DeserializationError(msg) => {
+                assert!(msg.contains("does not match byte count"));
+            }
+            e => panic!("Expected DeserializationError, got {:?}", e),
+        }
+    }
+
+    #[test]
+    fn test_deserialize_write_single_coil_too_short() {
+        let response = vec![5u8, 0x00, 0x10, 0xFF];
+        let result = deserialize_modbus_response(&response);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_deserialize_write_single_register_too_short() {
+        let response = vec![6u8, 0x00, 0x10, 0x12];
+        let result = deserialize_modbus_response(&response);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_deserialize_write_multiple_coils_too_short() {
+        let response = vec![15u8, 0x00, 0x01, 0x00];
+        let result = deserialize_modbus_response(&response);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_deserialize_write_multiple_registers_too_short() {
+        let response = vec![16u8, 0x00, 0x01, 0x00];
+        let result = deserialize_modbus_response(&response);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_deserialize_exception_too_short() {
+        let response = vec![0x81u8];
+        let result = deserialize_modbus_response(&response);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_try_from_slice() {
+        let response = vec![3u8, 4u8, 0x01, 0x02, 0x03, 0x04];
+        let result = ModbusResponse::try_from(response.as_slice()).unwrap();
+        assert_eq!(
+            result,
+            ModbusResponse::ReadHoldingRegisters {
+                registers: vec![0x0102, 0x0304]
+            }
+        );
+    }
+
+    #[test]
+    fn test_try_from_vec() {
+        let response = vec![3u8, 4u8, 0x01, 0x02, 0x03, 0x04];
+        let result = ModbusResponse::try_from(response).unwrap();
+        assert_eq!(
+            result,
+            ModbusResponse::ReadHoldingRegisters {
+                registers: vec![0x0102, 0x0304]
+            }
+        );
+    }
+
+    #[test]
+    fn test_try_from_slice_propagates_error() {
+        let error = ModbusResponse::try_from([7u8].as_slice()).unwrap_err();
+        match error {
+            ModbusError::DeserializationError(message) => {
+                assert!(message.contains("Unsupported function code"));
+            }
+            other => panic!("Expected DeserializationError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_align_response_read_input_registers_count_mismatch() {
+        let request = ModbusRequest::ReadInputRegisters {
+            starting_address: 0x0000,
+            quantity: 3,
+        };
+        let response = ModbusResponse::ReadInputRegisters {
+            registers: vec![0x0102, 0x0304],
+        };
+        let result = align_response_to_request(&request, response);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_align_response_write_single_register_value_mismatch() {
+        let request = ModbusRequest::WriteSingleRegister {
+            address: 0x0010,
+            value: 0x1234,
+        };
+        let response = ModbusResponse::WriteSingleRegister {
+            address: 0x0010,
+            value: 0x5678,
+        };
+        let result = align_response_to_request(&request, response);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_align_response_write_multiple_registers_quantity_mismatch() {
+        let request = ModbusRequest::WriteMultipleRegisters {
+            starting_address: 0x0000,
+            values: vec![0x1111, 0x2222, 0x3333],
+        };
+        let response = ModbusResponse::WriteMultipleRegisters {
+            starting_address: 0x0000,
+            quantity: 2,
+        };
+        let result = align_response_to_request(&request, response);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_align_response_write_multiple_coils_address_mismatch() {
+        let request = ModbusRequest::WriteMultipleCoils {
+            starting_address: 0x0001,
+            values: vec![true, false, true],
+        };
+        let response = ModbusResponse::WriteMultipleCoils {
+            starting_address: 0x0002,
+            quantity: 3,
+        };
+        let result = align_response_to_request(&request, response);
+        assert!(matches!(
+            result,
+            Err(ModbusError::RequestResponseMismatch(_))
+        ));
+    }
+
+    #[test]
+    fn test_align_response_write_multiple_registers_address_mismatch() {
+        let request = ModbusRequest::WriteMultipleRegisters {
+            starting_address: 0x0001,
+            values: vec![0x1111, 0x2222, 0x3333],
+        };
+        let response = ModbusResponse::WriteMultipleRegisters {
+            starting_address: 0x0002,
+            quantity: 3,
+        };
+        let result = align_response_to_request(&request, response);
+        assert!(matches!(
+            result,
+            Err(ModbusError::RequestResponseMismatch(_))
+        ));
     }
 }
