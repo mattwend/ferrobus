@@ -9,12 +9,6 @@ pub enum ModbusError {
     #[error("TCP connection error: {0}")]
     ConnectionError(#[from] std::io::Error),
 
-    #[error("Lock error: {0}")]
-    LockError(String),
-
-    #[error("ADU build error: {0}")]
-    AduBuildError(String),
-
     #[error("Response error: {0}")]
     ResponseError(String),
 
@@ -24,6 +18,9 @@ pub enum ModbusError {
     #[error("Unexpected response length: expected at least {expected}, got {actual}")]
     ResponseTooShort { expected: usize, actual: usize },
 
-    #[error("Backoff operation failed after retries: {0}")]
-    BackoffError(String),
+    #[error("Transaction ID mismatch: sent {expected}, received {actual}")]
+    TransactionIdMismatch { expected: u16, actual: u16 },
+
+    #[error("Request/response mismatch: {0}")]
+    RequestResponseMismatch(String),
 }

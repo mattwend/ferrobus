@@ -1,11 +1,8 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2025 tinymb contributors
 
-use bincode::Options;
-use std::error::Error;
-
 /// Represents a Modbus request supporting various function codes.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ModbusRequest {
     /// Read Coils (Function code 1)
     ReadCoils {
@@ -67,8 +64,7 @@ fn pack_coils(coils: &[bool]) -> Vec<u8> {
     bytes
 }
 
-/// Encodes a Modbus request into a Modbus PDU (Protocol Data Unit) using bincode
-/// with fixed-length integer encoding and big-endian (network) byte order.
+/// Encodes a Modbus request into a Modbus PDU (Protocol Data Unit).
 ///
 /// The resulting byte vector starts with the function code followed by the
 /// encoded payload as defined by the Modbus specification.
@@ -80,97 +76,74 @@ fn pack_coils(coils: &[bool]) -> Vec<u8> {
 /// # Returns
 ///
 /// A vector of bytes containing the encoded Modbus PDU.
-pub fn serialize_modbus_request(pdu: &ModbusRequest) -> Result<Vec<u8>, Box<dyn Error>> {
-    // Use a bincode configuration that ensures fixed-length encoding and big-endian order.
-    let config = bincode::DefaultOptions::new()
-        .with_fixint_encoding()
-        .with_big_endian();
-
+pub fn serialize_modbus_request(pdu: &ModbusRequest) -> Vec<u8> {
     let mut frame = Vec::new();
     match pdu {
         ModbusRequest::ReadCoils {
             starting_address,
             quantity,
-        } => {
-            // Function code 1.
-            frame.push(1u8);
-            let payload = config.serialize(&(*starting_address, *quantity))?;
-            frame.extend_from_slice(&payload);
         }
-        ModbusRequest::ReadDiscreteInputs {
+        | ModbusRequest::ReadDiscreteInputs {
+            starting_address,
+            quantity,
+        }
+        | ModbusRequest::ReadHoldingRegisters {
+            starting_address,
+            quantity,
+        }
+        | ModbusRequest::ReadInputRegisters {
             starting_address,
             quantity,
         } => {
-            // Function code 2.
-            frame.push(2u8);
-            let payload = config.serialize(&(*starting_address, *quantity))?;
-            frame.extend_from_slice(&payload);
-        }
-        ModbusRequest::ReadHoldingRegisters {
-            starting_address,
-            quantity,
-        } => {
-            // Function code 3.
-            frame.push(3u8);
-            let payload = config.serialize(&(*starting_address, *quantity))?;
-            frame.extend_from_slice(&payload);
-        }
-        ModbusRequest::ReadInputRegisters {
-            starting_address,
-            quantity,
-        } => {
-            // Function code 4.
-            frame.push(4u8);
-            let payload = config.serialize(&(*starting_address, *quantity))?;
-            frame.extend_from_slice(&payload);
+            let function_code = match pdu {
+                ModbusRequest::ReadCoils { .. } => 1,
+                ModbusRequest::ReadDiscreteInputs { .. } => 2,
+                ModbusRequest::ReadHoldingRegisters { .. } => 3,
+                ModbusRequest::ReadInputRegisters { .. } => 4,
+                _ => unreachable!(),
+            };
+            frame.push(function_code);
+            frame.extend_from_slice(&starting_address.to_be_bytes());
+            frame.extend_from_slice(&quantity.to_be_bytes());
         }
         ModbusRequest::WriteSingleCoil { address, value } => {
-            // Function code 5.
             frame.push(5u8);
-            // Per Modbus spec, true (ON) is 0xFF00 and false (OFF) is 0x0000.
+            frame.extend_from_slice(&address.to_be_bytes());
             let coil_value: u16 = if *value { 0xFF00 } else { 0x0000 };
-            let payload = config.serialize(&(*address, coil_value))?;
-            frame.extend_from_slice(&payload);
+            frame.extend_from_slice(&coil_value.to_be_bytes());
         }
         ModbusRequest::WriteSingleRegister { address, value } => {
-            // Function code 6.
             frame.push(6u8);
-            let payload = config.serialize(&(*address, *value))?;
-            frame.extend_from_slice(&payload);
+            frame.extend_from_slice(&address.to_be_bytes());
+            frame.extend_from_slice(&value.to_be_bytes());
         }
         ModbusRequest::WriteMultipleCoils {
             starting_address,
             values,
         } => {
-            // Function code 15.
             frame.push(15u8);
             let quantity = values.len() as u16;
+            frame.extend_from_slice(&starting_address.to_be_bytes());
+            frame.extend_from_slice(&quantity.to_be_bytes());
             let coil_bytes = pack_coils(values);
-            let byte_count = coil_bytes.len() as u8;
-            let header = config.serialize(&(*starting_address, quantity))?;
-            frame.extend_from_slice(&header);
-            frame.push(byte_count);
+            frame.push(coil_bytes.len() as u8);
             frame.extend_from_slice(&coil_bytes);
         }
         ModbusRequest::WriteMultipleRegisters {
             starting_address,
             values,
         } => {
-            // Function code 16.
             frame.push(16u8);
             let quantity = values.len() as u16;
-            let byte_count = (quantity * 2) as u8;
-            let header = config.serialize(&(*starting_address, quantity))?;
-            frame.extend_from_slice(&header);
-            frame.push(byte_count);
-            // Serialize each register value (u16).
+            frame.extend_from_slice(&starting_address.to_be_bytes());
+            frame.extend_from_slice(&quantity.to_be_bytes());
+            frame.push((quantity * 2) as u8);
             for reg in values {
-                let reg_bytes = config.serialize(reg)?;
-                frame.extend_from_slice(&reg_bytes);
+                frame.extend_from_slice(&reg.to_be_bytes());
             }
         }
     }
-    Ok(frame)
+    frame
 }
 
 #[cfg(test)]
@@ -188,7 +161,7 @@ mod tests {
         // starting_address 0x0010 -> [0x00, 0x10]
         // quantity 0x000A -> [0x00, 0x0A]
         let expected = vec![1u8, 0x00, 0x10, 0x00, 0x0A];
-        let result = serialize_modbus_request(&pdu).unwrap();
+        let result = serialize_modbus_request(&pdu);
         assert_eq!(result, expected);
     }
 
@@ -201,7 +174,7 @@ mod tests {
 
         // Expected: function code (2) then header.
         let expected = vec![2u8, 0x00, 0x20, 0x00, 0x05];
-        let result = serialize_modbus_request(&pdu).unwrap();
+        let result = serialize_modbus_request(&pdu);
         assert_eq!(result, expected);
     }
 
@@ -213,7 +186,7 @@ mod tests {
         };
 
         let expected = vec![3u8, 0x01, 0x00, 0x00, 0x03];
-        let result = serialize_modbus_request(&pdu).unwrap();
+        let result = serialize_modbus_request(&pdu);
         assert_eq!(result, expected);
     }
 
@@ -225,7 +198,7 @@ mod tests {
         };
 
         let expected = vec![4u8, 0x00, 0xFF, 0x00, 0x01];
-        let result = serialize_modbus_request(&pdu).unwrap();
+        let result = serialize_modbus_request(&pdu);
         assert_eq!(result, expected);
     }
 
@@ -238,7 +211,7 @@ mod tests {
 
         // Function code (5), then address (0x0010), then coil value (true -> 0xFF00).
         let expected = vec![5u8, 0x00, 0x10, 0xFF, 0x00];
-        let result = serialize_modbus_request(&pdu).unwrap();
+        let result = serialize_modbus_request(&pdu);
         assert_eq!(result, expected);
     }
 
@@ -251,7 +224,7 @@ mod tests {
 
         // Function code (5), then address (0x0010), then coil value (false -> 0x0000).
         let expected = vec![5u8, 0x00, 0x10, 0x00, 0x00];
-        let result = serialize_modbus_request(&pdu).unwrap();
+        let result = serialize_modbus_request(&pdu);
         assert_eq!(result, expected);
     }
 
@@ -264,7 +237,7 @@ mod tests {
 
         // Function code (6), then address (0x0010), then value (0x1234).
         let expected = vec![6u8, 0x00, 0x10, 0x12, 0x34];
-        let result = serialize_modbus_request(&pdu).unwrap();
+        let result = serialize_modbus_request(&pdu);
         assert_eq!(result, expected);
     }
 
@@ -288,7 +261,7 @@ mod tests {
             0x01, // byte count
             0x25, // coil byte
         ];
-        let result = serialize_modbus_request(&pdu).unwrap();
+        let result = serialize_modbus_request(&pdu);
         assert_eq!(result, expected);
     }
 
@@ -312,7 +285,7 @@ mod tests {
             0x11, 0x11, // first register
             0x22, 0x22, // second register
         ];
-        let result = serialize_modbus_request(&pdu).unwrap();
+        let result = serialize_modbus_request(&pdu);
         assert_eq!(result, expected);
     }
 }
