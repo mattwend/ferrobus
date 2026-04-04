@@ -336,18 +336,30 @@ async fn server_disconnects_on_header_read() {
 
 #[tokio::test]
 async fn server_sends_invalid_mbap_length() {
-    let addr = spawn_mock_server(|mut stream| {
-        tokio::spawn(async move {
-            let mut header = [0u8; 7];
-            stream.read_exact(&mut header).await.unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
 
-            header[4] = 0;
-            header[5] = 0;
+    tokio::spawn(async move {
+        let (mut first_stream, _) = listener.accept().await.unwrap();
+        let mut first_header = [0u8; 7];
+        first_stream.read_exact(&mut first_header).await.unwrap();
+        first_header[4] = 0;
+        first_header[5] = 0;
+        first_stream.write_all(&first_header).await.unwrap();
 
-            stream.write_all(&header).await.unwrap();
-        });
-    })
-    .await;
+        let (mut second_stream, _) = listener.accept().await.unwrap();
+        let mut second_header = [0u8; 7];
+        second_stream.read_exact(&mut second_header).await.unwrap();
+        let tid = u16::from_be_bytes([second_header[0], second_header[1]]);
+        let unit_id = second_header[6];
+
+        let pdu_len = 5;
+        let mut pdu = vec![0u8; pdu_len as usize];
+        second_stream.read_exact(&mut pdu).await.unwrap();
+
+        let response = make_read_coils_response(tid, unit_id, &[true, false]);
+        second_stream.write_all(&response).await.unwrap();
+    });
 
     let conn = ModbusTcpConnection::new(addr.ip(), addr.port(), 1, 0);
     conn.connect().await.unwrap();
@@ -358,11 +370,10 @@ async fn server_sends_invalid_mbap_length() {
     };
     let result = conn.send_message(&request).await;
 
-    assert!(result.is_err());
-    match result.unwrap_err() {
-        tiny_mb::ModbusError::ResponseError(msg) => {
-            assert!(msg.contains("Invalid MBAP length"));
+    assert_eq!(
+        result.unwrap(),
+        ModbusResponse::ReadCoils {
+            coils: vec![true, false]
         }
-        e => panic!("Expected ResponseError, got {:?}", e),
-    }
+    );
 }
