@@ -8,12 +8,6 @@ use tracing_subscriber::{filter::EnvFilter, fmt, layer::SubscriberExt, util::Sub
 use tiny_mb::ModbusRequest;
 use tiny_mb::tcp::ModbusTcpConnection;
 
-// TODO
-// * error types
-// * retry logic
-// * cli tool
-// * tcp_connection module tests
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     tracing_subscriber::registry()
