@@ -2,9 +2,11 @@
 // Copyright (c) 2025 tinymb contributors
 
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::time::sleep;
 
 use crate::ModbusRequest;
 use crate::request::serialize_modbus_request;
@@ -92,6 +94,22 @@ where
     Ok(addr)
 }
 
+pub async fn spawn_slow_server(delay: Duration) -> std::io::Result<SocketAddr> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let _stream = stream;
+                sleep(delay).await;
+            });
+        }
+    });
+
+    Ok(addr)
+}
+
 pub async fn write_frame(stream: &mut TcpStream, frame: &[u8]) -> std::io::Result<()> {
     stream.write_all(frame).await
 }
@@ -103,6 +121,7 @@ pub fn serialized_request_pdu(request: &ModbusRequest) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::net::TcpStream;
 
     #[test]
     fn exception_frame_sets_exception_bit() {
@@ -135,5 +154,12 @@ mod tests {
             serialized_request_pdu(&request),
             serialize_modbus_request(&request)
         );
+    }
+
+    #[tokio::test]
+    async fn spawn_slow_server_accepts_connections() {
+        let addr = spawn_slow_server(Duration::from_millis(10)).await.unwrap();
+
+        TcpStream::connect(addr).await.unwrap();
     }
 }
