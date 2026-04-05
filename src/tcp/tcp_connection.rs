@@ -22,7 +22,26 @@ use crate::{ModbusRequest, ModbusResponse, error::ModbusError, tcp::build_modbus
 const MBAP_HEADER_LEN: usize = 7;
 const MAX_MODBUS_TCP_FRAME: usize = 260;
 const RETRY_MAX_ELAPSED_TIME: Duration = Duration::from_secs(2);
-const IO_TIMEOUT: Duration = Duration::from_secs(5);
+const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const DEFAULT_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ModbusTcpTimeouts {
+    pub connect_timeout: Duration,
+    pub write_timeout: Duration,
+    pub read_timeout: Duration,
+}
+
+impl Default for ModbusTcpTimeouts {
+    fn default() -> Self {
+        Self {
+            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+            write_timeout: DEFAULT_WRITE_TIMEOUT,
+            read_timeout: DEFAULT_READ_TIMEOUT,
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct ModbusTcpConnection {
@@ -31,22 +50,48 @@ pub struct ModbusTcpConnection {
     port: u16,
     unit_id: u8,
     transaction_id: Arc<AtomicU16>,
+    timeouts: ModbusTcpTimeouts,
 }
 
 impl ModbusTcpConnection {
     pub fn new(address: IpAddr, port: u16, unit_id: u8, transaction_id: u16) -> Self {
+        Self::with_timeouts(
+            address,
+            port,
+            unit_id,
+            transaction_id,
+            ModbusTcpTimeouts::default(),
+        )
+    }
+
+    pub fn with_timeouts(
+        address: IpAddr,
+        port: u16,
+        unit_id: u8,
+        transaction_id: u16,
+        timeouts: ModbusTcpTimeouts,
+    ) -> Self {
         Self {
             stream: Arc::new(Mutex::new(None)),
             address,
             port,
             unit_id,
             transaction_id: Arc::new(AtomicU16::new(transaction_id)),
+            timeouts,
         }
     }
 
-    async fn connect_stream(address: IpAddr, port: u16) -> Result<TcpStream, ModbusError> {
+    pub fn timeouts(&self) -> ModbusTcpTimeouts {
+        self.timeouts
+    }
+
+    async fn connect_stream(
+        address: IpAddr,
+        port: u16,
+        connect_timeout: Duration,
+    ) -> Result<TcpStream, ModbusError> {
         let server_addr = format!("{}:{}", address, port);
-        let stream = timeout(IO_TIMEOUT, TcpStream::connect(&server_addr))
+        let stream = timeout(connect_timeout, TcpStream::connect(&server_addr))
             .await
             .map_err(|_| {
                 ModbusError::ConnectionError(std::io::Error::new(
@@ -60,7 +105,8 @@ impl ModbusTcpConnection {
     }
 
     pub async fn connect(&self) -> Result<(), ModbusError> {
-        let stream = Self::connect_stream(self.address, self.port).await?;
+        let stream =
+            Self::connect_stream(self.address, self.port, self.timeouts.connect_timeout).await?;
         let mut stream_guard = self.stream.lock().await;
         *stream_guard = Some(stream);
         Ok(())
@@ -92,8 +138,12 @@ impl ModbusTcpConnection {
             .build()
     }
 
-    async fn exchange_frame(socket: &mut TcpStream, adu: &[u8]) -> Result<Vec<u8>, ModbusError> {
-        match timeout(IO_TIMEOUT, socket.write_all(adu)).await {
+    async fn exchange_frame(
+        socket: &mut TcpStream,
+        adu: &[u8],
+        timeouts: ModbusTcpTimeouts,
+    ) -> Result<Vec<u8>, ModbusError> {
+        match timeout(timeouts.write_timeout, socket.write_all(adu)).await {
             Ok(Ok(())) => {}
             Ok(Err(error)) => return Err(ModbusError::ConnectionError(error)),
             Err(_) => {
@@ -107,7 +157,7 @@ impl ModbusTcpConnection {
         socket.flush().await.map_err(ModbusError::ConnectionError)?;
 
         let mut header_buffer = [0u8; MBAP_HEADER_LEN];
-        match timeout(IO_TIMEOUT, socket.read_exact(&mut header_buffer)).await {
+        match timeout(timeouts.read_timeout, socket.read_exact(&mut header_buffer)).await {
             Ok(Ok(_)) => {}
             Ok(Err(error)) => return Err(ModbusError::ConnectionError(error)),
             Err(_) => {
@@ -128,7 +178,7 @@ impl ModbusTcpConnection {
         response_buffer[..MBAP_HEADER_LEN].copy_from_slice(&header_buffer);
 
         match timeout(
-            IO_TIMEOUT,
+            timeouts.read_timeout,
             socket.read_exact(&mut response_buffer[MBAP_HEADER_LEN..]),
         )
         .await
@@ -149,6 +199,7 @@ impl ModbusTcpConnection {
         let address = self.address;
         let port = self.port;
         let unit_id = self.unit_id;
+        let timeouts = self.timeouts;
         let pdu = pdu.clone();
 
         let tid = transaction_id.fetch_add(1, Ordering::Relaxed);
@@ -162,7 +213,7 @@ impl ModbusTcpConnection {
 
                 let mut stream_guard = stream.lock().await;
                 if stream_guard.is_none() {
-                    let tcp_stream = Self::connect_stream(address, port)
+                    let tcp_stream = Self::connect_stream(address, port, timeouts.connect_timeout)
                         .await
                         .map_err(BackoffError::transient)?;
                     *stream_guard = Some(tcp_stream);
@@ -173,7 +224,7 @@ impl ModbusTcpConnection {
                     None => unreachable!("stream must be connected before exchange"),
                 };
 
-                let response_buffer = match Self::exchange_frame(socket, &adu).await {
+                let response_buffer = match Self::exchange_frame(socket, &adu, timeouts).await {
                     Ok(response_buffer) => response_buffer,
                     Err(error @ ModbusError::ConnectionError(_)) => {
                         *stream_guard = None;
@@ -290,5 +341,35 @@ mod tests {
     fn retry_backoff_has_bounded_elapsed_time() {
         let backoff = ModbusTcpConnection::retry_backoff();
         assert_eq!(backoff.max_elapsed_time, Some(RETRY_MAX_ELAPSED_TIME));
+    }
+
+    #[test]
+    fn default_timeouts_match_previous_behavior() {
+        let timeouts = ModbusTcpTimeouts::default();
+
+        assert_eq!(timeouts.connect_timeout, Duration::from_secs(5));
+        assert_eq!(timeouts.write_timeout, Duration::from_secs(5));
+        assert_eq!(timeouts.read_timeout, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn new_connection_uses_default_timeouts() {
+        let connection = ModbusTcpConnection::new("127.0.0.1".parse().unwrap(), 502, 1, 0);
+
+        assert_eq!(connection.timeouts(), ModbusTcpTimeouts::default());
+    }
+
+    #[test]
+    fn with_timeouts_stores_custom_timeouts() {
+        let timeouts = ModbusTcpTimeouts {
+            connect_timeout: Duration::from_secs(1),
+            write_timeout: Duration::from_secs(2),
+            read_timeout: Duration::from_secs(3),
+        };
+
+        let connection =
+            ModbusTcpConnection::with_timeouts("127.0.0.1".parse().unwrap(), 502, 1, 0, timeouts);
+
+        assert_eq!(connection.timeouts(), timeouts);
     }
 }
