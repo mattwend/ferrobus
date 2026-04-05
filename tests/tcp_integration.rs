@@ -86,7 +86,7 @@ async fn send_read_coils_success() {
     })
     .await;
 
-    let mut conn = ModbusTcpConnection::new(addr.ip(), addr.port(), 1, 0);
+    let conn = ModbusTcpConnection::new(addr.ip(), addr.port(), 1, 0);
     conn.connect().await.unwrap();
 
     let request = ModbusRequest::ReadCoils {
@@ -125,7 +125,7 @@ async fn send_write_single_register_success() {
     })
     .await;
 
-    let mut conn = ModbusTcpConnection::new(addr.ip(), addr.port(), 1, 0);
+    let conn = ModbusTcpConnection::new(addr.ip(), addr.port(), 1, 0);
     conn.connect().await.unwrap();
 
     let request = ModbusRequest::WriteSingleRegister {
@@ -164,7 +164,7 @@ async fn transaction_id_increments() {
     })
     .await;
 
-    let mut conn = ModbusTcpConnection::new(addr.ip(), addr.port(), 1, 100);
+    let conn = ModbusTcpConnection::new(addr.ip(), addr.port(), 1, 100);
     conn.connect().await.unwrap();
 
     let request = ModbusRequest::ReadCoils {
@@ -193,7 +193,7 @@ async fn transaction_id_mismatch() {
     })
     .await;
 
-    let mut conn = ModbusTcpConnection::new(addr.ip(), addr.port(), 1, 0);
+    let conn = ModbusTcpConnection::new(addr.ip(), addr.port(), 1, 0);
     conn.connect().await.unwrap();
 
     let request = ModbusRequest::ReadCoils {
@@ -254,7 +254,7 @@ async fn server_disconnects_on_write() {
         }
     });
 
-    let mut conn = ModbusTcpConnection::new(addr.ip(), addr.port(), 1, 0);
+    let conn = ModbusTcpConnection::new(addr.ip(), addr.port(), 1, 0);
     conn.connect().await.unwrap();
 
     let request = ModbusRequest::ReadCoils {
@@ -316,7 +316,7 @@ async fn server_disconnects_on_header_read() {
         }
     });
 
-    let mut conn = ModbusTcpConnection::new(addr.ip(), addr.port(), 1, 0);
+    let conn = ModbusTcpConnection::new(addr.ip(), addr.port(), 1, 0);
     conn.connect().await.unwrap();
 
     let request = ModbusRequest::ReadCoils {
@@ -349,7 +349,7 @@ async fn server_sends_invalid_mbap_length() {
     })
     .await;
 
-    let mut conn = ModbusTcpConnection::new(addr.ip(), addr.port(), 1, 0);
+    let conn = ModbusTcpConnection::new(addr.ip(), addr.port(), 1, 0);
     conn.connect().await.unwrap();
 
     let request = ModbusRequest::ReadCoils {

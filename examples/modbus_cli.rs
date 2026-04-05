@@ -21,7 +21,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .with(fmt::layer().with_target(false))
         .init();
 
-    let mut connection = ModbusTcpConnection::new("127.0.0.1".parse().unwrap(), 8502, 1, 1);
+    let connection = ModbusTcpConnection::new("127.0.0.1".parse().unwrap(), 8502, 1, 1);
 
     let response = connection
         .send_message(&ModbusRequest::WriteSingleRegister {
