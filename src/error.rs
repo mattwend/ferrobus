@@ -18,6 +18,15 @@ pub enum ModbusError {
     #[error("Transaction ID mismatch: sent {expected}, received {actual}")]
     TransactionIdMismatch { expected: u16, actual: u16 },
 
+    #[error("Protocol ID mismatch: expected 0, received {actual}")]
+    ProtocolIdMismatch { actual: u16 },
+
+    #[error("Unit ID mismatch: expected {expected}, received {actual}")]
+    UnitIdMismatch { expected: u8, actual: u8 },
+
     #[error("Request/response mismatch: {0}")]
     RequestResponseMismatch(String),
+
+    #[error("Validation error: {0}")]
+    ValidationError(String),
 }

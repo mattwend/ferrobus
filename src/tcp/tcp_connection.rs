@@ -5,12 +5,16 @@ use backoff::{
     Error as BackoffError, ExponentialBackoff, ExponentialBackoffBuilder, future::retry,
 };
 use std::net::IpAddr;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU16, Ordering},
+};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
-use tracing::{debug, warn};
+use tokio::time::timeout;
+use tracing::debug;
 
 use crate::response::align_response_to_request;
 use crate::{ModbusRequest, ModbusResponse, error::ModbusError, tcp::build_modbus_tcp_adu};
@@ -18,14 +22,15 @@ use crate::{ModbusRequest, ModbusResponse, error::ModbusError, tcp::build_modbus
 const MBAP_HEADER_LEN: usize = 7;
 const MAX_MODBUS_TCP_FRAME: usize = 260;
 const RETRY_MAX_ELAPSED_TIME: Duration = Duration::from_secs(2);
+const IO_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug)]
 pub struct ModbusTcpConnection {
-    stream: Arc<Mutex<Option<Arc<Mutex<TcpStream>>>>>,
+    stream: Arc<Mutex<Option<TcpStream>>>,
     address: IpAddr,
     port: u16,
     unit_id: u8,
-    transaction_id: Arc<Mutex<u16>>,
+    transaction_id: Arc<AtomicU16>,
 }
 
 impl ModbusTcpConnection {
@@ -35,39 +40,37 @@ impl ModbusTcpConnection {
             address,
             port,
             unit_id,
-            transaction_id: Arc::new(Mutex::new(transaction_id)),
+            transaction_id: Arc::new(AtomicU16::new(transaction_id)),
         }
+    }
+
+    async fn connect_stream(address: IpAddr, port: u16) -> Result<TcpStream, ModbusError> {
+        let server_addr = format!("{}:{}", address, port);
+        let stream = timeout(IO_TIMEOUT, TcpStream::connect(&server_addr))
+            .await
+            .map_err(|_| {
+                ModbusError::ConnectionError(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "connect timed out",
+                ))
+            })?
+            .map_err(ModbusError::ConnectionError)?;
+        debug!("Connected to Modbus TCP server at {}", &server_addr);
+        Ok(stream)
     }
 
     pub async fn connect(&self) -> Result<(), ModbusError> {
-        let server_addr = format!("{}:{}", self.address, self.port);
-        let stream = TcpStream::connect(&server_addr).await?;
-        debug!("Connected to Modbus TCP server at {}", &server_addr);
+        let stream = Self::connect_stream(self.address, self.port).await?;
         let mut stream_guard = self.stream.lock().await;
-        *stream_guard = Some(Arc::new(Mutex::new(stream)));
-        Ok(())
-    }
-
-    async fn ensure_connected(
-        stream: &Arc<Mutex<Option<Arc<Mutex<TcpStream>>>>>,
-        address: IpAddr,
-        port: u16,
-    ) -> Result<(), ModbusError> {
-        let mut stream_guard = stream.lock().await;
-        if stream_guard.is_none() {
-            let server_addr = format!("{}:{}", address, port);
-            let tcp_stream = TcpStream::connect(&server_addr).await?;
-            debug!("Connected to Modbus TCP server at {}", &server_addr);
-            *stream_guard = Some(Arc::new(Mutex::new(tcp_stream)));
-        }
+        *stream_guard = Some(stream);
         Ok(())
     }
 
     fn response_body_len_from_header(header: &[u8; MBAP_HEADER_LEN]) -> Result<usize, ModbusError> {
         let pdu_length = u16::from_be_bytes([header[4], header[5]]) as usize;
-        if pdu_length == 0 {
+        if pdu_length < 2 {
             return Err(ModbusError::ResponseError(
-                "Invalid MBAP length: missing unit identifier and PDU".to_string(),
+                "Invalid MBAP length: missing unit identifier or PDU".to_string(),
             ));
         }
 
@@ -89,6 +92,56 @@ impl ModbusTcpConnection {
             .build()
     }
 
+    async fn exchange_frame(socket: &mut TcpStream, adu: &[u8]) -> Result<Vec<u8>, ModbusError> {
+        match timeout(IO_TIMEOUT, socket.write_all(adu)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => return Err(ModbusError::ConnectionError(error)),
+            Err(_) => {
+                return Err(ModbusError::ConnectionError(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "write timed out",
+                )));
+            }
+        }
+
+        socket.flush().await.map_err(ModbusError::ConnectionError)?;
+
+        let mut header_buffer = [0u8; MBAP_HEADER_LEN];
+        match timeout(IO_TIMEOUT, socket.read_exact(&mut header_buffer)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => return Err(ModbusError::ConnectionError(error)),
+            Err(_) => {
+                return Err(ModbusError::ConnectionError(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "read header timed out",
+                )));
+            }
+        }
+
+        let body_len = Self::response_body_len_from_header(&header_buffer).map_err(|error| {
+            ModbusError::ConnectionError(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("invalid MBAP header: {error}"),
+            ))
+        })?;
+        let mut response_buffer = vec![0u8; MBAP_HEADER_LEN + body_len];
+        response_buffer[..MBAP_HEADER_LEN].copy_from_slice(&header_buffer);
+
+        match timeout(
+            IO_TIMEOUT,
+            socket.read_exact(&mut response_buffer[MBAP_HEADER_LEN..]),
+        )
+        .await
+        {
+            Ok(Ok(_)) => Ok(response_buffer),
+            Ok(Err(error)) => Err(ModbusError::ConnectionError(error)),
+            Err(_) => Err(ModbusError::ConnectionError(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "read body timed out",
+            ))),
+        }
+    }
+
     pub async fn send_message(&self, pdu: &ModbusRequest) -> Result<ModbusResponse, ModbusError> {
         let backoff = Self::retry_backoff();
         let stream = Arc::clone(&self.stream);
@@ -96,63 +149,52 @@ impl ModbusTcpConnection {
         let address = self.address;
         let port = self.port;
         let unit_id = self.unit_id;
+        let pdu = pdu.clone();
+
+        let tid = transaction_id.fetch_add(1, Ordering::Relaxed);
 
         retry(backoff, || {
             let pdu = pdu.clone();
             let stream = Arc::clone(&stream);
-            let transaction_id = Arc::clone(&transaction_id);
             async move {
-                Self::ensure_connected(&stream, address, port)
-                    .await
-                    .map_err(BackoffError::transient)?;
-
-                let tid = {
-                    let mut tid_guard = transaction_id.lock().await;
-                    let tid = *tid_guard;
-                    *tid_guard = tid.wrapping_add(1);
-                    tid
-                };
-
                 let adu = build_modbus_tcp_adu(tid, unit_id, &pdu);
                 debug!("Modbus TCP Frame: {:02X?}", adu);
 
-                let stream_mutex = {
-                    let stream_guard = stream.lock().await;
-                    Arc::clone(stream_guard.as_ref().expect("connection ensured above"))
+                let mut stream_guard = stream.lock().await;
+                if stream_guard.is_none() {
+                    let tcp_stream = Self::connect_stream(address, port)
+                        .await
+                        .map_err(BackoffError::transient)?;
+                    *stream_guard = Some(tcp_stream);
+                }
+
+                let socket = match stream_guard.as_mut() {
+                    Some(socket) => socket,
+                    None => unreachable!("stream must be connected before exchange"),
                 };
-                let mut socket = stream_mutex.lock().await;
 
-                if let Err(error) = socket.write_all(&adu).await {
-                    warn!("Write error: {}", error);
-                    drop(socket);
-                    let mut stream_guard = stream.lock().await;
-                    *stream_guard = None;
-                    return Err(BackoffError::transient(ModbusError::ConnectionError(error)));
+                let response_buffer = match Self::exchange_frame(socket, &adu).await {
+                    Ok(response_buffer) => response_buffer,
+                    Err(error @ ModbusError::ConnectionError(_)) => {
+                        *stream_guard = None;
+                        return Err(BackoffError::transient(error));
+                    }
+                    Err(error) => return Err(BackoffError::permanent(error)),
+                };
+
+                let protocol_id = u16::from_be_bytes([response_buffer[2], response_buffer[3]]);
+                if protocol_id != 0 {
+                    return Err(BackoffError::permanent(ModbusError::ProtocolIdMismatch {
+                        actual: protocol_id,
+                    }));
                 }
 
-                let mut header_buffer = [0u8; MBAP_HEADER_LEN];
-                if let Err(error) = socket.read_exact(&mut header_buffer).await {
-                    warn!("Read header error: {}", error);
-                    drop(socket);
-                    let mut stream_guard = stream.lock().await;
-                    *stream_guard = None;
-                    return Err(BackoffError::transient(ModbusError::ConnectionError(error)));
-                }
-
-                let body_len = Self::response_body_len_from_header(&header_buffer)
-                    .map_err(BackoffError::permanent)?;
-
-                let mut response_buffer = vec![0u8; MBAP_HEADER_LEN + body_len];
-                response_buffer[..MBAP_HEADER_LEN].copy_from_slice(&header_buffer);
-                if let Err(error) = socket
-                    .read_exact(&mut response_buffer[MBAP_HEADER_LEN..])
-                    .await
-                {
-                    warn!("Read body error: {}", error);
-                    drop(socket);
-                    let mut stream_guard = stream.lock().await;
-                    *stream_guard = None;
-                    return Err(BackoffError::transient(ModbusError::ConnectionError(error)));
+                let received_unit_id = response_buffer[6];
+                if received_unit_id != unit_id {
+                    return Err(BackoffError::permanent(ModbusError::UnitIdMismatch {
+                        expected: unit_id,
+                        actual: received_unit_id,
+                    }));
                 }
 
                 let received_transaction_id =
@@ -233,10 +275,15 @@ mod tests {
     }
 
     #[test]
-    fn response_body_len_zero_length_pdu() {
+    fn response_body_len_rejects_empty_pdu() {
         let header = [0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x11];
-        let body_len = ModbusTcpConnection::response_body_len_from_header(&header).unwrap();
-        assert_eq!(body_len, 0);
+        let error = ModbusTcpConnection::response_body_len_from_header(&header).unwrap_err();
+        match error {
+            ModbusError::ResponseError(message) => {
+                assert!(message.contains("Invalid MBAP length"));
+            }
+            other => panic!("Expected ResponseError, got {other:?}"),
+        }
     }
 
     #[test]

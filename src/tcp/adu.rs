@@ -19,6 +19,7 @@ use crate::request::{ModbusRequest, serialize_modbus_request};
 ///
 /// # Returns
 /// A vector of bytes containing the complete Modbus TCP frame.
+#[must_use]
 pub fn build_modbus_tcp_adu(transaction_id: u16, unit_id: u8, pdu: &ModbusRequest) -> Vec<u8> {
     let pdu = serialize_modbus_request(pdu);
     tracing::debug!("PDU: {:02X?}", pdu);
