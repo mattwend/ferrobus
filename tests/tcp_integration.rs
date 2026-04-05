@@ -2,25 +2,27 @@
 // Copyright (c) 2025 tinymb contributors
 
 use std::net::SocketAddr;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-use tiny_mb::tcp::ModbusTcpConnection;
+mod support;
+
+use tiny_mb::ModbusError;
+use tiny_mb::tcp::{ModbusTcpConnection, ModbusTcpTimeouts};
 use tiny_mb::{ModbusRequest, ModbusResponse};
 
-async fn spawn_mock_server<F>(handler: F) -> SocketAddr
+use support::{
+    build_exception_response_frame, build_protocol_mismatch_frame, build_tcp_response_frame,
+    read_request_frame, spawn_mock_server as spawn_test_server, spawn_slow_server,
+};
+
+async fn spawn_mock_server<F, Fut>(handler: F) -> SocketAddr
 where
-    F: FnOnce(TcpStream) + Send + 'static,
+    F: FnOnce(TcpStream) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
 {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-
-    tokio::spawn(async move {
-        let (stream, _) = listener.accept().await.unwrap();
-        handler(stream);
-    });
-
-    addr
+    spawn_test_server(handler).await.unwrap()
 }
 
 fn make_read_coils_response(tid: u16, unit_id: u8, coils: &[bool]) -> Vec<u8> {
@@ -35,14 +37,7 @@ fn make_read_coils_response(tid: u16, unit_id: u8, coils: &[bool]) -> Vec<u8> {
         }
         pdu.push(byte);
     }
-    let pdu_len = pdu.len() as u16;
-    let mut frame = Vec::with_capacity(7 + pdu.len());
-    frame.extend_from_slice(&tid.to_be_bytes());
-    frame.extend_from_slice(&0u16.to_be_bytes());
-    frame.extend_from_slice(&(1 + pdu_len).to_be_bytes());
-    frame.push(unit_id);
-    frame.extend_from_slice(&pdu);
-    frame
+    build_tcp_response_frame(tid, unit_id, &pdu)
 }
 
 fn make_write_single_register_response(tid: u16, unit_id: u8, address: u16, value: u16) -> Vec<u8> {
@@ -53,36 +48,20 @@ fn make_write_single_register_response(tid: u16, unit_id: u8, address: u16, valu
         (value >> 8) as u8,
         value as u8,
     ];
-    let pdu_len = pdu.len() as u16;
-    let mut frame = Vec::with_capacity(7 + pdu.len());
-    frame.extend_from_slice(&tid.to_be_bytes());
-    frame.extend_from_slice(&0u16.to_be_bytes());
-    frame.extend_from_slice(&(1 + pdu_len).to_be_bytes());
-    frame.push(unit_id);
-    frame.extend_from_slice(&pdu);
-    frame
+    build_tcp_response_frame(tid, unit_id, &pdu)
 }
 
 #[tokio::test]
 async fn send_read_coils_success() {
-    let addr = spawn_mock_server(|mut stream| {
-        tokio::spawn(async move {
-            let mut header = [0u8; 7];
-            stream.read_exact(&mut header).await.unwrap();
-            let tid = u16::from_be_bytes([header[0], header[1]]);
-            let unit_id = header[6];
+    let addr = spawn_mock_server(|mut stream| async move {
+        let request = read_request_frame(&mut stream).await.unwrap();
 
-            let pdu_len = 5;
-            let mut pdu = vec![0u8; pdu_len as usize];
-            stream.read_exact(&mut pdu).await.unwrap();
-
-            let response = make_read_coils_response(
-                tid,
-                unit_id,
-                &[true, false, true, false, true, false, true, false],
-            );
-            stream.write_all(&response).await.unwrap();
-        });
+        let response = make_read_coils_response(
+            request.transaction_id,
+            request.unit_id,
+            &[true, false, true, false, true, false, true, false],
+        );
+        stream.write_all(&response).await.unwrap();
     })
     .await;
 
@@ -105,23 +84,19 @@ async fn send_read_coils_success() {
 
 #[tokio::test]
 async fn send_write_single_register_success() {
-    let addr = spawn_mock_server(|mut stream| {
-        tokio::spawn(async move {
-            let mut header = [0u8; 7];
-            stream.read_exact(&mut header).await.unwrap();
-            let tid = u16::from_be_bytes([header[0], header[1]]);
-            let unit_id = header[6];
+    let addr = spawn_mock_server(|mut stream| async move {
+        let request = read_request_frame(&mut stream).await.unwrap();
 
-            let pdu_len = 5;
-            let mut pdu = vec![0u8; pdu_len as usize];
-            stream.read_exact(&mut pdu).await.unwrap();
+        let address = u16::from_be_bytes([request.pdu[1], request.pdu[2]]);
+        let value = u16::from_be_bytes([request.pdu[3], request.pdu[4]]);
 
-            let address = u16::from_be_bytes([pdu[1], pdu[2]]);
-            let value = u16::from_be_bytes([pdu[3], pdu[4]]);
-
-            let response = make_write_single_register_response(tid, unit_id, address, value);
-            stream.write_all(&response).await.unwrap();
-        });
+        let response = make_write_single_register_response(
+            request.transaction_id,
+            request.unit_id,
+            address,
+            value,
+        );
+        stream.write_all(&response).await.unwrap();
     })
     .await;
 
@@ -145,22 +120,13 @@ async fn send_write_single_register_success() {
 
 #[tokio::test]
 async fn transaction_id_increments() {
-    let addr = spawn_mock_server(|stream| {
-        tokio::spawn(async move {
-            let mut stream = stream;
-            for _ in 0..2 {
-                let mut header = [0u8; 7];
-                stream.read_exact(&mut header).await.unwrap();
-                let tid = u16::from_be_bytes([header[0], header[1]]);
-
-                let pdu_len = 5;
-                let mut pdu = vec![0u8; pdu_len as usize];
-                stream.read_exact(&mut pdu).await.unwrap();
-
-                let response = make_read_coils_response(tid, header[6], &[true, false]);
-                stream.write_all(&response).await.unwrap();
-            }
-        });
+    let addr = spawn_mock_server(|mut stream| async move {
+        for _ in 0..2 {
+            let request = read_request_frame(&mut stream).await.unwrap();
+            let response =
+                make_read_coils_response(request.transaction_id, request.unit_id, &[true, false]);
+            stream.write_all(&response).await.unwrap();
+        }
     })
     .await;
 
@@ -177,19 +143,11 @@ async fn transaction_id_increments() {
 
 #[tokio::test]
 async fn transaction_id_mismatch() {
-    let addr = spawn_mock_server(|mut stream| {
-        tokio::spawn(async move {
-            let mut header = [0u8; 7];
-            stream.read_exact(&mut header).await.unwrap();
-            let wrong_tid = u16::from_be_bytes([header[0], header[1]]) + 1;
-
-            let pdu_len = 5;
-            let mut pdu = vec![0u8; pdu_len as usize];
-            stream.read_exact(&mut pdu).await.unwrap();
-
-            let response = make_read_coils_response(wrong_tid, header[6], &[true, false]);
-            stream.write_all(&response).await.unwrap();
-        });
+    let addr = spawn_mock_server(|mut stream| async move {
+        let request = read_request_frame(&mut stream).await.unwrap();
+        let response =
+            make_read_coils_response(request.transaction_id + 1, request.unit_id, &[true, false]);
+        stream.write_all(&response).await.unwrap();
     })
     .await;
 
@@ -368,12 +326,137 @@ async fn server_sends_invalid_mbap_length() {
         starting_address: 0x0000,
         quantity: 2,
     };
-    let result = conn.send_message(&request).await;
+    let error = conn.send_message(&request).await.unwrap_err();
+
+    match error {
+        ModbusError::MalformedResponse(message) => {
+            assert!(message.contains("invalid MBAP header"));
+        }
+        other => panic!("Expected MalformedResponse, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn send_messages_across_multiple_unit_ids_on_one_connection() {
+    let addr = spawn_mock_server(|mut stream| async move {
+        for expected_unit_id in [1u8, 2u8] {
+            let request = read_request_frame(&mut stream).await.unwrap();
+            assert_eq!(request.unit_id, expected_unit_id);
+
+            let response =
+                make_read_coils_response(request.transaction_id, request.unit_id, &[true, false]);
+            stream.write_all(&response).await.unwrap();
+        }
+    })
+    .await;
+
+    let conn = ModbusTcpConnection::new(addr.ip(), addr.port(), 1, 0);
+    conn.connect().await.unwrap();
+
+    let request = ModbusRequest::ReadCoils {
+        starting_address: 0x0000,
+        quantity: 2,
+    };
+
+    let default_response = conn.send_message(&request).await.unwrap();
+    let alternate_response = conn.send_message_with_unit_id(2, &request).await.unwrap();
 
     assert_eq!(
-        result.unwrap(),
+        default_response,
         ModbusResponse::ReadCoils {
             coils: vec![true, false]
         }
     );
+    assert_eq!(
+        alternate_response,
+        ModbusResponse::ReadCoils {
+            coils: vec![true, false]
+        }
+    );
+}
+
+#[tokio::test]
+async fn send_message_returns_exception_response_as_typed_error() {
+    let addr = spawn_mock_server(|mut stream| async move {
+        let request = read_request_frame(&mut stream).await.unwrap();
+        let response =
+            build_exception_response_frame(request.transaction_id, request.unit_id, 0x01, 0x02);
+        stream.write_all(&response).await.unwrap();
+    })
+    .await;
+
+    let conn = ModbusTcpConnection::new(addr.ip(), addr.port(), 1, 0);
+    conn.connect().await.unwrap();
+
+    let request = ModbusRequest::ReadCoils {
+        starting_address: 0x0000,
+        quantity: 2,
+    };
+
+    let error = conn.send_message(&request).await.unwrap_err();
+    match error {
+        ModbusError::ExceptionResponse { function, code } => {
+            assert_eq!(function, 0x81);
+            assert_eq!(code, 0x02);
+        }
+        other => panic!("Expected ExceptionResponse, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn send_message_returns_protocol_id_mismatch_as_typed_error() {
+    let addr = spawn_mock_server(|mut stream| async move {
+        let request = read_request_frame(&mut stream).await.unwrap();
+        let response = build_protocol_mismatch_frame(
+            request.transaction_id,
+            1,
+            request.unit_id,
+            &[0x01, 0x01, 0x01],
+        );
+        stream.write_all(&response).await.unwrap();
+    })
+    .await;
+
+    let conn = ModbusTcpConnection::new(addr.ip(), addr.port(), 1, 0);
+    conn.connect().await.unwrap();
+
+    let request = ModbusRequest::ReadCoils {
+        starting_address: 0x0000,
+        quantity: 1,
+    };
+
+    let error = conn.send_message(&request).await.unwrap_err();
+    match error {
+        ModbusError::ProtocolIdMismatch { actual } => assert_eq!(actual, 1),
+        other => panic!("Expected ProtocolIdMismatch, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn send_message_returns_read_timeout_from_slow_server() {
+    let addr = spawn_slow_server(Duration::from_millis(200)).await.unwrap();
+
+    let conn = ModbusTcpConnection::with_timeouts(
+        addr.ip(),
+        addr.port(),
+        1,
+        0,
+        ModbusTcpTimeouts {
+            connect_timeout: Duration::from_millis(50),
+            write_timeout: Duration::from_millis(50),
+            read_timeout: Duration::from_millis(25),
+        },
+    );
+    conn.connect().await.unwrap();
+
+    let request = ModbusRequest::ReadCoils {
+        starting_address: 0x0000,
+        quantity: 1,
+    };
+
+    let error = conn.send_message(&request).await.unwrap_err();
+    match error {
+        ModbusError::ReadTimeout => {}
+        other => panic!("Expected ReadTimeout, got {other:?}"),
+    }
 }
