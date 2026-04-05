@@ -122,6 +122,17 @@ impl ModbusTcpConnection {
         Ok(())
     }
 
+    /// Closes the current TCP session if one is open.
+    pub async fn disconnect(&self) {
+        let mut stream_guard = self.stream.lock().await;
+        *stream_guard = None;
+    }
+
+    /// Returns whether this handle currently owns an open TCP stream.
+    pub async fn is_connected(&self) -> bool {
+        self.stream.lock().await.is_some()
+    }
+
     fn response_body_len_from_header(header: &[u8; MBAP_HEADER_LEN]) -> Result<usize, ModbusError> {
         let pdu_length = u16::from_be_bytes([header[4], header[5]]) as usize;
         if pdu_length < 2 {
@@ -286,6 +297,18 @@ impl ModbusTcpConnection {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::net::TcpListener;
+
+    async fn spawn_accept_once_server() -> std::net::SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+        });
+
+        addr
+    }
 
     #[test]
     fn response_body_len_excludes_unit_id() {
@@ -401,5 +424,45 @@ mod tests {
             &connection.transaction_id,
             &child.transaction_id,
         ));
+    }
+
+    #[tokio::test]
+    async fn is_connected_is_false_before_connect() {
+        let connection = ModbusTcpConnection::new("127.0.0.1".parse().unwrap(), 502, 1, 0);
+
+        assert!(!connection.is_connected().await);
+    }
+
+    #[tokio::test]
+    async fn is_connected_is_true_after_connect() {
+        let addr = spawn_accept_once_server().await;
+        let connection = ModbusTcpConnection::new(addr.ip(), addr.port(), 1, 0);
+
+        connection.connect().await.unwrap();
+
+        assert!(connection.is_connected().await);
+    }
+
+    #[tokio::test]
+    async fn disconnect_clears_connected_state() {
+        let addr = spawn_accept_once_server().await;
+        let connection = ModbusTcpConnection::new(addr.ip(), addr.port(), 1, 0);
+
+        connection.connect().await.unwrap();
+        assert!(connection.is_connected().await);
+
+        connection.disconnect().await;
+
+        assert!(!connection.is_connected().await);
+    }
+
+    #[tokio::test]
+    async fn disconnect_is_idempotent_when_already_disconnected() {
+        let connection = ModbusTcpConnection::new("127.0.0.1".parse().unwrap(), 502, 1, 0);
+
+        connection.disconnect().await;
+        connection.disconnect().await;
+
+        assert!(!connection.is_connected().await);
     }
 }
