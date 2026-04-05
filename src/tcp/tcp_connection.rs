@@ -108,13 +108,8 @@ impl ModbusTcpConnection {
         let server_addr = format!("{}:{}", address, port);
         let stream = timeout(connect_timeout, TcpStream::connect(&server_addr))
             .await
-            .map_err(|_| {
-                ModbusError::ConnectionError(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "connect timed out",
-                ))
-            })?
-            .map_err(ModbusError::ConnectionError)?;
+            .map_err(|_| ModbusError::ConnectTimeout)?
+            .map_err(ModbusError::ConnectError)?;
         debug!("Connected to Modbus TCP server at {}", &server_addr);
         Ok(stream)
     }
@@ -130,7 +125,7 @@ impl ModbusTcpConnection {
     fn response_body_len_from_header(header: &[u8; MBAP_HEADER_LEN]) -> Result<usize, ModbusError> {
         let pdu_length = u16::from_be_bytes([header[4], header[5]]) as usize;
         if pdu_length < 2 {
-            return Err(ModbusError::ResponseError(
+            return Err(ModbusError::MalformedResponse(
                 "Invalid MBAP length: missing unit identifier or PDU".to_string(),
             ));
         }
@@ -138,7 +133,7 @@ impl ModbusTcpConnection {
         let body_len = pdu_length - 1;
         let total_length = MBAP_HEADER_LEN + body_len;
         if total_length > MAX_MODBUS_TCP_FRAME {
-            return Err(ModbusError::ResponseError(format!(
+            return Err(ModbusError::MalformedResponse(format!(
                 "Response exceeds maximum frame size: {} > {}",
                 total_length, MAX_MODBUS_TCP_FRAME
             )));
@@ -160,34 +155,21 @@ impl ModbusTcpConnection {
     ) -> Result<Vec<u8>, ModbusError> {
         match timeout(timeouts.write_timeout, socket.write_all(adu)).await {
             Ok(Ok(())) => {}
-            Ok(Err(error)) => return Err(ModbusError::ConnectionError(error)),
-            Err(_) => {
-                return Err(ModbusError::ConnectionError(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "write timed out",
-                )));
-            }
+            Ok(Err(error)) => return Err(ModbusError::WriteError(error)),
+            Err(_) => return Err(ModbusError::WriteTimeout),
         }
 
-        socket.flush().await.map_err(ModbusError::ConnectionError)?;
+        socket.flush().await.map_err(ModbusError::WriteError)?;
 
         let mut header_buffer = [0u8; MBAP_HEADER_LEN];
         match timeout(timeouts.read_timeout, socket.read_exact(&mut header_buffer)).await {
             Ok(Ok(_)) => {}
-            Ok(Err(error)) => return Err(ModbusError::ConnectionError(error)),
-            Err(_) => {
-                return Err(ModbusError::ConnectionError(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "read header timed out",
-                )));
-            }
+            Ok(Err(error)) => return Err(ModbusError::ReadError(error)),
+            Err(_) => return Err(ModbusError::ReadTimeout),
         }
 
         let body_len = Self::response_body_len_from_header(&header_buffer).map_err(|error| {
-            ModbusError::ConnectionError(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("invalid MBAP header: {error}"),
-            ))
+            ModbusError::MalformedResponse(format!("invalid MBAP header: {error}"))
         })?;
         let mut response_buffer = vec![0u8; MBAP_HEADER_LEN + body_len];
         response_buffer[..MBAP_HEADER_LEN].copy_from_slice(&header_buffer);
@@ -199,11 +181,8 @@ impl ModbusTcpConnection {
         .await
         {
             Ok(Ok(_)) => Ok(response_buffer),
-            Ok(Err(error)) => Err(ModbusError::ConnectionError(error)),
-            Err(_) => Err(ModbusError::ConnectionError(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "read body timed out",
-            ))),
+            Ok(Err(error)) => Err(ModbusError::ReadError(error)),
+            Err(_) => Err(ModbusError::ReadTimeout),
         }
     }
 
@@ -248,7 +227,14 @@ impl ModbusTcpConnection {
 
                 let response_buffer = match Self::exchange_frame(socket, &adu, timeouts).await {
                     Ok(response_buffer) => response_buffer,
-                    Err(error @ ModbusError::ConnectionError(_)) => {
+                    Err(
+                        error @ (ModbusError::ConnectError(_)
+                        | ModbusError::ConnectTimeout
+                        | ModbusError::WriteError(_)
+                        | ModbusError::WriteTimeout
+                        | ModbusError::ReadError(_)
+                        | ModbusError::ReadTimeout),
+                    ) => {
                         *stream_guard = None;
                         return Err(BackoffError::transient(error));
                     }
@@ -284,6 +270,12 @@ impl ModbusTcpConnection {
                 let pdu_bytes = &response_buffer[MBAP_HEADER_LEN..];
                 let response =
                     ModbusResponse::try_from(pdu_bytes).map_err(BackoffError::permanent)?;
+                if let ModbusResponse::Exception { function, code } = response {
+                    return Err(BackoffError::permanent(ModbusError::ExceptionResponse {
+                        function,
+                        code,
+                    }));
+                }
                 align_response_to_request(&pdu, response).map_err(BackoffError::permanent)
             }
         })
@@ -307,10 +299,10 @@ mod tests {
         let header = [0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x11];
         let error = ModbusTcpConnection::response_body_len_from_header(&header).unwrap_err();
         match error {
-            ModbusError::ResponseError(message) => {
+            ModbusError::MalformedResponse(message) => {
                 assert!(message.contains("Invalid MBAP length"));
             }
-            other => panic!("Expected ResponseError, got {other:?}"),
+            other => panic!("Expected MalformedResponse, got {other:?}"),
         }
     }
 
@@ -333,10 +325,10 @@ mod tests {
         let header = [0x00, 0x01, 0x00, 0x00, 0x01, 0x00, 0x11];
         let error = ModbusTcpConnection::response_body_len_from_header(&header).unwrap_err();
         match error {
-            ModbusError::ResponseError(message) => {
+            ModbusError::MalformedResponse(message) => {
                 assert!(message.contains("exceeds maximum frame size"));
             }
-            other => panic!("Expected ResponseError, got {other:?}"),
+            other => panic!("Expected MalformedResponse, got {other:?}"),
         }
     }
 
@@ -352,10 +344,10 @@ mod tests {
         let header = [0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x11];
         let error = ModbusTcpConnection::response_body_len_from_header(&header).unwrap_err();
         match error {
-            ModbusError::ResponseError(message) => {
+            ModbusError::MalformedResponse(message) => {
                 assert!(message.contains("Invalid MBAP length"));
             }
-            other => panic!("Expected ResponseError, got {other:?}"),
+            other => panic!("Expected MalformedResponse, got {other:?}"),
         }
     }
 

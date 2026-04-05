@@ -5,6 +5,7 @@ use std::net::SocketAddr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
+use tiny_mb::ModbusError;
 use tiny_mb::tcp::ModbusTcpConnection;
 use tiny_mb::{ModbusRequest, ModbusResponse};
 
@@ -368,14 +369,14 @@ async fn server_sends_invalid_mbap_length() {
         starting_address: 0x0000,
         quantity: 2,
     };
-    let result = conn.send_message(&request).await;
+    let error = conn.send_message(&request).await.unwrap_err();
 
-    assert_eq!(
-        result.unwrap(),
-        ModbusResponse::ReadCoils {
-            coils: vec![true, false]
+    match error {
+        ModbusError::MalformedResponse(message) => {
+            assert!(message.contains("invalid MBAP header"));
         }
-    );
+        other => panic!("Expected MalformedResponse, got {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -424,4 +425,94 @@ async fn send_messages_across_multiple_unit_ids_on_one_connection() {
             coils: vec![true, false]
         }
     );
+}
+
+#[tokio::test]
+async fn send_message_returns_exception_response_as_typed_error() {
+    let addr = spawn_mock_server(|mut stream| {
+        tokio::spawn(async move {
+            let mut header = [0u8; 7];
+            stream.read_exact(&mut header).await.unwrap();
+            let tid = u16::from_be_bytes([header[0], header[1]]);
+            let unit_id = header[6];
+
+            let mut pdu = vec![0u8; 5];
+            stream.read_exact(&mut pdu).await.unwrap();
+
+            let response = vec![
+                (tid >> 8) as u8,
+                tid as u8,
+                0x00,
+                0x00,
+                0x00,
+                0x03,
+                unit_id,
+                0x81,
+                0x02,
+            ];
+            stream.write_all(&response).await.unwrap();
+        });
+    })
+    .await;
+
+    let conn = ModbusTcpConnection::new(addr.ip(), addr.port(), 1, 0);
+    conn.connect().await.unwrap();
+
+    let request = ModbusRequest::ReadCoils {
+        starting_address: 0x0000,
+        quantity: 2,
+    };
+
+    let error = conn.send_message(&request).await.unwrap_err();
+    match error {
+        ModbusError::ExceptionResponse { function, code } => {
+            assert_eq!(function, 0x81);
+            assert_eq!(code, 0x02);
+        }
+        other => panic!("Expected ExceptionResponse, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn send_message_returns_protocol_id_mismatch_as_typed_error() {
+    let addr = spawn_mock_server(|mut stream| {
+        tokio::spawn(async move {
+            let mut header = [0u8; 7];
+            stream.read_exact(&mut header).await.unwrap();
+            let tid = u16::from_be_bytes([header[0], header[1]]);
+            let unit_id = header[6];
+
+            let mut pdu = vec![0u8; 5];
+            stream.read_exact(&mut pdu).await.unwrap();
+
+            let response = vec![
+                (tid >> 8) as u8,
+                tid as u8,
+                0x00,
+                0x01,
+                0x00,
+                0x04,
+                unit_id,
+                0x01,
+                0x01,
+                0x01,
+            ];
+            stream.write_all(&response).await.unwrap();
+        });
+    })
+    .await;
+
+    let conn = ModbusTcpConnection::new(addr.ip(), addr.port(), 1, 0);
+    conn.connect().await.unwrap();
+
+    let request = ModbusRequest::ReadCoils {
+        starting_address: 0x0000,
+        quantity: 1,
+    };
+
+    let error = conn.send_message(&request).await.unwrap_err();
+    match error {
+        ModbusError::ProtocolIdMismatch { actual } => assert_eq!(actual, 1),
+        other => panic!("Expected ProtocolIdMismatch, got {other:?}"),
+    }
 }
