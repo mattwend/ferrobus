@@ -10,6 +10,7 @@ const MAX_READ_INPUT_REGISTERS: u16 = 0x007D;
 const MAX_WRITE_MULTIPLE_COILS: u16 = 0x07B0;
 const MAX_WRITE_MULTIPLE_REGISTERS: u16 = 0x007B;
 
+/// Typed Modbus request PDUs.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ModbusRequest {
     ReadCoils {
@@ -104,6 +105,10 @@ impl ModbusRequest {
         Ok(())
     }
 
+    /// Serializes the request into a Modbus PDU.
+    ///
+    /// Validation runs before serialization, so protocol-limit violations are
+    /// returned as [`ModbusError::ValidationError`].
     pub fn serialize(&self) -> Result<Vec<u8>, ModbusError> {
         self.validate()?;
         Ok(serialize_modbus_request_internal(self))
@@ -205,6 +210,9 @@ fn serialize_modbus_request_internal(pdu: &ModbusRequest) -> Vec<u8> {
 }
 
 #[must_use]
+/// Serializes a request without validation.
+///
+/// Prefer [`ModbusRequest::serialize`] when accepting user input or external data.
 pub fn serialize_modbus_request(pdu: &ModbusRequest) -> Vec<u8> {
     serialize_modbus_request_internal(pdu)
 }

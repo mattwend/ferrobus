@@ -69,6 +69,7 @@ fn parse_registers(response: &[u8], min_len: usize) -> Result<Vec<u16>, ModbusEr
     Ok(registers)
 }
 
+/// Verifies that a decoded response matches the request that produced it.
 pub fn align_response_to_request(
     request: &ModbusRequest,
     response: ModbusResponse,
@@ -212,6 +213,7 @@ pub fn align_response_to_request(
     }
 }
 
+/// Typed Modbus response PDUs.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ModbusResponse {
     ReadCoils {
@@ -249,10 +251,12 @@ pub enum ModbusResponse {
 }
 
 impl ModbusResponse {
+    /// Deserializes a Modbus response PDU.
     pub fn deserialize(response: &[u8]) -> Result<ModbusResponse, ModbusError> {
         deserialize_modbus_response_internal(response, None)
     }
 
+    /// Deserializes a Modbus response PDU and truncates bit-packed reads to `count` values.
     pub fn deserialize_with_count(
         response: &[u8],
         count: usize,
