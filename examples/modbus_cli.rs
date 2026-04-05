@@ -7,6 +7,7 @@ use std::net::IpAddr;
 use tracing::info;
 use tracing_subscriber::{filter::EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
+use tiny_mb::ModbusError;
 use tiny_mb::ModbusRequest;
 use tiny_mb::ModbusResponse;
 use tiny_mb::tcp::ModbusTcpConnection;
@@ -377,9 +378,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     connection.connect().await?;
 
-    let response = connection.send_message(&request).await?;
-
-    print_response(response, cli.output);
+    match connection.send_message(&request).await {
+        Ok(response) => print_response(response, cli.output),
+        Err(ModbusError::ExceptionResponse { function, code }) => {
+            eprintln!("{}", format_exception(function, code));
+        }
+        Err(error) => return Err(error.into()),
+    }
 
     Ok(())
 }
