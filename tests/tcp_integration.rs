@@ -2,14 +2,15 @@
 // Copyright (c) 2025 tinymb contributors
 
 use std::net::SocketAddr;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 use tiny_mb::ModbusError;
-use tiny_mb::tcp::ModbusTcpConnection;
+use tiny_mb::tcp::{ModbusTcpConnection, ModbusTcpTimeouts};
 use tiny_mb::test_support::{
     build_exception_response_frame, build_protocol_mismatch_frame, build_tcp_response_frame,
-    read_request_frame, spawn_mock_server as spawn_test_server, write_frame,
+    read_request_frame, spawn_mock_server as spawn_test_server, spawn_slow_server, write_frame,
 };
 use tiny_mb::{ModbusRequest, ModbusResponse};
 
@@ -425,5 +426,34 @@ async fn send_message_returns_protocol_id_mismatch_as_typed_error() {
     match error {
         ModbusError::ProtocolIdMismatch { actual } => assert_eq!(actual, 1),
         other => panic!("Expected ProtocolIdMismatch, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn send_message_returns_read_timeout_from_slow_server() {
+    let addr = spawn_slow_server(Duration::from_millis(200)).await.unwrap();
+
+    let conn = ModbusTcpConnection::with_timeouts(
+        addr.ip(),
+        addr.port(),
+        1,
+        0,
+        ModbusTcpTimeouts {
+            connect_timeout: Duration::from_millis(50),
+            write_timeout: Duration::from_millis(50),
+            read_timeout: Duration::from_millis(25),
+        },
+    );
+    conn.connect().await.unwrap();
+
+    let request = ModbusRequest::ReadCoils {
+        starting_address: 0x0000,
+        quantity: 1,
+    };
+
+    let error = conn.send_message(&request).await.unwrap_err();
+    match error {
+        ModbusError::ReadTimeout => {}
+        other => panic!("Expected ReadTimeout, got {other:?}"),
     }
 }
