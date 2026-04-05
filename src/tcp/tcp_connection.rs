@@ -26,10 +26,14 @@ const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Per-operation time limits used by [`ModbusTcpConnection`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ModbusTcpTimeouts {
+    /// Maximum time allowed to establish a TCP connection.
     pub connect_timeout: Duration,
+    /// Maximum time allowed to write one Modbus TCP frame.
     pub write_timeout: Duration,
+    /// Maximum time allowed to read one Modbus TCP response.
     pub read_timeout: Duration,
 }
 
@@ -43,6 +47,9 @@ impl Default for ModbusTcpTimeouts {
     }
 }
 
+/// Reusable Modbus TCP client handle.
+///
+/// Cloned handles share the same underlying TCP stream and transaction counter.
 #[derive(Clone, Debug)]
 pub struct ModbusTcpConnection {
     stream: Arc<Mutex<Option<TcpStream>>>,
@@ -54,6 +61,7 @@ pub struct ModbusTcpConnection {
 }
 
 impl ModbusTcpConnection {
+    /// Creates a connection handle with default connect, write, and read timeouts.
     pub fn new(address: IpAddr, port: u16, unit_id: u8, transaction_id: u16) -> Self {
         Self::with_timeouts(
             address,
@@ -64,6 +72,7 @@ impl ModbusTcpConnection {
         )
     }
 
+    /// Creates a connection handle with explicit timeout settings.
     pub fn with_timeouts(
         address: IpAddr,
         port: u16,
@@ -81,14 +90,17 @@ impl ModbusTcpConnection {
         }
     }
 
+    /// Returns the timeout configuration used for future operations.
     pub fn timeouts(&self) -> ModbusTcpTimeouts {
         self.timeouts
     }
 
+    /// Returns the default unit identifier used by [`Self::send_message`].
     pub fn unit_id(&self) -> u8 {
         self.unit_id
     }
 
+    /// Returns a new handle that shares the same transport but overrides the default unit id.
     pub fn with_unit_id(&self, unit_id: u8) -> Self {
         Self {
             stream: Arc::clone(&self.stream),
@@ -114,6 +126,10 @@ impl ModbusTcpConnection {
         Ok(stream)
     }
 
+    /// Opens the TCP connection eagerly.
+    ///
+    /// Calling this is optional because [`Self::send_message`] and
+    /// [`Self::send_message_with_unit_id`] connect lazily when needed.
     pub async fn connect(&self) -> Result<(), ModbusError> {
         let stream =
             Self::connect_stream(self.address, self.port, self.timeouts.connect_timeout).await?;
@@ -197,10 +213,17 @@ impl ModbusTcpConnection {
         }
     }
 
+    /// Sends one request using this connection's default unit id.
+    ///
+    /// The connection is opened on demand, and transient I/O failures are retried
+    /// with a short exponential backoff.
     pub async fn send_message(&self, pdu: &ModbusRequest) -> Result<ModbusResponse, ModbusError> {
         self.send_message_with_unit_id(self.unit_id, pdu).await
     }
 
+    /// Sends one request using an explicit unit id.
+    ///
+    /// This is useful when one TCP gateway fronts multiple logical Modbus devices.
     pub async fn send_message_with_unit_id(
         &self,
         unit_id: u8,
