@@ -15,9 +15,6 @@ pub enum ModbusError {
     #[error("Deserialization error: {0}")]
     DeserializationError(String),
 
-    #[error("Unexpected response length: expected at least {expected}, got {actual}")]
-    ResponseTooShort { expected: usize, actual: usize },
-
     #[error("Transaction ID mismatch: sent {expected}, received {actual}")]
     TransactionIdMismatch { expected: u16, actual: u16 },
 

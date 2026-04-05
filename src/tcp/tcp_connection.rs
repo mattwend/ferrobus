@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2025 tinymb contributors
 
-use backoff::{Error as BackoffError, ExponentialBackoff, future::retry};
+use backoff::{
+    Error as BackoffError, ExponentialBackoff, ExponentialBackoffBuilder, future::retry,
+};
 use std::net::IpAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
@@ -14,6 +17,7 @@ use crate::{ModbusRequest, ModbusResponse, error::ModbusError, tcp::build_modbus
 
 const MBAP_HEADER_LEN: usize = 7;
 const MAX_MODBUS_TCP_FRAME: usize = 260;
+const RETRY_MAX_ELAPSED_TIME: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Debug)]
 pub struct ModbusTcpConnection {
@@ -84,11 +88,17 @@ impl ModbusTcpConnection {
         Ok(body_len)
     }
 
+    fn retry_backoff() -> ExponentialBackoff {
+        ExponentialBackoffBuilder::new()
+            .with_max_elapsed_time(Some(RETRY_MAX_ELAPSED_TIME))
+            .build()
+    }
+
     pub async fn send_message(
         &mut self,
         pdu: &ModbusRequest,
     ) -> Result<ModbusResponse, ModbusError> {
-        let backoff = ExponentialBackoff::default();
+        let backoff = Self::retry_backoff();
         let stream = Arc::new(Mutex::new(self.stream.clone()));
         let transaction_id = Arc::clone(&self.transaction_id);
         let address = self.address;
@@ -198,5 +208,51 @@ mod tests {
             }
             other => panic!("Expected ResponseError, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn response_body_len_minimum_valid() {
+        let header = [0x00, 0x01, 0x00, 0x00, 0x00, 0x02, 0x11];
+        let body_len = ModbusTcpConnection::response_body_len_from_header(&header).unwrap();
+        assert_eq!(body_len, 1);
+    }
+
+    #[test]
+    fn response_body_len_maximum_frame() {
+        let header = [0x00, 0x01, 0x00, 0x00, 0x00, 0xFE, 0x11];
+        let body_len = ModbusTcpConnection::response_body_len_from_header(&header).unwrap();
+        assert_eq!(body_len, 253);
+    }
+
+    #[test]
+    fn response_body_len_rejects_oversized_frame() {
+        let header = [0x00, 0x01, 0x00, 0x00, 0x01, 0x00, 0x11];
+        let error = ModbusTcpConnection::response_body_len_from_header(&header).unwrap_err();
+        match error {
+            ModbusError::ResponseError(message) => {
+                assert!(message.contains("exceeds maximum frame size"));
+            }
+            other => panic!("Expected ResponseError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn response_body_len_single_byte_pdu() {
+        let header = [0x00, 0x01, 0x00, 0x00, 0x00, 0x03, 0x11];
+        let body_len = ModbusTcpConnection::response_body_len_from_header(&header).unwrap();
+        assert_eq!(body_len, 2);
+    }
+
+    #[test]
+    fn response_body_len_zero_length_pdu() {
+        let header = [0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x11];
+        let body_len = ModbusTcpConnection::response_body_len_from_header(&header).unwrap();
+        assert_eq!(body_len, 0);
+    }
+
+    #[test]
+    fn retry_backoff_has_bounded_elapsed_time() {
+        let backoff = ModbusTcpConnection::retry_backoff();
+        assert_eq!(backoff.max_elapsed_time, Some(RETRY_MAX_ELAPSED_TIME));
     }
 }
