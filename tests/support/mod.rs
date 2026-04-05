@@ -4,13 +4,9 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::sleep;
-
-use crate::ModbusRequest;
-use crate::request::serialize_modbus_request;
-use crate::tcp::build_modbus_tcp_adu;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CapturedRequest {
@@ -52,10 +48,6 @@ pub fn build_protocol_mismatch_frame(
     frame.push(unit_id);
     frame.extend_from_slice(pdu);
     frame
-}
-
-pub fn build_request_frame(transaction_id: u16, unit_id: u8, request: &ModbusRequest) -> Vec<u8> {
-    build_modbus_tcp_adu(transaction_id, unit_id, request)
 }
 
 pub async fn read_request_frame(stream: &mut TcpStream) -> std::io::Result<CapturedRequest> {
@@ -108,58 +100,4 @@ pub async fn spawn_slow_server(delay: Duration) -> std::io::Result<SocketAddr> {
     });
 
     Ok(addr)
-}
-
-pub async fn write_frame(stream: &mut TcpStream, frame: &[u8]) -> std::io::Result<()> {
-    stream.write_all(frame).await
-}
-
-pub fn serialized_request_pdu(request: &ModbusRequest) -> Vec<u8> {
-    serialize_modbus_request(request)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tokio::net::TcpStream;
-
-    #[test]
-    fn exception_frame_sets_exception_bit() {
-        let frame = build_exception_response_frame(1, 2, 3, 4);
-
-        assert_eq!(&frame[..7], &[0x00, 0x01, 0x00, 0x00, 0x00, 0x03, 0x02]);
-        assert_eq!(&frame[7..], &[0x83, 0x04]);
-    }
-
-    #[test]
-    fn request_frame_matches_public_builder() {
-        let request = ModbusRequest::ReadHoldingRegisters {
-            starting_address: 0x0010,
-            quantity: 2,
-        };
-
-        let frame = build_request_frame(0x1234, 0x11, &request);
-
-        assert_eq!(frame, build_modbus_tcp_adu(0x1234, 0x11, &request));
-    }
-
-    #[test]
-    fn serialized_request_pdu_matches_request_serializer() {
-        let request = ModbusRequest::WriteSingleRegister {
-            address: 0x0010,
-            value: 0x1234,
-        };
-
-        assert_eq!(
-            serialized_request_pdu(&request),
-            serialize_modbus_request(&request)
-        );
-    }
-
-    #[tokio::test]
-    async fn spawn_slow_server_accepts_connections() {
-        let addr = spawn_slow_server(Duration::from_millis(10)).await.unwrap();
-
-        TcpStream::connect(addr).await.unwrap();
-    }
 }

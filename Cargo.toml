@@ -7,7 +7,6 @@ license = "MIT"
 [features]
 default = []
 cli = ["dep:clap", "dep:tracing-subscriber"]
-test-support = []
 
 [dependencies]
 backoff = { version = "0.4", features = ["tokio"] }
@@ -20,7 +19,3 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = tr
 [[example]]
 name = "modbus_cli"
 required-features = ["cli"]
-
-[[test]]
-name = "tcp_integration"
-required-features = ["test-support"]
