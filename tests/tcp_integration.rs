@@ -377,3 +377,51 @@ async fn server_sends_invalid_mbap_length() {
         }
     );
 }
+
+#[tokio::test]
+async fn send_messages_across_multiple_unit_ids_on_one_connection() {
+    let addr = spawn_mock_server(|stream| {
+        tokio::spawn(async move {
+            let mut stream = stream;
+
+            for expected_unit_id in [1u8, 2u8] {
+                let mut header = [0u8; 7];
+                stream.read_exact(&mut header).await.unwrap();
+                let tid = u16::from_be_bytes([header[0], header[1]]);
+                let unit_id = header[6];
+                assert_eq!(unit_id, expected_unit_id);
+
+                let mut pdu = vec![0u8; 5];
+                stream.read_exact(&mut pdu).await.unwrap();
+
+                let response = make_read_coils_response(tid, unit_id, &[true, false]);
+                stream.write_all(&response).await.unwrap();
+            }
+        });
+    })
+    .await;
+
+    let conn = ModbusTcpConnection::new(addr.ip(), addr.port(), 1, 0);
+    conn.connect().await.unwrap();
+
+    let request = ModbusRequest::ReadCoils {
+        starting_address: 0x0000,
+        quantity: 2,
+    };
+
+    let default_response = conn.send_message(&request).await.unwrap();
+    let alternate_response = conn.send_message_with_unit_id(2, &request).await.unwrap();
+
+    assert_eq!(
+        default_response,
+        ModbusResponse::ReadCoils {
+            coils: vec![true, false]
+        }
+    );
+    assert_eq!(
+        alternate_response,
+        ModbusResponse::ReadCoils {
+            coils: vec![true, false]
+        }
+    );
+}

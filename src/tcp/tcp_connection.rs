@@ -85,6 +85,21 @@ impl ModbusTcpConnection {
         self.timeouts
     }
 
+    pub fn unit_id(&self) -> u8 {
+        self.unit_id
+    }
+
+    pub fn with_unit_id(&self, unit_id: u8) -> Self {
+        Self {
+            stream: Arc::clone(&self.stream),
+            address: self.address,
+            port: self.port,
+            unit_id,
+            transaction_id: Arc::clone(&self.transaction_id),
+            timeouts: self.timeouts,
+        }
+    }
+
     async fn connect_stream(
         address: IpAddr,
         port: u16,
@@ -193,12 +208,19 @@ impl ModbusTcpConnection {
     }
 
     pub async fn send_message(&self, pdu: &ModbusRequest) -> Result<ModbusResponse, ModbusError> {
+        self.send_message_with_unit_id(self.unit_id, pdu).await
+    }
+
+    pub async fn send_message_with_unit_id(
+        &self,
+        unit_id: u8,
+        pdu: &ModbusRequest,
+    ) -> Result<ModbusResponse, ModbusError> {
         let backoff = Self::retry_backoff();
         let stream = Arc::clone(&self.stream);
         let transaction_id = Arc::clone(&self.transaction_id);
         let address = self.address;
         let port = self.port;
-        let unit_id = self.unit_id;
         let timeouts = self.timeouts;
         let pdu = pdu.clone();
 
@@ -371,5 +393,21 @@ mod tests {
             ModbusTcpConnection::with_timeouts("127.0.0.1".parse().unwrap(), 502, 1, 0, timeouts);
 
         assert_eq!(connection.timeouts(), timeouts);
+    }
+
+    #[test]
+    fn with_unit_id_returns_child_handle_with_shared_state() {
+        let connection = ModbusTcpConnection::new("127.0.0.1".parse().unwrap(), 502, 1, 7);
+
+        let child = connection.with_unit_id(42);
+
+        assert_eq!(connection.unit_id(), 1);
+        assert_eq!(child.unit_id(), 42);
+        assert_eq!(child.timeouts(), connection.timeouts());
+        assert!(Arc::ptr_eq(&connection.stream, &child.stream));
+        assert!(Arc::ptr_eq(
+            &connection.transaction_id,
+            &child.transaction_id,
+        ));
     }
 }
