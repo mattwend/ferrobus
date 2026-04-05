@@ -6,13 +6,16 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
+mod support;
+
 use tiny_mb::ModbusError;
 use tiny_mb::tcp::{ModbusTcpConnection, ModbusTcpTimeouts};
-use tiny_mb::test_support::{
-    build_exception_response_frame, build_protocol_mismatch_frame, build_tcp_response_frame,
-    read_request_frame, spawn_mock_server as spawn_test_server, spawn_slow_server, write_frame,
-};
 use tiny_mb::{ModbusRequest, ModbusResponse};
+
+use support::{
+    build_exception_response_frame, build_protocol_mismatch_frame, build_tcp_response_frame,
+    read_request_frame, spawn_mock_server as spawn_test_server, spawn_slow_server,
+};
 
 async fn spawn_mock_server<F, Fut>(handler: F) -> SocketAddr
 where
@@ -58,7 +61,7 @@ async fn send_read_coils_success() {
             request.unit_id,
             &[true, false, true, false, true, false, true, false],
         );
-        write_frame(&mut stream, &response).await.unwrap();
+        stream.write_all(&response).await.unwrap();
     })
     .await;
 
@@ -93,7 +96,7 @@ async fn send_write_single_register_success() {
             address,
             value,
         );
-        write_frame(&mut stream, &response).await.unwrap();
+        stream.write_all(&response).await.unwrap();
     })
     .await;
 
@@ -122,7 +125,7 @@ async fn transaction_id_increments() {
             let request = read_request_frame(&mut stream).await.unwrap();
             let response =
                 make_read_coils_response(request.transaction_id, request.unit_id, &[true, false]);
-            write_frame(&mut stream, &response).await.unwrap();
+            stream.write_all(&response).await.unwrap();
         }
     })
     .await;
@@ -144,7 +147,7 @@ async fn transaction_id_mismatch() {
         let request = read_request_frame(&mut stream).await.unwrap();
         let response =
             make_read_coils_response(request.transaction_id + 1, request.unit_id, &[true, false]);
-        write_frame(&mut stream, &response).await.unwrap();
+        stream.write_all(&response).await.unwrap();
     })
     .await;
 
@@ -342,7 +345,7 @@ async fn send_messages_across_multiple_unit_ids_on_one_connection() {
 
             let response =
                 make_read_coils_response(request.transaction_id, request.unit_id, &[true, false]);
-            write_frame(&mut stream, &response).await.unwrap();
+            stream.write_all(&response).await.unwrap();
         }
     })
     .await;
@@ -378,7 +381,7 @@ async fn send_message_returns_exception_response_as_typed_error() {
         let request = read_request_frame(&mut stream).await.unwrap();
         let response =
             build_exception_response_frame(request.transaction_id, request.unit_id, 0x01, 0x02);
-        write_frame(&mut stream, &response).await.unwrap();
+        stream.write_all(&response).await.unwrap();
     })
     .await;
 
@@ -410,7 +413,7 @@ async fn send_message_returns_protocol_id_mismatch_as_typed_error() {
             request.unit_id,
             &[0x01, 0x01, 0x01],
         );
-        write_frame(&mut stream, &response).await.unwrap();
+        stream.write_all(&response).await.unwrap();
     })
     .await;
 

@@ -19,6 +19,3 @@ pub mod response;
 pub use response::ModbusResponse;
 
 pub mod tcp;
-
-#[cfg(feature = "test-support")]
-pub mod test_support;
