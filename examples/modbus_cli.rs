@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2025 tiny-mb contributors
 
-use clap::{Parser, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::error::Error;
 use std::net::IpAddr;
+use std::process;
 use tracing::info;
 use tracing_subscriber::{filter::EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -12,129 +13,226 @@ use tiny_mb::ModbusRequest;
 use tiny_mb::ModbusResponse;
 use tiny_mb::tcp::ModbusTcpConnection;
 
+// ---------------------------------------------------------------------------
+// CLI definition
+// ---------------------------------------------------------------------------
+
 #[derive(Parser, Debug)]
 #[command(name = "modbus_cli")]
-#[command(about = "Modbus TCP client for tiny-mb library")]
-#[command(long_about = "Connects to a Modbus TCP device and issues one request at a time.")]
-#[command(after_help = "Examples:\n  \
-modbus_cli --address 192.168.1.10 read_holding 100 4\n  \
-modbus_cli write_coil 12 on\n  \
-modbus_cli --output hex write_register 200 4660\n  \
-modbus_cli write_coils 16 1 0 1 1\n  \
-modbus_cli write_registers 300 10 20 30\n  \
-modbus_cli -a 192.168.0.89 write_register 5004 6000")]
+#[command(about = "Modbus TCP client for the tiny-mb library")]
+#[command(long_about = "\
+Connects to a Modbus TCP device and issues one request at a time.\n\
+\n\
+Use `read` for non-mutating operations and `write` for state-changing operations.\n\
+Results are printed to stdout; errors and exceptions go to stderr.")]
+#[command(after_help = "\
+Examples:\n  \
+modbus_cli read holding --address 192.168.1.10 100 4\n  \
+modbus_cli read coils 0 16\n  \
+modbus_cli write coil 12 on\n  \
+modbus_cli write register --output hex 200 4660\n  \
+modbus_cli write coils 16 1 0 1 1\n  \
+modbus_cli write registers 300 10 20 30\n  \
+modbus_cli -a 192.168.0.89 write register 5004 6000\n\
+\n\
+Environment:\n  \
+LOG_LEVEL   Set tracing verbosity (e.g. LOG_LEVEL=debug)")]
 struct Cli {
     #[arg(
         short = 'a',
         long,
+        global = true,
         default_value = "127.0.0.1",
         help = "Target device IP address"
     )]
     address: IpAddr,
 
-    #[arg(short = 'p', long, default_value = "502", help = "Modbus TCP port")]
+    #[arg(
+        short = 'p',
+        long,
+        global = true,
+        default_value = "502",
+        help = "Modbus TCP port"
+    )]
     port: u16,
 
     #[arg(
         short = 'u',
         long,
+        global = true,
         default_value = "1",
-        help = "Modbus unit identifier"
+        help = "Modbus unit identifier (1-247)"
     )]
     unit_id: u8,
 
     #[arg(
         short = 't',
         long,
+        global = true,
         default_value = "1",
-        help = "Transaction identifier"
+        help = "Initial transaction identifier"
     )]
     transaction_id: u16,
 
     #[arg(
         short = 'o',
         long,
+        global = true,
         default_value = "decimal",
-        help = "Output format for register values"
+        help = "Output format for register values [decimal, hex]"
     )]
     output: OutputFormat,
 
-    #[arg(help = "Modbus function to execute")]
-    function: Function,
+    #[command(subcommand)]
+    command: Command,
+}
 
-    #[arg(
-        value_name = "START_ADDRESS",
-        help = "Starting register/coil address for the operation"
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Read coils, discrete inputs, or registers (non-mutating)
+    #[command(
+        about = "Read coils, discrete inputs, or registers from the device",
+        long_about = "Issues a non-mutating Modbus read request. The device state is not changed."
     )]
-    start_address: u16,
+    Read {
+        #[command(subcommand)]
+        operation: ReadOperation,
+    },
 
-    #[arg(
-        value_name = "QUANTITY_OR_VALUES",
-        help = "Read quantity or write payload values, depending on the function"
+    /// Write coils or registers (mutating)
+    #[command(
+        about = "Write coils or registers to the device",
+        long_about = "Issues a mutating Modbus write request. The target device state will change."
     )]
+    Write {
+        #[command(subcommand)]
+        operation: WriteOperation,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ReadOperation {
+    /// Read one or more coils (function code 0x01)
+    #[command(
+        about = "Read coils starting at <ADDRESS> (FC 0x01)",
+        after_help = "Example: modbus_cli read coils 0 16"
+    )]
+    Coils(ReadArgs),
+
+    /// Read one or more discrete inputs (function code 0x02)
+    #[command(
+        about = "Read discrete inputs starting at <ADDRESS> (FC 0x02)",
+        after_help = "Example: modbus_cli read discrete 100 8"
+    )]
+    Discrete(ReadArgs),
+
+    /// Read one or more holding registers (function code 0x03)
+    #[command(
+        about = "Read holding registers starting at <ADDRESS> (FC 0x03)",
+        after_help = "Example: modbus_cli read holding 40001 10"
+    )]
+    Holding(ReadArgs),
+
+    /// Read one or more input registers (function code 0x04)
+    #[command(
+        about = "Read input registers starting at <ADDRESS> (FC 0x04)",
+        after_help = "Example: modbus_cli read input 30001 5"
+    )]
+    Input(ReadArgs),
+}
+
+#[derive(Args, Debug)]
+struct ReadArgs {
+    /// Starting register or coil address (0-65535)
+    #[arg(value_name = "ADDRESS")]
+    address: u16,
+
+    /// Number of items to read (1-2000 for coils/discretes, 1-125 for registers)
+    #[arg(value_name = "QUANTITY")]
+    quantity: u16,
+}
+
+#[derive(Subcommand, Debug)]
+enum WriteOperation {
+    /// Write a single coil (function code 0x05)
+    #[command(
+        about = "Write a single coil at <ADDRESS> (FC 0x05)",
+        long_about = "Accepted coil values: 1, true, on (energize) or 0, false, off (de-energize).\n\
+                       The wire encoding uses 0xFF00 for ON and 0x0000 for OFF.",
+        after_help = "Example: modbus_cli write coil 12 on"
+    )]
+    Coil(WriteSingleCoilArgs),
+
+    /// Write a single holding register (function code 0x06)
+    #[command(
+        about = "Write a single register at <ADDRESS> (FC 0x06)",
+        long_about = "The value is an unsigned 16-bit integer (0-65535).\n\
+                       It is sent big-endian on the wire.",
+        after_help = "Example: modbus_cli write register 200 4660"
+    )]
+    Register(WriteSingleRegisterArgs),
+
+    /// Write multiple coils (function code 0x0F)
+    #[command(
+        about = "Write multiple coils starting at <ADDRESS> (FC 0x0F)",
+        long_about = "Each value is a coil state: 1/true/on or 0/false/off.\n\
+                       Values are applied starting at <ADDRESS> in order.",
+        after_help = "Example: modbus_cli write coils 16 1 0 1 1"
+    )]
+    Coils(WriteMultipleCoilsArgs),
+
+    /// Write multiple holding registers (function code 0x10)
+    #[command(
+        about = "Write multiple registers starting at <ADDRESS> (FC 0x10)",
+        long_about = "Each value is an unsigned 16-bit integer (0-65535).\n\
+                       Values are written starting at <ADDRESS> in order.",
+        after_help = "Example: modbus_cli write registers 300 10 20 30"
+    )]
+    Registers(WriteMultipleRegistersArgs),
+}
+
+#[derive(Args, Debug)]
+struct WriteSingleCoilArgs {
+    /// Coil address (0-65535)
+    #[arg(value_name = "ADDRESS")]
+    address: u16,
+
+    /// Coil state: 1, true, on (energize) or 0, false, off (de-energize)
+    #[arg(value_name = "VALUE")]
+    value: String,
+}
+
+#[derive(Args, Debug)]
+struct WriteSingleRegisterArgs {
+    /// Register address (0-65535)
+    #[arg(value_name = "ADDRESS")]
+    address: u16,
+
+    /// Unsigned 16-bit value (0-65535)
+    #[arg(value_name = "VALUE")]
+    value: String,
+}
+
+#[derive(Args, Debug)]
+struct WriteMultipleCoilsArgs {
+    /// Starting coil address (0-65535)
+    #[arg(value_name = "ADDRESS")]
+    address: u16,
+
+    /// One or more coil values: 1/true/on or 0/false/off
+    #[arg(value_name = "VALUES", required = true, num_args = 1..)]
     values: Vec<String>,
 }
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum Function {
-    #[clap(name = "read_coils")]
-    ReadCoils,
-    #[clap(name = "read_discrete")]
-    ReadDiscreteInputs,
-    #[clap(name = "read_holding")]
-    ReadHoldingRegisters,
-    #[clap(name = "read_input")]
-    ReadInputRegisters,
-    #[clap(name = "write_coil")]
-    WriteSingleCoil,
-    #[clap(name = "write_register")]
-    WriteSingleRegister,
-    #[clap(name = "write_coils")]
-    WriteMultipleCoils,
-    #[clap(name = "write_registers")]
-    WriteMultipleRegisters,
-}
+#[derive(Args, Debug)]
+struct WriteMultipleRegistersArgs {
+    /// Starting register address (0-65535)
+    #[arg(value_name = "ADDRESS")]
+    address: u16,
 
-impl Function {
-    fn cli_name(self) -> &'static str {
-        match self {
-            Function::ReadCoils => "read_coils",
-            Function::ReadDiscreteInputs => "read_discrete",
-            Function::ReadHoldingRegisters => "read_holding",
-            Function::ReadInputRegisters => "read_input",
-            Function::WriteSingleCoil => "write_coil",
-            Function::WriteSingleRegister => "write_register",
-            Function::WriteMultipleCoils => "write_coils",
-            Function::WriteMultipleRegisters => "write_registers",
-        }
-    }
-
-    fn display_name(self) -> &'static str {
-        match self {
-            Function::ReadCoils => "ReadCoils",
-            Function::ReadDiscreteInputs => "ReadDiscreteInputs",
-            Function::ReadHoldingRegisters => "ReadHoldingRegisters",
-            Function::ReadInputRegisters => "ReadInputRegisters",
-            Function::WriteSingleCoil => "WriteSingleCoil",
-            Function::WriteSingleRegister => "WriteSingleRegister",
-            Function::WriteMultipleCoils => "WriteMultipleCoils",
-            Function::WriteMultipleRegisters => "WriteMultipleRegisters",
-        }
-    }
-
-    fn from_code(code: u8) -> Option<Self> {
-        match code {
-            0x01 => Some(Function::ReadCoils),
-            0x02 => Some(Function::ReadDiscreteInputs),
-            0x03 => Some(Function::ReadHoldingRegisters),
-            0x04 => Some(Function::ReadInputRegisters),
-            0x05 => Some(Function::WriteSingleCoil),
-            0x06 => Some(Function::WriteSingleRegister),
-            0x0F => Some(Function::WriteMultipleCoils),
-            0x10 => Some(Function::WriteMultipleRegisters),
-            _ => None,
-        }
-    }
+    /// One or more unsigned 16-bit values (0-65535)
+    #[arg(value_name = "VALUES", required = true, num_args = 1..)]
+    values: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, ValueEnum)]
@@ -146,12 +244,37 @@ enum OutputFormat {
     Hex,
 }
 
+// ---------------------------------------------------------------------------
+// Display name helpers
+// ---------------------------------------------------------------------------
+
+/// Human-readable name for a Modbus function, used in echo and exception output.
+fn function_display_name(code: u8) -> &'static str {
+    match code {
+        0x01 => "ReadCoils",
+        0x02 => "ReadDiscreteInputs",
+        0x03 => "ReadHoldingRegisters",
+        0x04 => "ReadInputRegisters",
+        0x05 => "WriteSingleCoil",
+        0x06 => "WriteSingleRegister",
+        0x0F => "WriteMultipleCoils",
+        0x10 => "WriteMultipleRegisters",
+        _ => "Unknown",
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Parsing helpers
+// ---------------------------------------------------------------------------
+
 /// Accepts common operator-friendly coil spellings for write commands.
 fn parse_coil_value(s: &str) -> Result<bool, String> {
     match s {
         "1" | "true" | "on" => Ok(true),
         "0" | "false" | "off" => Ok(false),
-        _ => Err(format!("invalid coil value: {s}, expected 0 or 1")),
+        _ => Err(format!(
+            "invalid coil value: '{s}' — expected 1/true/on or 0/false/off"
+        )),
     }
 }
 
@@ -162,23 +285,16 @@ fn parse_coil_values(values: &[String]) -> Result<Vec<bool>, String> {
 /// Validates register values before they are sent in write requests.
 fn parse_register_value(s: &str) -> Result<u16, String> {
     s.parse::<u16>()
-        .map_err(|_| format!("invalid register value: {s}, expected u16"))
+        .map_err(|_| format!("invalid register value: '{s}' — expected unsigned integer 0-65535"))
 }
 
 fn parse_register_values(values: &[String]) -> Result<Vec<u16>, String> {
     values.iter().map(|s| parse_register_value(s)).collect()
 }
 
-/// Enforces the read-command convention of `<start_address> <quantity>`.
-fn parse_quantity(values: &[String], function: Function) -> Result<u16, String> {
-    let quantity = values.first().ok_or(format!(
-        "{} requires <quantity> argument",
-        function.cli_name()
-    ))?;
-    quantity
-        .parse::<u16>()
-        .map_err(|_| format!("invalid quantity: {quantity}"))
-}
+// ---------------------------------------------------------------------------
+// Formatting helpers
+// ---------------------------------------------------------------------------
 
 fn format_register(value: u16, format: OutputFormat) -> String {
     match format {
@@ -193,9 +309,7 @@ fn format_coil(value: bool) -> &'static str {
 
 /// Formats exception responses for operators diagnosing bad addresses or unsupported functions.
 fn format_exception(function: u8, code: u8) -> String {
-    let function_name = Function::from_code(function)
-        .map(Function::display_name)
-        .unwrap_or("Unknown");
+    let func = function_display_name(function & 0x7F);
     let exception_name = match code {
         0x01 => "IllegalFunction",
         0x02 => "IllegalDataAddress",
@@ -208,99 +322,125 @@ fn format_exception(function: u8, code: u8) -> String {
         0x0B => "GatewayTargetDeviceFailedToRespond",
         _ => "Unknown",
     };
-    format!("Exception({function_name}, code={code} ({exception_name}))")
+    format!("Exception: {func}, code={code} ({exception_name})")
 }
 
-/// Translates CLI arguments into the typed request enum expected by the library.
-///
-/// Arguments:
-/// - `function`: Selected Modbus function.
-/// - `address`: Starting register or coil address for the operation.
-/// - `values`: Remaining CLI values, interpreted as a quantity or write payload.
-///
-/// Returns:
-/// - `Ok(ModbusRequest)` when the arguments match the selected function.
-/// - `Err(String)` when required values are missing or invalid.
-fn build_request(
-    function: Function,
-    address: u16,
-    values: &[String],
-) -> Result<ModbusRequest, String> {
-    match function {
-        Function::ReadCoils => {
-            let quantity = parse_quantity(values, function)?;
-            Ok(ModbusRequest::ReadCoils {
-                starting_address: address,
-                quantity,
-            })
+// ---------------------------------------------------------------------------
+// Request description — echoes what was requested
+// ---------------------------------------------------------------------------
+
+/// Returns a concise, human-readable description of the request that was issued.
+fn describe_request(request: &ModbusRequest) -> String {
+    match request {
+        ModbusRequest::ReadCoils {
+            starting_address,
+            quantity,
+        } => format!("ReadCoils address={starting_address} quantity={quantity}"),
+        ModbusRequest::ReadDiscreteInputs {
+            starting_address,
+            quantity,
+        } => format!("ReadDiscreteInputs address={starting_address} quantity={quantity}"),
+        ModbusRequest::ReadHoldingRegisters {
+            starting_address,
+            quantity,
+        } => format!("ReadHoldingRegisters address={starting_address} quantity={quantity}"),
+        ModbusRequest::ReadInputRegisters {
+            starting_address,
+            quantity,
+        } => format!("ReadInputRegisters address={starting_address} quantity={quantity}"),
+        ModbusRequest::WriteSingleCoil { address, value } => {
+            format!(
+                "WriteSingleCoil address={address} value={}",
+                format_coil(*value)
+            )
         }
-        Function::ReadDiscreteInputs => {
-            let quantity = parse_quantity(values, function)?;
-            Ok(ModbusRequest::ReadDiscreteInputs {
-                starting_address: address,
-                quantity,
-            })
+        ModbusRequest::WriteSingleRegister { address, value } => {
+            format!("WriteSingleRegister address={address} value={value}")
         }
-        Function::ReadHoldingRegisters => {
-            let quantity = parse_quantity(values, function)?;
-            Ok(ModbusRequest::ReadHoldingRegisters {
-                starting_address: address,
-                quantity,
-            })
-        }
-        Function::ReadInputRegisters => {
-            let quantity = parse_quantity(values, function)?;
-            Ok(ModbusRequest::ReadInputRegisters {
-                starting_address: address,
-                quantity,
-            })
-        }
-        Function::WriteSingleCoil => {
-            let value = values
-                .first()
-                .ok_or("write_coil requires <value> argument (0 or 1)")?;
-            let value = parse_coil_value(value)?;
-            Ok(ModbusRequest::WriteSingleCoil { address, value })
-        }
-        Function::WriteSingleRegister => {
-            let value = values
-                .first()
-                .ok_or("write_register requires <value> argument")?;
-            let value = parse_register_value(value)?;
-            Ok(ModbusRequest::WriteSingleRegister { address, value })
-        }
-        Function::WriteMultipleCoils => {
-            let values = parse_coil_values(values)?;
-            if values.is_empty() {
-                return Err("write_coils requires at least one value (0 or 1)".to_string());
-            }
-            Ok(ModbusRequest::WriteMultipleCoils {
-                starting_address: address,
-                values,
-            })
-        }
-        Function::WriteMultipleRegisters => {
-            let values = parse_register_values(values)?;
-            if values.is_empty() {
-                return Err("write_registers requires at least one value".to_string());
-            }
-            Ok(ModbusRequest::WriteMultipleRegisters {
-                starting_address: address,
-                values,
-            })
-        }
+        ModbusRequest::WriteMultipleCoils {
+            starting_address,
+            values,
+        } => format!(
+            "WriteMultipleCoils address={starting_address} quantity={}",
+            values.len()
+        ),
+        ModbusRequest::WriteMultipleRegisters {
+            starting_address,
+            values,
+        } => format!(
+            "WriteMultipleRegisters address={starting_address} quantity={}",
+            values.len()
+        ),
     }
 }
 
+// ---------------------------------------------------------------------------
+// Request builder
+// ---------------------------------------------------------------------------
+
+/// Translates CLI subcommands into the typed request enum expected by the library.
+fn build_request(command: &Command) -> Result<ModbusRequest, String> {
+    match command {
+        Command::Read { operation } => match operation {
+            ReadOperation::Coils(args) => Ok(ModbusRequest::ReadCoils {
+                starting_address: args.address,
+                quantity: args.quantity,
+            }),
+            ReadOperation::Discrete(args) => Ok(ModbusRequest::ReadDiscreteInputs {
+                starting_address: args.address,
+                quantity: args.quantity,
+            }),
+            ReadOperation::Holding(args) => Ok(ModbusRequest::ReadHoldingRegisters {
+                starting_address: args.address,
+                quantity: args.quantity,
+            }),
+            ReadOperation::Input(args) => Ok(ModbusRequest::ReadInputRegisters {
+                starting_address: args.address,
+                quantity: args.quantity,
+            }),
+        },
+        Command::Write { operation } => match operation {
+            WriteOperation::Coil(args) => {
+                let value = parse_coil_value(&args.value)?;
+                Ok(ModbusRequest::WriteSingleCoil {
+                    address: args.address,
+                    value,
+                })
+            }
+            WriteOperation::Register(args) => {
+                let value = parse_register_value(&args.value)?;
+                Ok(ModbusRequest::WriteSingleRegister {
+                    address: args.address,
+                    value,
+                })
+            }
+            WriteOperation::Coils(args) => {
+                let values = parse_coil_values(&args.values)?;
+                Ok(ModbusRequest::WriteMultipleCoils {
+                    starting_address: args.address,
+                    values,
+                })
+            }
+            WriteOperation::Registers(args) => {
+                let values = parse_register_values(&args.values)?;
+                Ok(ModbusRequest::WriteMultipleRegisters {
+                    starting_address: args.address,
+                    values,
+                })
+            }
+        },
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Response printing
+// ---------------------------------------------------------------------------
+
 /// Formats responses for interactive use and simple shell pipelines.
-///
-/// Arguments:
-/// - `response`: Parsed Modbus response returned by the library.
-/// - `output_format`: Output style for register values.
-///
-/// Returns:
-/// - Nothing. Output is written to stdout or stderr.
-fn print_response(response: ModbusResponse, output_format: OutputFormat) {
+fn print_response(request: &ModbusRequest, response: ModbusResponse, output_format: OutputFormat) {
+    // Echo the requested action so the operator can confirm what was issued.
+    eprintln!("Request: {}", describe_request(request));
+
     match response {
         ModbusResponse::ReadCoils { coils } => {
             for coil in coils {
@@ -323,11 +463,11 @@ fn print_response(response: ModbusResponse, output_format: OutputFormat) {
             }
         }
         ModbusResponse::WriteSingleCoil { address, value } => {
-            println!("address={}, value={}", address, format_coil(value));
+            println!("OK: address={}, value={}", address, format_coil(value));
         }
         ModbusResponse::WriteSingleRegister { address, value } => {
             println!(
-                "address={}, value={}",
+                "OK: address={}, value={}",
                 address,
                 format_register(value, output_format)
             );
@@ -337,7 +477,7 @@ fn print_response(response: ModbusResponse, output_format: OutputFormat) {
             quantity,
         } => {
             println!(
-                "starting_address={}, quantity={}",
+                "OK: starting_address={}, quantity={}",
                 starting_address, quantity
             );
         }
@@ -346,7 +486,7 @@ fn print_response(response: ModbusResponse, output_format: OutputFormat) {
             quantity,
         } => {
             println!(
-                "starting_address={}, quantity={}",
+                "OK: starting_address={}, quantity={}",
                 starting_address, quantity
             );
         }
@@ -355,6 +495,60 @@ fn print_response(response: ModbusResponse, output_format: OutputFormat) {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Error formatting — phase-aware timeout hints
+// ---------------------------------------------------------------------------
+
+/// Formats a `ModbusError` with phase-specific guidance so the operator
+/// knows which stage failed and what to try next.
+fn format_error(error: &ModbusError, address: IpAddr, port: u16) -> String {
+    match error {
+        ModbusError::ConnectError(e) => {
+            format!(
+                "Connect failed ({address}:{port}): {e}\n\
+                 Hint: verify the device is reachable and the port is correct."
+            )
+        }
+        ModbusError::ConnectTimeout => {
+            format!(
+                "Connect timed out ({address}:{port}).\n\
+                 Hint: check network connectivity and firewall rules."
+            )
+        }
+        ModbusError::WriteError(e) => {
+            format!(
+                "Write failed ({address}:{port}): {e}\n\
+                 Hint: the TCP session may have been closed by the device. Retry the request."
+            )
+        }
+        ModbusError::WriteTimeout => {
+            format!(
+                "Write timed out ({address}:{port}).\n\
+                 Hint: the device may be unresponsive. Check the connection and retry."
+            )
+        }
+        ModbusError::ReadError(e) => {
+            format!(
+                "Read failed ({address}:{port}): {e}\n\
+                 Hint: the device may have dropped the connection after the request was sent."
+            )
+        }
+        ModbusError::ReadTimeout => {
+            format!(
+                "Read timed out ({address}:{port}).\n\
+                 Hint: the device accepted the connection but did not respond in time. \
+                 Verify the unit ID and function are supported."
+            )
+        }
+        ModbusError::ExceptionResponse { function, code } => format_exception(*function, *code),
+        other => format!("Error: {other}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Entry point
+// ---------------------------------------------------------------------------
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -365,26 +559,376 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let cli = Cli::parse();
 
-    let request = build_request(cli.function, cli.start_address, &cli.values)
-        .map_err(std::io::Error::other)?;
+    let request = match build_request(&cli.command) {
+        Ok(r) => r,
+        Err(message) => {
+            eprintln!("Error: {message}");
+            process::exit(2);
+        }
+    };
 
     info!(
         "Connecting to {}:{} (unit_id={}, transaction_id={})",
         cli.address, cli.port, cli.unit_id, cli.transaction_id
     );
+    info!("{}", describe_request(&request));
 
     let connection =
         ModbusTcpConnection::new(cli.address, cli.port, cli.unit_id, cli.transaction_id);
 
-    connection.connect().await?;
+    connection
+        .connect()
+        .await
+        .map_err(|e| format_error(&e, cli.address, cli.port))?;
 
     match connection.send_message(&request).await {
-        Ok(response) => print_response(response, cli.output),
+        Ok(response) => print_response(&request, response, cli.output),
         Err(ModbusError::ExceptionResponse { function, code }) => {
+            eprintln!("Request: {}", describe_request(&request));
             eprintln!("{}", format_exception(function, code));
+            process::exit(1);
         }
-        Err(error) => return Err(error.into()),
+        Err(error) => {
+            eprintln!("Request: {}", describe_request(&request));
+            eprintln!("{}", format_error(&error, cli.address, cli.port));
+            process::exit(1);
+        }
     }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -- Coil parsing -------------------------------------------------------
+
+    #[test]
+    fn parse_coil_accepts_on_spellings() {
+        assert!(parse_coil_value("1").unwrap());
+        assert!(parse_coil_value("true").unwrap());
+        assert!(parse_coil_value("on").unwrap());
+    }
+
+    #[test]
+    fn parse_coil_accepts_off_spellings() {
+        assert!(!parse_coil_value("0").unwrap());
+        assert!(!parse_coil_value("false").unwrap());
+        assert!(!parse_coil_value("off").unwrap());
+    }
+
+    #[test]
+    fn parse_coil_rejects_invalid() {
+        assert!(parse_coil_value("yes").is_err());
+        assert!(parse_coil_value("2").is_err());
+        assert!(parse_coil_value("").is_err());
+    }
+
+    // -- Register parsing ---------------------------------------------------
+
+    #[test]
+    fn parse_register_valid() {
+        assert_eq!(parse_register_value("0").unwrap(), 0);
+        assert_eq!(parse_register_value("65535").unwrap(), 65535);
+        assert_eq!(parse_register_value("4660").unwrap(), 4660);
+    }
+
+    #[test]
+    fn parse_register_rejects_overflow() {
+        assert!(parse_register_value("65536").is_err());
+        assert!(parse_register_value("-1").is_err());
+        assert!(parse_register_value("abc").is_err());
+    }
+
+    // -- Request building ---------------------------------------------------
+
+    #[test]
+    fn build_read_coils_request() {
+        let cmd = Command::Read {
+            operation: ReadOperation::Coils(ReadArgs {
+                address: 100,
+                quantity: 8,
+            }),
+        };
+        let request = build_request(&cmd).unwrap();
+        assert_eq!(
+            request,
+            ModbusRequest::ReadCoils {
+                starting_address: 100,
+                quantity: 8
+            }
+        );
+    }
+
+    #[test]
+    fn build_read_discrete_request() {
+        let cmd = Command::Read {
+            operation: ReadOperation::Discrete(ReadArgs {
+                address: 0,
+                quantity: 16,
+            }),
+        };
+        let request = build_request(&cmd).unwrap();
+        assert_eq!(
+            request,
+            ModbusRequest::ReadDiscreteInputs {
+                starting_address: 0,
+                quantity: 16
+            }
+        );
+    }
+
+    #[test]
+    fn build_read_holding_request() {
+        let cmd = Command::Read {
+            operation: ReadOperation::Holding(ReadArgs {
+                address: 40001,
+                quantity: 10,
+            }),
+        };
+        let request = build_request(&cmd).unwrap();
+        assert_eq!(
+            request,
+            ModbusRequest::ReadHoldingRegisters {
+                starting_address: 40001,
+                quantity: 10
+            }
+        );
+    }
+
+    #[test]
+    fn build_read_input_request() {
+        let cmd = Command::Read {
+            operation: ReadOperation::Input(ReadArgs {
+                address: 30001,
+                quantity: 5,
+            }),
+        };
+        let request = build_request(&cmd).unwrap();
+        assert_eq!(
+            request,
+            ModbusRequest::ReadInputRegisters {
+                starting_address: 30001,
+                quantity: 5
+            }
+        );
+    }
+
+    #[test]
+    fn build_write_single_coil_request() {
+        let cmd = Command::Write {
+            operation: WriteOperation::Coil(WriteSingleCoilArgs {
+                address: 12,
+                value: "on".to_string(),
+            }),
+        };
+        let request = build_request(&cmd).unwrap();
+        assert_eq!(
+            request,
+            ModbusRequest::WriteSingleCoil {
+                address: 12,
+                value: true
+            }
+        );
+    }
+
+    #[test]
+    fn build_write_single_register_request() {
+        let cmd = Command::Write {
+            operation: WriteOperation::Register(WriteSingleRegisterArgs {
+                address: 200,
+                value: "4660".to_string(),
+            }),
+        };
+        let request = build_request(&cmd).unwrap();
+        assert_eq!(
+            request,
+            ModbusRequest::WriteSingleRegister {
+                address: 200,
+                value: 4660
+            }
+        );
+    }
+
+    #[test]
+    fn build_write_multiple_coils_request() {
+        let cmd = Command::Write {
+            operation: WriteOperation::Coils(WriteMultipleCoilsArgs {
+                address: 16,
+                values: vec![
+                    "1".to_string(),
+                    "0".to_string(),
+                    "true".to_string(),
+                    "off".to_string(),
+                ],
+            }),
+        };
+        let request = build_request(&cmd).unwrap();
+        assert_eq!(
+            request,
+            ModbusRequest::WriteMultipleCoils {
+                starting_address: 16,
+                values: vec![true, false, true, false]
+            }
+        );
+    }
+
+    #[test]
+    fn build_write_multiple_registers_request() {
+        let cmd = Command::Write {
+            operation: WriteOperation::Registers(WriteMultipleRegistersArgs {
+                address: 300,
+                values: vec!["10".to_string(), "20".to_string(), "30".to_string()],
+            }),
+        };
+        let request = build_request(&cmd).unwrap();
+        assert_eq!(
+            request,
+            ModbusRequest::WriteMultipleRegisters {
+                starting_address: 300,
+                values: vec![10, 20, 30]
+            }
+        );
+    }
+
+    #[test]
+    fn build_write_single_coil_rejects_bad_value() {
+        let cmd = Command::Write {
+            operation: WriteOperation::Coil(WriteSingleCoilArgs {
+                address: 0,
+                value: "yes".to_string(),
+            }),
+        };
+        assert!(build_request(&cmd).is_err());
+    }
+
+    #[test]
+    fn build_write_single_register_rejects_overflow() {
+        let cmd = Command::Write {
+            operation: WriteOperation::Register(WriteSingleRegisterArgs {
+                address: 0,
+                value: "99999".to_string(),
+            }),
+        };
+        assert!(build_request(&cmd).is_err());
+    }
+
+    // -- Describe request ---------------------------------------------------
+
+    #[test]
+    fn describe_request_read_coils() {
+        let request = ModbusRequest::ReadCoils {
+            starting_address: 100,
+            quantity: 8,
+        };
+        let desc = describe_request(&request);
+        assert!(desc.contains("ReadCoils"));
+        assert!(desc.contains("100"));
+        assert!(desc.contains("8"));
+    }
+
+    #[test]
+    fn describe_request_write_single_coil() {
+        let request = ModbusRequest::WriteSingleCoil {
+            address: 12,
+            value: true,
+        };
+        let desc = describe_request(&request);
+        assert!(desc.contains("WriteSingleCoil"));
+        assert!(desc.contains("12"));
+        assert!(desc.contains("1"));
+    }
+
+    #[test]
+    fn describe_request_write_multiple_registers() {
+        let request = ModbusRequest::WriteMultipleRegisters {
+            starting_address: 300,
+            values: vec![10, 20, 30],
+        };
+        let desc = describe_request(&request);
+        assert!(desc.contains("WriteMultipleRegisters"));
+        assert!(desc.contains("300"));
+        assert!(desc.contains("3"));
+    }
+
+    // -- Exception formatting -----------------------------------------------
+
+    #[test]
+    fn format_exception_known_codes() {
+        let msg = format_exception(0x81, 0x02);
+        assert!(msg.contains("ReadCoils"));
+        assert!(msg.contains("IllegalDataAddress"));
+    }
+
+    #[test]
+    fn format_exception_unknown_function() {
+        let msg = format_exception(0xF0, 0x01);
+        assert!(msg.contains("Unknown"));
+        assert!(msg.contains("IllegalFunction"));
+    }
+
+    // -- Error formatting ---------------------------------------------------
+
+    #[test]
+    fn format_error_connect_timeout_includes_hint() {
+        let addr: IpAddr = "192.168.1.10".parse().unwrap();
+        let msg = format_error(&ModbusError::ConnectTimeout, addr, 502);
+        assert!(msg.contains("Connect timed out"));
+        assert!(msg.contains("192.168.1.10:502"));
+        assert!(msg.contains("Hint"));
+    }
+
+    #[test]
+    fn format_error_read_timeout_includes_hint() {
+        let addr: IpAddr = "10.0.0.1".parse().unwrap();
+        let msg = format_error(&ModbusError::ReadTimeout, addr, 502);
+        assert!(msg.contains("Read timed out"));
+        assert!(msg.contains("10.0.0.1:502"));
+        assert!(msg.contains("unit ID"));
+    }
+
+    #[test]
+    fn format_error_write_timeout_includes_hint() {
+        let addr: IpAddr = "10.0.0.1".parse().unwrap();
+        let msg = format_error(&ModbusError::WriteTimeout, addr, 502);
+        assert!(msg.contains("Write timed out"));
+        assert!(msg.contains("Hint"));
+    }
+
+    // -- Output formatting --------------------------------------------------
+
+    #[test]
+    fn format_register_decimal() {
+        assert_eq!(format_register(4660, OutputFormat::Decimal), "4660");
+    }
+
+    #[test]
+    fn format_register_hex() {
+        assert_eq!(format_register(4660, OutputFormat::Hex), "0x1234");
+    }
+
+    #[test]
+    fn format_coil_values() {
+        assert_eq!(format_coil(true), "1");
+        assert_eq!(format_coil(false), "0");
+    }
+
+    // -- Function display name ----------------------------------------------
+
+    #[test]
+    fn function_display_name_known() {
+        assert_eq!(function_display_name(0x01), "ReadCoils");
+        assert_eq!(function_display_name(0x06), "WriteSingleRegister");
+        assert_eq!(function_display_name(0x10), "WriteMultipleRegisters");
+    }
+
+    #[test]
+    fn function_display_name_unknown() {
+        assert_eq!(function_display_name(0xFF), "Unknown");
+    }
 }
