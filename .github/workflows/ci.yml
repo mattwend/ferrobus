@@ -59,4 +59,4 @@ jobs:
         with:
           files: lcov.info
           fail_ci_if_error: false
-          # token: ${{ secrets.CODECOV_TOKEN }}  # required for private repos
+          token: ${{ secrets.CODECOV_TOKEN }}
