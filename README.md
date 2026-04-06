@@ -1,7 +1,7 @@
 # tiny-mb
 
 [![CI](https://github.com/mattwend/tiny-mb/actions/workflows/ci.yml/badge.svg)](https://github.com/mattwend/tiny-mb/actions/workflows/ci.yml)
-[![codecov](https://codecov.io/gh/mattwend/tiny-mb/branch/main/graph/badge.svg)](https://codecov.io/gh/mattwend/tiny-mb)
+[![codecov](https://codecov.io/gh/mattwend/tiny-mb/branch/v0.x.x/graph/badge.svg)](https://codecov.io/gh/mattwend/tiny-mb)
 
 Small Rust Modbus library with typed request/response PDUs and a reusable Modbus TCP transport.
 
