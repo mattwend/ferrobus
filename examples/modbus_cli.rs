@@ -40,12 +40,12 @@ LOG_LEVEL   Set tracing verbosity (e.g. LOG_LEVEL=debug)")]
 struct Cli {
     #[arg(
         short = 'a',
-        long,
+        long = "address",
         global = true,
         default_value = "127.0.0.1",
         help = "Target device IP address"
     )]
-    address: IpAddr,
+    ip_address: IpAddr,
 
     #[arg(
         short = 'p',
@@ -569,17 +569,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     info!(
         "Connecting to {}:{} (unit_id={}, transaction_id={})",
-        cli.address, cli.port, cli.unit_id, cli.transaction_id
+        cli.ip_address, cli.port, cli.unit_id, cli.transaction_id
     );
     info!("{}", describe_request(&request));
 
     let connection =
-        ModbusTcpConnection::new(cli.address, cli.port, cli.unit_id, cli.transaction_id);
+        ModbusTcpConnection::new(cli.ip_address, cli.port, cli.unit_id, cli.transaction_id);
 
     connection
         .connect()
         .await
-        .map_err(|e| format_error(&e, cli.address, cli.port))?;
+        .map_err(|e| format_error(&e, cli.ip_address, cli.port))?;
 
     match connection.send_message(&request).await {
         Ok(response) => print_response(&request, response, cli.output),
@@ -590,7 +590,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
         Err(error) => {
             eprintln!("Request: {}", describe_request(&request));
-            eprintln!("{}", format_error(&error, cli.address, cli.port));
+            eprintln!("{}", format_error(&error, cli.ip_address, cli.port));
             process::exit(1);
         }
     }
@@ -930,5 +930,30 @@ mod tests {
     #[test]
     fn function_display_name_unknown() {
         assert_eq!(function_display_name(0xFF), "Unknown");
+    }
+
+    #[test]
+    fn parse_cli_global_address_does_not_conflict_with_register_address() {
+        let cli = Cli::parse_from([
+            "modbus_cli",
+            "-a",
+            "192.168.0.89",
+            "write",
+            "register",
+            "5004",
+            "16000",
+        ]);
+
+        assert_eq!(cli.ip_address, "192.168.0.89".parse::<IpAddr>().unwrap());
+        match cli.command {
+            Command::Write { operation } => match operation {
+                WriteOperation::Register(args) => {
+                    assert_eq!(args.address, 5004);
+                    assert_eq!(args.value, "16000");
+                }
+                other => panic!("expected write register command, got {other:?}"),
+            },
+            other => panic!("expected write command, got {other:?}"),
+        }
     }
 }
