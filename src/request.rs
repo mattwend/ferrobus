@@ -83,7 +83,13 @@ impl ModbusRequest {
                 }
             }
             ModbusRequest::WriteMultipleCoils { values, .. } => {
-                let qty = values.len() as u16;
+                let qty = u16::try_from(values.len()).map_err(|_| {
+                    ModbusError::ValidationError(format!(
+                        "WriteMultipleCoils quantity must be 1-{}, got {}",
+                        MAX_WRITE_MULTIPLE_COILS,
+                        values.len()
+                    ))
+                })?;
                 if qty == 0 || qty > MAX_WRITE_MULTIPLE_COILS {
                     return Err(ModbusError::ValidationError(format!(
                         "WriteMultipleCoils quantity must be 1-{}, got {}",
@@ -92,7 +98,13 @@ impl ModbusRequest {
                 }
             }
             ModbusRequest::WriteMultipleRegisters { values, .. } => {
-                let qty = values.len() as u16;
+                let qty = u16::try_from(values.len()).map_err(|_| {
+                    ModbusError::ValidationError(format!(
+                        "WriteMultipleRegisters quantity must be 1-{}, got {}",
+                        MAX_WRITE_MULTIPLE_REGISTERS,
+                        values.len()
+                    ))
+                })?;
                 if qty == 0 || qty > MAX_WRITE_MULTIPLE_REGISTERS {
                     return Err(ModbusError::ValidationError(format!(
                         "WriteMultipleRegisters quantity must be 1-{}, got {}",
@@ -181,26 +193,29 @@ fn serialize_modbus_request_internal(pdu: &ModbusRequest) -> Vec<u8> {
             starting_address,
             values,
         } => {
+            debug_assert!(values.len() <= usize::from(MAX_WRITE_MULTIPLE_COILS));
+
             frame.push(15u8);
-            let quantity = u16::try_from(values.len()).expect("validated above");
+            let quantity = values.len() as u16;
             frame.extend_from_slice(&starting_address.to_be_bytes());
             frame.extend_from_slice(&quantity.to_be_bytes());
             let coil_bytes = pack_coils(values);
-            frame.push(u8::try_from(coil_bytes.len()).expect("coil byte count fits in u8"));
+            let coil_byte_count = coil_bytes.len() as u8;
+            frame.push(coil_byte_count);
             frame.extend_from_slice(&coil_bytes);
         }
         ModbusRequest::WriteMultipleRegisters {
             starting_address,
             values,
         } => {
+            debug_assert!(values.len() <= usize::from(MAX_WRITE_MULTIPLE_REGISTERS));
+
             frame.push(16u8);
-            let quantity = u16::try_from(values.len()).expect("validated above");
+            let quantity = values.len() as u16;
             frame.extend_from_slice(&starting_address.to_be_bytes());
             frame.extend_from_slice(&quantity.to_be_bytes());
-            frame.push(
-                u8::try_from(quantity.checked_mul(2).expect("byte count fits in u8"))
-                    .expect("byte count fits in u8"),
-            );
+            let byte_count = (values.len() * 2) as u8;
+            frame.push(byte_count);
             for reg in values {
                 frame.extend_from_slice(&reg.to_be_bytes());
             }
@@ -466,6 +481,26 @@ mod tests {
         let pdu = ModbusRequest::WriteMultipleRegisters {
             starting_address: 0x0000,
             values: vec![0x0000; 124],
+        };
+        let result = pdu.serialize();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_write_multiple_coils_len_overflows_u16() {
+        let pdu = ModbusRequest::WriteMultipleCoils {
+            starting_address: 0x0000,
+            values: vec![true; usize::from(u16::MAX) + 1],
+        };
+        let result = pdu.serialize();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_write_multiple_registers_len_overflows_u16() {
+        let pdu = ModbusRequest::WriteMultipleRegisters {
+            starting_address: 0x0000,
+            values: vec![0x0000; usize::from(u16::MAX) + 1],
         };
         let result = pdu.serialize();
         assert!(result.is_err());
