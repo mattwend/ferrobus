@@ -64,6 +64,7 @@ pub struct ModbusTcpConnection {
 
 impl ModbusTcpConnection {
     /// Creates a connection handle with default connect, write, and read timeouts.
+    #[must_use]
     pub fn new(address: IpAddr, port: u16, unit_id: u8, transaction_id: u16) -> Self {
         Self::with_timeouts(
             address,
@@ -75,6 +76,7 @@ impl ModbusTcpConnection {
     }
 
     /// Creates a connection handle with explicit timeout settings.
+    #[must_use]
     pub fn with_timeouts(
         address: IpAddr,
         port: u16,
@@ -93,16 +95,19 @@ impl ModbusTcpConnection {
     }
 
     /// Returns the timeout configuration used for future operations.
+    #[must_use]
     pub fn timeouts(&self) -> ModbusTcpTimeouts {
         self.timeouts
     }
 
     /// Returns the default unit identifier used by [`Self::send_message`].
+    #[must_use]
     pub fn unit_id(&self) -> u8 {
         self.unit_id
     }
 
     /// Returns a new handle that shares the same transport but overrides the default unit id.
+    #[must_use]
     pub fn with_unit_id(&self, unit_id: u8) -> Self {
         Self {
             stream: Arc::clone(&self.stream),
@@ -119,7 +124,7 @@ impl ModbusTcpConnection {
         port: u16,
         connect_timeout: Duration,
     ) -> Result<TcpStream, ModbusError> {
-        let server_addr = format!("{}:{}", address, port);
+        let server_addr = format!("{address}:{port}");
         let stream = timeout(connect_timeout, TcpStream::connect(&server_addr))
             .await
             .map_err(|_| ModbusError::ConnectTimeout)?
@@ -132,6 +137,10 @@ impl ModbusTcpConnection {
     ///
     /// Calling this is optional because [`Self::send_message`] and
     /// [`Self::send_message_with_unit_id`] connect lazily when needed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ModbusError::ConnectError`] or [`ModbusError::ConnectTimeout`] if opening the socket fails.
     pub async fn connect(&self) -> Result<(), ModbusError> {
         let stream =
             Self::connect_stream(self.address, self.port, self.timeouts.connect_timeout).await?;
@@ -151,7 +160,7 @@ impl ModbusTcpConnection {
         self.stream.lock().await.is_some()
     }
 
-    fn response_body_len_from_header(header: &[u8; MBAP_HEADER_LEN]) -> Result<usize, ModbusError> {
+    fn response_body_len_from_header(header: [u8; MBAP_HEADER_LEN]) -> Result<usize, ModbusError> {
         let pdu_length = u16::from_be_bytes([header[4], header[5]]) as usize;
         if pdu_length < 2 {
             return Err(ModbusError::MalformedResponse(
@@ -163,8 +172,7 @@ impl ModbusTcpConnection {
         let total_length = MBAP_HEADER_LEN + body_len;
         if total_length > MAX_MODBUS_TCP_FRAME {
             return Err(ModbusError::MalformedResponse(format!(
-                "Response exceeds maximum frame size: {} > {}",
-                total_length, MAX_MODBUS_TCP_FRAME
+                "Response exceeds maximum frame size: {total_length} > {MAX_MODBUS_TCP_FRAME}"
             )));
         }
 
@@ -216,7 +224,7 @@ impl ModbusTcpConnection {
             Err(_) => return Err(ModbusError::ReadTimeout),
         }
 
-        let body_len = Self::response_body_len_from_header(&header_buffer).map_err(|error| {
+        let body_len = Self::response_body_len_from_header(header_buffer).map_err(|error| {
             ModbusError::MalformedResponse(format!("invalid MBAP header: {error}"))
         })?;
         let mut response_buffer = vec![0u8; MBAP_HEADER_LEN + body_len];
@@ -238,6 +246,10 @@ impl ModbusTcpConnection {
     ///
     /// The connection is opened on demand, and transient I/O failures are retried
     /// with a short exponential backoff.
+    ///
+    /// # Errors
+    ///
+    /// Returns transport, protocol, validation, or request/response mismatch errors.
     pub async fn send_message(&self, pdu: &ModbusRequest) -> Result<ModbusResponse, ModbusError> {
         self.send_message_with_unit_id(self.unit_id, pdu).await
     }
@@ -245,6 +257,10 @@ impl ModbusTcpConnection {
     /// Sends one request using an explicit unit id.
     ///
     /// This is useful when one TCP gateway fronts multiple logical Modbus devices.
+    ///
+    /// # Errors
+    ///
+    /// Returns transport, protocol, validation, or request/response mismatch errors.
     pub async fn send_message_with_unit_id(
         &self,
         unit_id: u8,
@@ -333,6 +349,7 @@ impl ModbusTcpConnection {
 }
 
 #[cfg(test)]
+#[allow(clippy::panic, clippy::unwrap_used)]
 mod tests {
     use super::*;
     use tokio::net::TcpListener;
@@ -351,14 +368,14 @@ mod tests {
     #[test]
     fn response_body_len_excludes_unit_id() {
         let header = [0x00, 0x01, 0x00, 0x00, 0x00, 0x06, 0x11];
-        let body_len = ModbusTcpConnection::response_body_len_from_header(&header).unwrap();
+        let body_len = ModbusTcpConnection::response_body_len_from_header(header).unwrap();
         assert_eq!(body_len, 5);
     }
 
     #[test]
     fn response_body_len_rejects_zero_length() {
         let header = [0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x11];
-        let error = ModbusTcpConnection::response_body_len_from_header(&header).unwrap_err();
+        let error = ModbusTcpConnection::response_body_len_from_header(header).unwrap_err();
         match error {
             ModbusError::MalformedResponse(message) => {
                 assert!(message.contains("Invalid MBAP length"));
@@ -370,21 +387,21 @@ mod tests {
     #[test]
     fn response_body_len_minimum_valid() {
         let header = [0x00, 0x01, 0x00, 0x00, 0x00, 0x02, 0x11];
-        let body_len = ModbusTcpConnection::response_body_len_from_header(&header).unwrap();
+        let body_len = ModbusTcpConnection::response_body_len_from_header(header).unwrap();
         assert_eq!(body_len, 1);
     }
 
     #[test]
     fn response_body_len_maximum_frame() {
         let header = [0x00, 0x01, 0x00, 0x00, 0x00, 0xFE, 0x11];
-        let body_len = ModbusTcpConnection::response_body_len_from_header(&header).unwrap();
+        let body_len = ModbusTcpConnection::response_body_len_from_header(header).unwrap();
         assert_eq!(body_len, 253);
     }
 
     #[test]
     fn response_body_len_rejects_oversized_frame() {
         let header = [0x00, 0x01, 0x00, 0x00, 0x01, 0x00, 0x11];
-        let error = ModbusTcpConnection::response_body_len_from_header(&header).unwrap_err();
+        let error = ModbusTcpConnection::response_body_len_from_header(header).unwrap_err();
         match error {
             ModbusError::MalformedResponse(message) => {
                 assert!(message.contains("exceeds maximum frame size"));
@@ -396,14 +413,14 @@ mod tests {
     #[test]
     fn response_body_len_single_byte_pdu() {
         let header = [0x00, 0x01, 0x00, 0x00, 0x00, 0x03, 0x11];
-        let body_len = ModbusTcpConnection::response_body_len_from_header(&header).unwrap();
+        let body_len = ModbusTcpConnection::response_body_len_from_header(header).unwrap();
         assert_eq!(body_len, 2);
     }
 
     #[test]
     fn response_body_len_rejects_empty_pdu() {
         let header = [0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x11];
-        let error = ModbusTcpConnection::response_body_len_from_header(&header).unwrap_err();
+        let error = ModbusTcpConnection::response_body_len_from_header(header).unwrap_err();
         match error {
             ModbusError::MalformedResponse(message) => {
                 assert!(message.contains("Invalid MBAP length"));

@@ -13,36 +13,60 @@ const MAX_WRITE_MULTIPLE_REGISTERS: u16 = 0x007B;
 /// Typed Modbus request PDUs.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ModbusRequest {
+    /// Read coil outputs starting at `starting_address`.
     ReadCoils {
+        /// Zero-based starting address.
         starting_address: u16,
+        /// Number of coils to read.
         quantity: u16,
     },
+    /// Read discrete inputs starting at `starting_address`.
     ReadDiscreteInputs {
+        /// Zero-based starting address.
         starting_address: u16,
+        /// Number of inputs to read.
         quantity: u16,
     },
+    /// Read holding registers starting at `starting_address`.
     ReadHoldingRegisters {
+        /// Zero-based starting address.
         starting_address: u16,
+        /// Number of registers to read.
         quantity: u16,
     },
+    /// Read input registers starting at `starting_address`.
     ReadInputRegisters {
+        /// Zero-based starting address.
         starting_address: u16,
+        /// Number of registers to read.
         quantity: u16,
     },
+    /// Write one coil output.
     WriteSingleCoil {
+        /// Coil address to write.
         address: u16,
+        /// Coil value to write.
         value: bool,
     },
+    /// Write one holding register.
     WriteSingleRegister {
+        /// Register address to write.
         address: u16,
+        /// Register value to write.
         value: u16,
     },
+    /// Write multiple coil outputs starting at `starting_address`.
     WriteMultipleCoils {
+        /// Zero-based starting address.
         starting_address: u16,
+        /// Coil values to write.
         values: Vec<bool>,
     },
+    /// Write multiple holding registers starting at `starting_address`.
     WriteMultipleRegisters {
+        /// Zero-based starting address.
         starting_address: u16,
+        /// Register values to write.
         values: Vec<u16>,
     },
 }
@@ -53,32 +77,28 @@ impl ModbusRequest {
             ModbusRequest::ReadCoils { quantity, .. } => {
                 if *quantity == 0 || *quantity > MAX_READ_COILS {
                     return Err(ModbusError::ValidationError(format!(
-                        "ReadCoils quantity must be 1-{}, got {}",
-                        MAX_READ_COILS, quantity
+                        "ReadCoils quantity must be 1-{MAX_READ_COILS}, got {quantity}"
                     )));
                 }
             }
             ModbusRequest::ReadDiscreteInputs { quantity, .. } => {
                 if *quantity == 0 || *quantity > MAX_READ_DISCRETE_INPUTS {
                     return Err(ModbusError::ValidationError(format!(
-                        "ReadDiscreteInputs quantity must be 1-{}, got {}",
-                        MAX_READ_DISCRETE_INPUTS, quantity
+                        "ReadDiscreteInputs quantity must be 1-{MAX_READ_DISCRETE_INPUTS}, got {quantity}"
                     )));
                 }
             }
             ModbusRequest::ReadHoldingRegisters { quantity, .. } => {
                 if *quantity == 0 || *quantity > MAX_READ_HOLDING_REGISTERS {
                     return Err(ModbusError::ValidationError(format!(
-                        "ReadHoldingRegisters quantity must be 1-{}, got {}",
-                        MAX_READ_HOLDING_REGISTERS, quantity
+                        "ReadHoldingRegisters quantity must be 1-{MAX_READ_HOLDING_REGISTERS}, got {quantity}"
                     )));
                 }
             }
             ModbusRequest::ReadInputRegisters { quantity, .. } => {
                 if *quantity == 0 || *quantity > MAX_READ_INPUT_REGISTERS {
                     return Err(ModbusError::ValidationError(format!(
-                        "ReadInputRegisters quantity must be 1-{}, got {}",
-                        MAX_READ_INPUT_REGISTERS, quantity
+                        "ReadInputRegisters quantity must be 1-{MAX_READ_INPUT_REGISTERS}, got {quantity}"
                     )));
                 }
             }
@@ -92,8 +112,7 @@ impl ModbusRequest {
                 })?;
                 if qty == 0 || qty > MAX_WRITE_MULTIPLE_COILS {
                     return Err(ModbusError::ValidationError(format!(
-                        "WriteMultipleCoils quantity must be 1-{}, got {}",
-                        MAX_WRITE_MULTIPLE_COILS, qty
+                        "WriteMultipleCoils quantity must be 1-{MAX_WRITE_MULTIPLE_COILS}, got {qty}"
                     )));
                 }
             }
@@ -107,8 +126,7 @@ impl ModbusRequest {
                 })?;
                 if qty == 0 || qty > MAX_WRITE_MULTIPLE_REGISTERS {
                     return Err(ModbusError::ValidationError(format!(
-                        "WriteMultipleRegisters quantity must be 1-{}, got {}",
-                        MAX_WRITE_MULTIPLE_REGISTERS, qty
+                        "WriteMultipleRegisters quantity must be 1-{MAX_WRITE_MULTIPLE_REGISTERS}, got {qty}"
                     )));
                 }
             }
@@ -121,6 +139,10 @@ impl ModbusRequest {
     ///
     /// Validation runs before serialization, so protocol-limit violations are
     /// returned as [`ModbusError::ValidationError`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ModbusError::ValidationError`] when the request violates Modbus limits.
     pub fn serialize(&self) -> Result<Vec<u8>, ModbusError> {
         self.validate()?;
         serialize_modbus_request_internal(self)
@@ -210,8 +232,12 @@ fn serialize_modbus_request_internal(pdu: &ModbusRequest) -> Result<Vec<u8>, Mod
             frame.extend_from_slice(&starting_address.to_be_bytes());
             frame.extend_from_slice(&quantity.to_be_bytes());
             let coil_bytes = pack_coils(values);
-            debug_assert!(coil_bytes.len() <= u8::MAX as usize);
-            let coil_byte_count = coil_bytes.len() as u8;
+            let coil_byte_count = u8::try_from(coil_bytes.len()).map_err(|_| {
+                ModbusError::ValidationError(format!(
+                    "WriteMultipleCoils byte count must fit in u8, got {}",
+                    coil_bytes.len()
+                ))
+            })?;
             frame.push(coil_byte_count);
             frame.extend_from_slice(&coil_bytes);
         }
@@ -231,7 +257,12 @@ fn serialize_modbus_request_internal(pdu: &ModbusRequest) -> Result<Vec<u8>, Mod
             frame.extend_from_slice(&starting_address.to_be_bytes());
             frame.extend_from_slice(&quantity.to_be_bytes());
             debug_assert!(values.len() <= usize::from(MAX_WRITE_MULTIPLE_REGISTERS));
-            let byte_count = (values.len() * 2) as u8;
+            let byte_count = u8::try_from(values.len() * 2).map_err(|_| {
+                ModbusError::ValidationError(format!(
+                    "WriteMultipleRegisters byte count must fit in u8, got {}",
+                    values.len() * 2
+                ))
+            })?;
             frame.push(byte_count);
             for reg in values {
                 frame.extend_from_slice(&reg.to_be_bytes());
@@ -247,6 +278,7 @@ pub(crate) fn serialize_modbus_request(pdu: &ModbusRequest) -> Result<Vec<u8>, M
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 

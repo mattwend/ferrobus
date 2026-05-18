@@ -1,6 +1,15 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2025 tinymb contributors
 
+#![allow(
+    missing_docs,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::panic,
+    clippy::uninlined_format_args,
+    clippy::unwrap_used
+)]
+
 use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};

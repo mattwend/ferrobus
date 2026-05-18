@@ -16,7 +16,7 @@ use crate::request::{ModbusRequest, serialize_modbus_request};
 /// # Arguments
 /// * `transaction_id` - A unique transaction identifier for matching requests/replies.
 /// * `unit_id` - The unit identifier of the remote slave device.
-/// * `pdu` - The ModbusRequest PDU struct.
+/// * `pdu` - The [`ModbusRequest`] PDU struct.
 ///
 /// # Returns
 /// A vector of bytes containing the complete Modbus TCP frame.
@@ -37,12 +37,18 @@ pub(crate) fn build_modbus_tcp_adu_checked(
     pdu: &ModbusRequest,
 ) -> Result<Vec<u8>, ModbusError> {
     let pdu = serialize_modbus_request(pdu)?;
+    let length = u16::try_from(1 + pdu.len()).map_err(|_| {
+        ModbusError::ValidationError(format!(
+            "Modbus TCP ADU length is too large: {}",
+            1 + pdu.len()
+        ))
+    })?;
     tracing::debug!("PDU: {:02X?}", pdu);
 
     let mut frame = Vec::with_capacity(7 + pdu.len());
     frame.extend_from_slice(&transaction_id.to_be_bytes());
     frame.extend_from_slice(&0u16.to_be_bytes());
-    frame.extend_from_slice(&((1 + pdu.len()) as u16).to_be_bytes());
+    frame.extend_from_slice(&length.to_be_bytes());
     frame.push(unit_id);
     frame.extend_from_slice(&pdu);
 
@@ -50,6 +56,7 @@ pub(crate) fn build_modbus_tcp_adu_checked(
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
