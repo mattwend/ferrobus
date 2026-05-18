@@ -123,12 +123,12 @@ impl ModbusRequest {
     /// returned as [`ModbusError::ValidationError`].
     pub fn serialize(&self) -> Result<Vec<u8>, ModbusError> {
         self.validate()?;
-        Ok(serialize_modbus_request_internal(self))
+        serialize_modbus_request_internal(self)
     }
 }
 
 fn pack_coils(coils: &[bool]) -> Vec<u8> {
-    let mut bytes = Vec::new();
+    let mut bytes = Vec::with_capacity(coils.len().div_ceil(8));
     let mut current_byte = 0;
     let mut bit_index = 0;
     for &coil in coils {
@@ -148,33 +148,38 @@ fn pack_coils(coils: &[bool]) -> Vec<u8> {
     bytes
 }
 
-fn serialize_modbus_request_internal(pdu: &ModbusRequest) -> Vec<u8> {
+fn serialize_modbus_request_internal(pdu: &ModbusRequest) -> Result<Vec<u8>, ModbusError> {
     let mut frame = Vec::new();
     match pdu {
         ModbusRequest::ReadCoils {
             starting_address,
             quantity,
+        } => {
+            frame.push(1);
+            frame.extend_from_slice(&starting_address.to_be_bytes());
+            frame.extend_from_slice(&quantity.to_be_bytes());
         }
-        | ModbusRequest::ReadDiscreteInputs {
-            starting_address,
-            quantity,
-        }
-        | ModbusRequest::ReadHoldingRegisters {
-            starting_address,
-            quantity,
-        }
-        | ModbusRequest::ReadInputRegisters {
+        ModbusRequest::ReadDiscreteInputs {
             starting_address,
             quantity,
         } => {
-            let function_code = match pdu {
-                ModbusRequest::ReadCoils { .. } => 1,
-                ModbusRequest::ReadDiscreteInputs { .. } => 2,
-                ModbusRequest::ReadHoldingRegisters { .. } => 3,
-                ModbusRequest::ReadInputRegisters { .. } => 4,
-                _ => unreachable!(),
-            };
-            frame.push(function_code);
+            frame.push(2);
+            frame.extend_from_slice(&starting_address.to_be_bytes());
+            frame.extend_from_slice(&quantity.to_be_bytes());
+        }
+        ModbusRequest::ReadHoldingRegisters {
+            starting_address,
+            quantity,
+        } => {
+            frame.push(3);
+            frame.extend_from_slice(&starting_address.to_be_bytes());
+            frame.extend_from_slice(&quantity.to_be_bytes());
+        }
+        ModbusRequest::ReadInputRegisters {
+            starting_address,
+            quantity,
+        } => {
+            frame.push(4);
             frame.extend_from_slice(&starting_address.to_be_bytes());
             frame.extend_from_slice(&quantity.to_be_bytes());
         }
@@ -196,10 +201,16 @@ fn serialize_modbus_request_internal(pdu: &ModbusRequest) -> Vec<u8> {
             debug_assert!(values.len() <= usize::from(MAX_WRITE_MULTIPLE_COILS));
 
             frame.push(15u8);
-            let quantity = values.len() as u16;
+            let quantity = u16::try_from(values.len()).map_err(|_| {
+                ModbusError::ValidationError(format!(
+                    "WriteMultipleCoils quantity must fit in u16, got {}",
+                    values.len()
+                ))
+            })?;
             frame.extend_from_slice(&starting_address.to_be_bytes());
             frame.extend_from_slice(&quantity.to_be_bytes());
             let coil_bytes = pack_coils(values);
+            debug_assert!(coil_bytes.len() <= u8::MAX as usize);
             let coil_byte_count = coil_bytes.len() as u8;
             frame.push(coil_byte_count);
             frame.extend_from_slice(&coil_bytes);
@@ -211,9 +222,15 @@ fn serialize_modbus_request_internal(pdu: &ModbusRequest) -> Vec<u8> {
             debug_assert!(values.len() <= usize::from(MAX_WRITE_MULTIPLE_REGISTERS));
 
             frame.push(16u8);
-            let quantity = values.len() as u16;
+            let quantity = u16::try_from(values.len()).map_err(|_| {
+                ModbusError::ValidationError(format!(
+                    "WriteMultipleRegisters quantity must fit in u16, got {}",
+                    values.len()
+                ))
+            })?;
             frame.extend_from_slice(&starting_address.to_be_bytes());
             frame.extend_from_slice(&quantity.to_be_bytes());
+            debug_assert!(values.len() <= usize::from(MAX_WRITE_MULTIPLE_REGISTERS));
             let byte_count = (values.len() * 2) as u8;
             frame.push(byte_count);
             for reg in values {
@@ -221,14 +238,11 @@ fn serialize_modbus_request_internal(pdu: &ModbusRequest) -> Vec<u8> {
             }
         }
     }
-    frame
+    Ok(frame)
 }
 
-#[must_use]
-/// Serializes a request without validation.
-///
-/// Prefer [`ModbusRequest::serialize`] when accepting user input or external data.
-pub fn serialize_modbus_request(pdu: &ModbusRequest) -> Vec<u8> {
+pub(crate) fn serialize_modbus_request(pdu: &ModbusRequest) -> Result<Vec<u8>, ModbusError> {
+    pdu.validate()?;
     serialize_modbus_request_internal(pdu)
 }
 
@@ -244,7 +258,7 @@ mod tests {
         };
 
         let expected = vec![1u8, 0x00, 0x10, 0x00, 0x0A];
-        let result = serialize_modbus_request(&pdu);
+        let result = pdu.serialize().unwrap();
         assert_eq!(result, expected);
     }
 
@@ -256,7 +270,7 @@ mod tests {
         };
 
         let expected = vec![2u8, 0x00, 0x20, 0x00, 0x05];
-        let result = serialize_modbus_request(&pdu);
+        let result = pdu.serialize().unwrap();
         assert_eq!(result, expected);
     }
 
@@ -268,7 +282,7 @@ mod tests {
         };
 
         let expected = vec![3u8, 0x01, 0x00, 0x00, 0x03];
-        let result = serialize_modbus_request(&pdu);
+        let result = pdu.serialize().unwrap();
         assert_eq!(result, expected);
     }
 
@@ -280,7 +294,7 @@ mod tests {
         };
 
         let expected = vec![4u8, 0x00, 0xFF, 0x00, 0x01];
-        let result = serialize_modbus_request(&pdu);
+        let result = pdu.serialize().unwrap();
         assert_eq!(result, expected);
     }
 
@@ -292,7 +306,7 @@ mod tests {
         };
 
         let expected = vec![5u8, 0x00, 0x10, 0xFF, 0x00];
-        let result = serialize_modbus_request(&pdu);
+        let result = pdu.serialize().unwrap();
         assert_eq!(result, expected);
     }
 
@@ -304,7 +318,7 @@ mod tests {
         };
 
         let expected = vec![5u8, 0x00, 0x10, 0x00, 0x00];
-        let result = serialize_modbus_request(&pdu);
+        let result = pdu.serialize().unwrap();
         assert_eq!(result, expected);
     }
 
@@ -316,7 +330,7 @@ mod tests {
         };
 
         let expected = vec![6u8, 0x00, 0x10, 0x12, 0x34];
-        let result = serialize_modbus_request(&pdu);
+        let result = pdu.serialize().unwrap();
         assert_eq!(result, expected);
     }
 
@@ -329,7 +343,7 @@ mod tests {
         };
 
         let expected = vec![15u8, 0x00, 0x01, 0x00, 0x06, 0x01, 0x25];
-        let result = serialize_modbus_request(&pdu);
+        let result = pdu.serialize().unwrap();
         assert_eq!(result, expected);
     }
 
@@ -342,7 +356,7 @@ mod tests {
         };
 
         let expected = vec![16u8, 0x00, 0x01, 0x00, 0x02, 0x04, 0x11, 0x11, 0x22, 0x22];
-        let result = serialize_modbus_request(&pdu);
+        let result = pdu.serialize().unwrap();
         assert_eq!(result, expected);
     }
 
@@ -392,7 +406,7 @@ mod tests {
             starting_address: 0x0000,
             values: coils,
         };
-        let result = serialize_modbus_request(&pdu);
+        let result = pdu.serialize().unwrap();
         assert_eq!(result[5], 1);
         assert_eq!(result[6], 0x55);
     }
@@ -404,7 +418,7 @@ mod tests {
             starting_address: 0x0000,
             values: coils,
         };
-        let result = serialize_modbus_request(&pdu);
+        let result = pdu.serialize().unwrap();
         assert_eq!(result[5], 2);
         assert_eq!(result[6], 0xFF);
         assert_eq!(result[7], 0x01);

@@ -180,7 +180,12 @@ pub fn align_response_to_request(
                 quantity: resp_qty,
             },
         ) => {
-            let qty = values.len() as u16;
+            let qty = u16::try_from(values.len()).map_err(|_| {
+                ModbusError::RequestResponseMismatch(format!(
+                    "WriteMultipleCoils: request quantity does not fit in u16: {}",
+                    values.len()
+                ))
+            })?;
             if starting_address != response_address || qty != *resp_qty {
                 return Err(ModbusError::RequestResponseMismatch(format!(
                     "WriteMultipleCoils: wrote address {starting_address} quantity {qty} but server acknowledged address {response_address} quantity {resp_qty}",
@@ -198,7 +203,12 @@ pub fn align_response_to_request(
                 quantity: resp_qty,
             },
         ) => {
-            let qty = values.len() as u16;
+            let qty = u16::try_from(values.len()).map_err(|_| {
+                ModbusError::RequestResponseMismatch(format!(
+                    "WriteMultipleRegisters: request quantity does not fit in u16: {}",
+                    values.len()
+                ))
+            })?;
             if starting_address != response_address || qty != *resp_qty {
                 return Err(ModbusError::RequestResponseMismatch(format!(
                     "WriteMultipleRegisters: wrote address {starting_address} quantity {qty} but server acknowledged address {response_address} quantity {resp_qty}",

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2025 tinymb contributors
 
+use crate::error::ModbusError;
 use crate::request::{ModbusRequest, serialize_modbus_request};
 
 /// Builds a Modbus TCP frame by constructing the 7-byte MBAP header
@@ -21,7 +22,21 @@ use crate::request::{ModbusRequest, serialize_modbus_request};
 /// A vector of bytes containing the complete Modbus TCP frame.
 #[must_use]
 pub fn build_modbus_tcp_adu(transaction_id: u16, unit_id: u8, pdu: &ModbusRequest) -> Vec<u8> {
-    let pdu = serialize_modbus_request(pdu);
+    match build_modbus_tcp_adu_checked(transaction_id, unit_id, pdu) {
+        Ok(frame) => frame,
+        Err(error) => {
+            tracing::debug!("invalid Modbus request for TCP ADU: {error}");
+            Vec::new()
+        }
+    }
+}
+
+pub(crate) fn build_modbus_tcp_adu_checked(
+    transaction_id: u16,
+    unit_id: u8,
+    pdu: &ModbusRequest,
+) -> Result<Vec<u8>, ModbusError> {
+    let pdu = serialize_modbus_request(pdu)?;
     tracing::debug!("PDU: {:02X?}", pdu);
 
     let mut frame = Vec::with_capacity(7 + pdu.len());
@@ -31,7 +46,7 @@ pub fn build_modbus_tcp_adu(transaction_id: u16, unit_id: u8, pdu: &ModbusReques
     frame.push(unit_id);
     frame.extend_from_slice(&pdu);
 
-    frame
+    Ok(frame)
 }
 
 #[cfg(test)]
