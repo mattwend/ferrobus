@@ -55,7 +55,7 @@ fn parse_registers(response: &[u8], min_len: usize) -> Result<Vec<u16>, ModbusEr
             2 + byte_count
         )));
     }
-    if !byte_count.is_multiple_of(2) {
+    if byte_count % 2 != 0 {
         return Err(ModbusError::DeserializationError(
             "Byte count is not even for register data".to_string(),
         ));
@@ -70,6 +70,12 @@ fn parse_registers(response: &[u8], min_len: usize) -> Result<Vec<u16>, ModbusEr
 }
 
 /// Verifies that a decoded response matches the request that produced it.
+///
+/// # Errors
+///
+/// Returns [`ModbusError::RequestResponseMismatch`] when the response cannot
+/// be reconciled with the request.
+#[allow(clippy::too_many_lines)]
 pub fn align_response_to_request(
     request: &ModbusRequest,
     response: ModbusResponse,
@@ -217,8 +223,7 @@ pub fn align_response_to_request(
             Ok(response)
         }
         _ => Err(ModbusError::RequestResponseMismatch(format!(
-            "Request/response mismatch: got {:?} for {:?}",
-            response, request
+            "Request/response mismatch: got {response:?} for {request:?}"
         ))),
     }
 }
@@ -226,47 +231,78 @@ pub fn align_response_to_request(
 /// Typed Modbus response PDUs.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ModbusResponse {
+    /// Coil output values returned by a read-coils request.
     ReadCoils {
+        /// Coil values in wire order.
         coils: Vec<bool>,
     },
+    /// Discrete input values returned by a read-discrete-inputs request.
     ReadDiscreteInputs {
+        /// Input values in wire order.
         inputs: Vec<bool>,
     },
+    /// Holding register values returned by a read-holding-registers request.
     ReadHoldingRegisters {
+        /// Register values in wire order.
         registers: Vec<u16>,
     },
+    /// Input register values returned by a read-input-registers request.
     ReadInputRegisters {
+        /// Register values in wire order.
         registers: Vec<u16>,
     },
+    /// Echo response for writing one coil.
     WriteSingleCoil {
+        /// Coil address echoed by the device.
         address: u16,
+        /// Coil value echoed by the device.
         value: bool,
     },
+    /// Echo response for writing one register.
     WriteSingleRegister {
+        /// Register address echoed by the device.
         address: u16,
+        /// Register value echoed by the device.
         value: u16,
     },
+    /// Acknowledgement for writing multiple coils.
     WriteMultipleCoils {
+        /// Starting address acknowledged by the device.
         starting_address: u16,
+        /// Quantity acknowledged by the device.
         quantity: u16,
     },
+    /// Acknowledgement for writing multiple registers.
     WriteMultipleRegisters {
+        /// Starting address acknowledged by the device.
         starting_address: u16,
+        /// Quantity acknowledged by the device.
         quantity: u16,
     },
+    /// Modbus exception response PDU.
     Exception {
+        /// Exception function code, including the high exception bit.
         function: u8,
+        /// Modbus exception code.
         code: u8,
     },
 }
 
 impl ModbusResponse {
     /// Deserializes a Modbus response PDU.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ModbusError::DeserializationError`] when the bytes are not a supported response.
     pub fn deserialize(response: &[u8]) -> Result<ModbusResponse, ModbusError> {
         deserialize_modbus_response_internal(response, None)
     }
 
     /// Deserializes a Modbus response PDU and truncates bit-packed reads to `count` values.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ModbusError::DeserializationError`] when the bytes are not a supported response.
     pub fn deserialize_with_count(
         response: &[u8],
         count: usize,
@@ -274,6 +310,11 @@ impl ModbusResponse {
         deserialize_modbus_response_internal(response, Some(count))
     }
 
+    /// Aligns this response with the request that produced it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ModbusError::RequestResponseMismatch`] if the response does not match.
     pub fn align_to_request(self, request: &ModbusRequest) -> Result<ModbusResponse, ModbusError> {
         align_response_to_request(request, self)
     }
@@ -321,8 +362,7 @@ fn deserialize_modbus_response_internal(
                 0x0000 => false,
                 _ => {
                     return Err(ModbusError::DeserializationError(format!(
-                        "Invalid coil value in Write Single Coil response: {:#06x}",
-                        coil_value
+                        "Invalid coil value in Write Single Coil response: {coil_value:#06x}"
                     )));
                 }
             };
@@ -380,12 +420,16 @@ fn deserialize_modbus_response_internal(
             })
         }
         _ => Err(ModbusError::DeserializationError(format!(
-            "Unsupported function code: {}",
-            function_code
+            "Unsupported function code: {function_code}"
         ))),
     }
 }
 
+/// Deserializes a Modbus response PDU.
+///
+/// # Errors
+///
+/// Returns [`ModbusError::DeserializationError`] when the bytes are not a supported response.
 pub fn deserialize_modbus_response(response: &[u8]) -> Result<ModbusResponse, ModbusError> {
     ModbusResponse::deserialize(response)
 }
@@ -407,6 +451,7 @@ impl TryFrom<Vec<u8>> for ModbusResponse {
 }
 
 #[cfg(test)]
+#[allow(clippy::panic, clippy::uninlined_format_args, clippy::unwrap_used)]
 mod tests {
     use super::*;
 

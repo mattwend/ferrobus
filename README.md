@@ -26,6 +26,10 @@ Small Rust Modbus library with typed request/response PDUs and a reusable Modbus
 - Support for talking to multiple unit IDs through one Modbus TCP connection handle
 - Optional CLI example behind the `cli` feature
 
+## Prerequisites
+
+- Rust 1.85 or newer (MSRV), matching the crate's Rust 2024 edition.
+
 ## Installation
 
 Add the crate to your project:
