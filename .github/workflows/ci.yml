@@ -38,6 +38,14 @@ jobs:
       - uses: taiki-e/install-action@cargo-deny
       - run: cargo deny check
 
+  cargo-machete:
+    name: Cargo machete
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@cargo-machete
+      - run: cargo machete
+
   coverage:
     name: Coverage
     runs-on: ubuntu-latest
