@@ -9,6 +9,7 @@ const MAX_READ_HOLDING_REGISTERS: u16 = 0x007D;
 const MAX_READ_INPUT_REGISTERS: u16 = 0x007D;
 const MAX_WRITE_MULTIPLE_COILS: u16 = 0x07B0;
 const MAX_WRITE_MULTIPLE_REGISTERS: u16 = 0x007B;
+const MAX_REQUEST_PDU_LEN: usize = 252;
 
 /// Typed Modbus request PDUs.
 #[derive(Debug, Clone, PartialEq)]
@@ -171,7 +172,7 @@ fn pack_coils(coils: &[bool]) -> Vec<u8> {
 }
 
 fn serialize_modbus_request_internal(pdu: &ModbusRequest) -> Result<Vec<u8>, ModbusError> {
-    let mut frame = Vec::new();
+    let mut frame = Vec::with_capacity(MAX_REQUEST_PDU_LEN);
     match pdu {
         ModbusRequest::ReadCoils {
             starting_address,
