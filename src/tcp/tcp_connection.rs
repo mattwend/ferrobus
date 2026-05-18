@@ -17,7 +17,9 @@ use tokio::time::timeout;
 use tracing::debug;
 
 use crate::response::align_response_to_request;
-use crate::{ModbusRequest, ModbusResponse, error::ModbusError, tcp::build_modbus_tcp_adu};
+use crate::{
+    ModbusRequest, ModbusResponse, error::ModbusError, tcp::adu::build_modbus_tcp_adu_checked,
+};
 
 const MBAP_HEADER_LEN: usize = 7;
 const MAX_MODBUS_TCP_FRAME: usize = 260;
@@ -175,6 +177,25 @@ impl ModbusTcpConnection {
             .build()
     }
 
+    async fn ensure_connected_stream(
+        stream: &mut Option<TcpStream>,
+        address: IpAddr,
+        port: u16,
+        timeouts: ModbusTcpTimeouts,
+    ) -> Result<&mut TcpStream, ModbusError> {
+        if stream.is_none() {
+            let tcp_stream = Self::connect_stream(address, port, timeouts.connect_timeout).await?;
+            *stream = Some(tcp_stream);
+        }
+
+        stream.as_mut().ok_or_else(|| {
+            ModbusError::ConnectError(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "stream missing after successful connect",
+            ))
+        })
+    }
+
     async fn exchange_frame(
         socket: &mut TcpStream,
         adu: &[u8],
@@ -243,21 +264,15 @@ impl ModbusTcpConnection {
             let pdu = pdu.clone();
             let stream = Arc::clone(&stream);
             async move {
-                let adu = build_modbus_tcp_adu(tid, unit_id, &pdu);
+                let adu = build_modbus_tcp_adu_checked(tid, unit_id, &pdu)
+                    .map_err(BackoffError::permanent)?;
                 debug!("Modbus TCP Frame: {:02X?}", adu);
 
                 let mut stream_guard = stream.lock().await;
-                if stream_guard.is_none() {
-                    let tcp_stream = Self::connect_stream(address, port, timeouts.connect_timeout)
+                let socket =
+                    Self::ensure_connected_stream(&mut stream_guard, address, port, timeouts)
                         .await
                         .map_err(BackoffError::transient)?;
-                    *stream_guard = Some(tcp_stream);
-                }
-
-                let socket = match stream_guard.as_mut() {
-                    Some(socket) => socket,
-                    None => unreachable!("stream must be connected before exchange"),
-                };
 
                 let response_buffer = match Self::exchange_frame(socket, &adu, timeouts).await {
                     Ok(response_buffer) => response_buffer,
