@@ -4,6 +4,8 @@
 use crate::error::ModbusError;
 use crate::request::{ModbusRequest, serialize_modbus_request};
 
+const MBAP_HEADER_LEN: usize = 7;
+
 /// Builds a Modbus TCP frame by constructing the 7-byte MBAP header
 /// and appending the Modbus PDU.
 ///
@@ -26,7 +28,7 @@ pub fn build_modbus_tcp_adu(transaction_id: u16, unit_id: u8, pdu: &ModbusReques
         Ok(frame) => frame,
         Err(error) => {
             tracing::debug!("invalid Modbus request for TCP ADU: {error}");
-            Vec::new()
+            Vec::default()
         }
     }
 }
@@ -45,7 +47,7 @@ pub(crate) fn build_modbus_tcp_adu_checked(
     })?;
     tracing::debug!("PDU: {:02X?}", pdu);
 
-    let mut frame = Vec::with_capacity(7 + pdu.len());
+    let mut frame = Vec::with_capacity(MBAP_HEADER_LEN + pdu.len());
     frame.extend_from_slice(&transaction_id.to_be_bytes());
     frame.extend_from_slice(&0u16.to_be_bytes());
     frame.extend_from_slice(&length.to_be_bytes());

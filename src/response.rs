@@ -18,7 +18,7 @@ fn unpack_bits(
             response.len()
         )));
     }
-    let byte_count = response[1] as usize;
+    let byte_count = usize::from(response[1]);
     if response.len() < 2 + byte_count {
         return Err(ModbusError::DeserializationError(format!(
             "Response length {} does not match byte count {}",
@@ -27,7 +27,7 @@ fn unpack_bits(
         )));
     }
     let bits = &response[2..2 + byte_count];
-    let mut result = Vec::new();
+    let mut result = Vec::with_capacity(byte_count * 8);
     for byte in bits {
         for bit in 0..8 {
             result.push((byte >> bit) & 1 == 1);
@@ -47,7 +47,7 @@ fn parse_registers(response: &[u8], min_len: usize) -> Result<Vec<u16>, ModbusEr
             response.len()
         )));
     }
-    let byte_count = response[1] as usize;
+    let byte_count = usize::from(response[1]);
     if response.len() < 2 + byte_count {
         return Err(ModbusError::DeserializationError(format!(
             "Response length {} does not match byte count {}",
