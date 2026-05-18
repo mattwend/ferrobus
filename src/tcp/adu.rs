@@ -22,18 +22,11 @@ const MBAP_HEADER_LEN: usize = 7;
 ///
 /// # Returns
 /// A vector of bytes containing the complete Modbus TCP frame.
-#[must_use]
-pub fn build_modbus_tcp_adu(transaction_id: u16, unit_id: u8, pdu: &ModbusRequest) -> Vec<u8> {
-    match build_modbus_tcp_adu_checked(transaction_id, unit_id, pdu) {
-        Ok(frame) => frame,
-        Err(error) => {
-            tracing::debug!("invalid Modbus request for TCP ADU: {error}");
-            Vec::default()
-        }
-    }
-}
-
-pub(crate) fn build_modbus_tcp_adu_checked(
+///
+/// # Errors
+/// Returns a [`ModbusError`] if the request cannot be serialized or the
+/// resulting frame would exceed the Modbus TCP length field.
+pub fn build_modbus_tcp_adu(
     transaction_id: u16,
     unit_id: u8,
     pdu: &ModbusRequest,
@@ -68,7 +61,7 @@ mod tests {
             starting_address: 0x0010,
             quantity: 0x000A,
         };
-        let frame = build_modbus_tcp_adu(0x0001, 0x11, &pdu);
+        let frame = build_modbus_tcp_adu(0x0001, 0x11, &pdu).unwrap();
 
         let expected = [
             0x00, 0x01, // transaction_id
@@ -89,7 +82,7 @@ mod tests {
             address: 0x00FF,
             value: true,
         };
-        let frame = build_modbus_tcp_adu(0x1234, 0x01, &pdu);
+        let frame = build_modbus_tcp_adu(0x1234, 0x01, &pdu).unwrap();
 
         assert_eq!(frame.len(), 12);
         assert_eq!([frame[0], frame[1]], [0x12, 0x34]);
@@ -105,7 +98,7 @@ mod tests {
             starting_address: 0x0001,
             values: vec![0x1111, 0x2222],
         };
-        let frame = build_modbus_tcp_adu(0xFFFF, 0xFF, &pdu);
+        let frame = build_modbus_tcp_adu(0xFFFF, 0xFF, &pdu).unwrap();
 
         let expected = [
             0xFF, 0xFF, // transaction_id
@@ -129,7 +122,7 @@ mod tests {
             starting_address: 0x0000,
             quantity: 0x0001,
         };
-        let frame = build_modbus_tcp_adu(1, 1, &pdu);
+        let frame = build_modbus_tcp_adu(1, 1, &pdu).unwrap();
         let declared_length = u16::from_be_bytes([frame[4], frame[5]]);
         assert_eq!(declared_length, 6);
     }
