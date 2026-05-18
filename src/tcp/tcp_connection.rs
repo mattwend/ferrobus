@@ -17,9 +17,7 @@ use tokio::time::timeout;
 use tracing::debug;
 
 use crate::response::align_response_to_request;
-use crate::{
-    ModbusRequest, ModbusResponse, error::ModbusError, tcp::adu::build_modbus_tcp_adu_checked,
-};
+use crate::{ModbusRequest, ModbusResponse, error::ModbusError, tcp::adu::build_modbus_tcp_adu};
 
 const MBAP_HEADER_LEN: usize = 7;
 const MAX_MODBUS_TCP_FRAME: usize = 260;
@@ -280,8 +278,8 @@ impl ModbusTcpConnection {
             let pdu = pdu.clone();
             let stream = Arc::clone(&stream);
             async move {
-                let adu = build_modbus_tcp_adu_checked(tid, unit_id, &pdu)
-                    .map_err(BackoffError::permanent)?;
+                let adu =
+                    build_modbus_tcp_adu(tid, unit_id, &pdu).map_err(BackoffError::permanent)?;
                 debug!("Modbus TCP Frame: {:02X?}", adu);
 
                 let mut stream_guard = stream.lock().await;
