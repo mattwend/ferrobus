@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2025 tinymb contributors
 
+use crate::error::ModbusError;
 use crate::request::{ModbusRequest, serialize_modbus_request};
+
+const MBAP_HEADER_LEN: usize = 7;
 
 /// Builds a Modbus TCP frame by constructing the 7-byte MBAP header
 /// and appending the Modbus PDU.
@@ -15,26 +18,62 @@ use crate::request::{ModbusRequest, serialize_modbus_request};
 /// # Arguments
 /// * `transaction_id` - A unique transaction identifier for matching requests/replies.
 /// * `unit_id` - The unit identifier of the remote slave device.
-/// * `pdu` - The ModbusRequest PDU struct.
+/// * `pdu` - The [`ModbusRequest`] PDU struct.
 ///
 /// # Returns
 /// A vector of bytes containing the complete Modbus TCP frame.
-#[must_use]
-pub fn build_modbus_tcp_adu(transaction_id: u16, unit_id: u8, pdu: &ModbusRequest) -> Vec<u8> {
-    let pdu = serialize_modbus_request(pdu);
-    tracing::debug!("PDU: {:02X?}", pdu);
+///
+/// # Errors
+/// Returns a [`ModbusError`] if the request cannot be serialized or the
+/// resulting frame would exceed the Modbus TCP length field.
+pub fn build_modbus_tcp_adu(
+    transaction_id: u16,
+    unit_id: u8,
+    pdu: &ModbusRequest,
+) -> Result<Vec<u8>, ModbusError> {
+    let pdu_bytes = serialize_modbus_request(pdu)?;
+    build_modbus_tcp_adu_from_pdu_bytes(transaction_id, unit_id, &pdu_bytes)
+}
 
-    let mut frame = Vec::with_capacity(7 + pdu.len());
+/// Builds a Modbus TCP ADU from already-serialized PDU bytes.
+///
+/// This helper isolates the MBAP header construction (and the length-field
+/// overflow check) from PDU serialization so the length-overflow branch can
+/// be exercised by tests without going through [`ModbusRequest`] validation.
+///
+/// # Arguments
+/// * `transaction_id` - Transaction identifier for matching requests/replies.
+/// * `unit_id` - Unit identifier of the remote slave device.
+/// * `pdu_bytes` - Pre-serialized Modbus PDU bytes.
+///
+/// # Errors
+/// Returns a [`ModbusError::ValidationError`] if `pdu_bytes.len() + 1` does
+/// not fit in the 16-bit MBAP length field.
+pub(crate) fn build_modbus_tcp_adu_from_pdu_bytes(
+    transaction_id: u16,
+    unit_id: u8,
+    pdu_bytes: &[u8],
+) -> Result<Vec<u8>, ModbusError> {
+    let payload_len = pdu_bytes.len().checked_add(1).ok_or_else(|| {
+        ModbusError::ValidationError("Modbus TCP ADU length is too large".to_string())
+    })?;
+    let length = u16::try_from(payload_len).map_err(|_| {
+        ModbusError::ValidationError(format!("Modbus TCP ADU length is too large: {payload_len}"))
+    })?;
+    tracing::debug!("PDU: {:02X?}", pdu_bytes);
+
+    let mut frame = Vec::with_capacity(MBAP_HEADER_LEN + pdu_bytes.len());
     frame.extend_from_slice(&transaction_id.to_be_bytes());
     frame.extend_from_slice(&0u16.to_be_bytes());
-    frame.extend_from_slice(&((1 + pdu.len()) as u16).to_be_bytes());
+    frame.extend_from_slice(&length.to_be_bytes());
     frame.push(unit_id);
-    frame.extend_from_slice(&pdu);
+    frame.extend_from_slice(pdu_bytes);
 
-    frame
+    Ok(frame)
 }
 
 #[cfg(test)]
+#[allow(clippy::panic, clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -44,7 +83,7 @@ mod tests {
             starting_address: 0x0010,
             quantity: 0x000A,
         };
-        let frame = build_modbus_tcp_adu(0x0001, 0x11, &pdu);
+        let frame = build_modbus_tcp_adu(0x0001, 0x11, &pdu).unwrap();
 
         let expected = [
             0x00, 0x01, // transaction_id
@@ -65,7 +104,7 @@ mod tests {
             address: 0x00FF,
             value: true,
         };
-        let frame = build_modbus_tcp_adu(0x1234, 0x01, &pdu);
+        let frame = build_modbus_tcp_adu(0x1234, 0x01, &pdu).unwrap();
 
         assert_eq!(frame.len(), 12);
         assert_eq!([frame[0], frame[1]], [0x12, 0x34]);
@@ -81,7 +120,7 @@ mod tests {
             starting_address: 0x0001,
             values: vec![0x1111, 0x2222],
         };
-        let frame = build_modbus_tcp_adu(0xFFFF, 0xFF, &pdu);
+        let frame = build_modbus_tcp_adu(0xFFFF, 0xFF, &pdu).unwrap();
 
         let expected = [
             0xFF, 0xFF, // transaction_id
@@ -105,8 +144,21 @@ mod tests {
             starting_address: 0x0000,
             quantity: 0x0001,
         };
-        let frame = build_modbus_tcp_adu(1, 1, &pdu);
+        let frame = build_modbus_tcp_adu(1, 1, &pdu).unwrap();
         let declared_length = u16::from_be_bytes([frame[4], frame[5]]);
         assert_eq!(declared_length, 6);
+    }
+
+    #[test]
+    fn build_from_pdu_bytes_rejects_oversized_pdu() {
+        // 1 + pdu_bytes.len() must fit in a u16; this is the only way to
+        // exercise the length-field overflow branch since validated requests
+        // never produce PDUs this large.
+        let oversized = vec![0u8; usize::from(u16::MAX)];
+        let err = build_modbus_tcp_adu_from_pdu_bytes(0, 1, &oversized).unwrap_err();
+        match err {
+            ModbusError::ValidationError(msg) => assert!(msg.contains("too large")),
+            other => panic!("expected ValidationError, got {other:?}"),
+        }
     }
 }

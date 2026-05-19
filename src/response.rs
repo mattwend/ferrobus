@@ -18,7 +18,7 @@ fn unpack_bits(
             response.len()
         )));
     }
-    let byte_count = response[1] as usize;
+    let byte_count = usize::from(response[1]);
     if response.len() < 2 + byte_count {
         return Err(ModbusError::DeserializationError(format!(
             "Response length {} does not match byte count {}",
@@ -27,7 +27,7 @@ fn unpack_bits(
         )));
     }
     let bits = &response[2..2 + byte_count];
-    let mut result = Vec::new();
+    let mut result = Vec::with_capacity(byte_count * 8);
     for byte in bits {
         for bit in 0..8 {
             result.push((byte >> bit) & 1 == 1);
@@ -47,7 +47,7 @@ fn parse_registers(response: &[u8], min_len: usize) -> Result<Vec<u16>, ModbusEr
             response.len()
         )));
     }
-    let byte_count = response[1] as usize;
+    let byte_count = usize::from(response[1]);
     if response.len() < 2 + byte_count {
         return Err(ModbusError::DeserializationError(format!(
             "Response length {} does not match byte count {}",
@@ -55,7 +55,7 @@ fn parse_registers(response: &[u8], min_len: usize) -> Result<Vec<u16>, ModbusEr
             2 + byte_count
         )));
     }
-    if !byte_count.is_multiple_of(2) {
+    if byte_count % 2 != 0 {
         return Err(ModbusError::DeserializationError(
             "Byte count is not even for register data".to_string(),
         ));
@@ -70,6 +70,12 @@ fn parse_registers(response: &[u8], min_len: usize) -> Result<Vec<u16>, ModbusEr
 }
 
 /// Verifies that a decoded response matches the request that produced it.
+///
+/// # Errors
+///
+/// Returns [`ModbusError::RequestResponseMismatch`] when the response cannot
+/// be reconciled with the request.
+#[allow(clippy::too_many_lines)]
 pub fn align_response_to_request(
     request: &ModbusRequest,
     response: ModbusResponse,
@@ -180,7 +186,12 @@ pub fn align_response_to_request(
                 quantity: resp_qty,
             },
         ) => {
-            let qty = values.len() as u16;
+            let qty = u16::try_from(values.len()).map_err(|_| {
+                ModbusError::RequestResponseMismatch(format!(
+                    "WriteMultipleCoils: request quantity does not fit in u16: {}",
+                    values.len()
+                ))
+            })?;
             if starting_address != response_address || qty != *resp_qty {
                 return Err(ModbusError::RequestResponseMismatch(format!(
                     "WriteMultipleCoils: wrote address {starting_address} quantity {qty} but server acknowledged address {response_address} quantity {resp_qty}",
@@ -198,7 +209,12 @@ pub fn align_response_to_request(
                 quantity: resp_qty,
             },
         ) => {
-            let qty = values.len() as u16;
+            let qty = u16::try_from(values.len()).map_err(|_| {
+                ModbusError::RequestResponseMismatch(format!(
+                    "WriteMultipleRegisters: request quantity does not fit in u16: {}",
+                    values.len()
+                ))
+            })?;
             if starting_address != response_address || qty != *resp_qty {
                 return Err(ModbusError::RequestResponseMismatch(format!(
                     "WriteMultipleRegisters: wrote address {starting_address} quantity {qty} but server acknowledged address {response_address} quantity {resp_qty}",
@@ -207,8 +223,7 @@ pub fn align_response_to_request(
             Ok(response)
         }
         _ => Err(ModbusError::RequestResponseMismatch(format!(
-            "Request/response mismatch: got {:?} for {:?}",
-            response, request
+            "Request/response mismatch: got {response:?} for {request:?}"
         ))),
     }
 }
@@ -216,47 +231,78 @@ pub fn align_response_to_request(
 /// Typed Modbus response PDUs.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ModbusResponse {
+    /// Coil output values returned by a read-coils request.
     ReadCoils {
+        /// Coil values in wire order.
         coils: Vec<bool>,
     },
+    /// Discrete input values returned by a read-discrete-inputs request.
     ReadDiscreteInputs {
+        /// Input values in wire order.
         inputs: Vec<bool>,
     },
+    /// Holding register values returned by a read-holding-registers request.
     ReadHoldingRegisters {
+        /// Register values in wire order.
         registers: Vec<u16>,
     },
+    /// Input register values returned by a read-input-registers request.
     ReadInputRegisters {
+        /// Register values in wire order.
         registers: Vec<u16>,
     },
+    /// Echo response for writing one coil.
     WriteSingleCoil {
+        /// Coil address echoed by the device.
         address: u16,
+        /// Coil value echoed by the device.
         value: bool,
     },
+    /// Echo response for writing one register.
     WriteSingleRegister {
+        /// Register address echoed by the device.
         address: u16,
+        /// Register value echoed by the device.
         value: u16,
     },
+    /// Acknowledgement for writing multiple coils.
     WriteMultipleCoils {
+        /// Starting address acknowledged by the device.
         starting_address: u16,
+        /// Quantity acknowledged by the device.
         quantity: u16,
     },
+    /// Acknowledgement for writing multiple registers.
     WriteMultipleRegisters {
+        /// Starting address acknowledged by the device.
         starting_address: u16,
+        /// Quantity acknowledged by the device.
         quantity: u16,
     },
+    /// Modbus exception response PDU.
     Exception {
+        /// Exception function code, including the high exception bit.
         function: u8,
+        /// Modbus exception code.
         code: u8,
     },
 }
 
 impl ModbusResponse {
     /// Deserializes a Modbus response PDU.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ModbusError::DeserializationError`] when the bytes are not a supported response.
     pub fn deserialize(response: &[u8]) -> Result<ModbusResponse, ModbusError> {
         deserialize_modbus_response_internal(response, None)
     }
 
     /// Deserializes a Modbus response PDU and truncates bit-packed reads to `count` values.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ModbusError::DeserializationError`] when the bytes are not a supported response.
     pub fn deserialize_with_count(
         response: &[u8],
         count: usize,
@@ -264,6 +310,11 @@ impl ModbusResponse {
         deserialize_modbus_response_internal(response, Some(count))
     }
 
+    /// Aligns this response with the request that produced it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ModbusError::RequestResponseMismatch`] if the response does not match.
     pub fn align_to_request(self, request: &ModbusRequest) -> Result<ModbusResponse, ModbusError> {
         align_response_to_request(request, self)
     }
@@ -311,8 +362,7 @@ fn deserialize_modbus_response_internal(
                 0x0000 => false,
                 _ => {
                     return Err(ModbusError::DeserializationError(format!(
-                        "Invalid coil value in Write Single Coil response: {:#06x}",
-                        coil_value
+                        "Invalid coil value in Write Single Coil response: {coil_value:#06x}"
                     )));
                 }
             };
@@ -370,12 +420,16 @@ fn deserialize_modbus_response_internal(
             })
         }
         _ => Err(ModbusError::DeserializationError(format!(
-            "Unsupported function code: {}",
-            function_code
+            "Unsupported function code: {function_code}"
         ))),
     }
 }
 
+/// Deserializes a Modbus response PDU.
+///
+/// # Errors
+///
+/// Returns [`ModbusError::DeserializationError`] when the bytes are not a supported response.
 pub fn deserialize_modbus_response(response: &[u8]) -> Result<ModbusResponse, ModbusError> {
     ModbusResponse::deserialize(response)
 }
@@ -397,6 +451,7 @@ impl TryFrom<Vec<u8>> for ModbusResponse {
 }
 
 #[cfg(test)]
+#[allow(clippy::panic, clippy::uninlined_format_args, clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -1080,6 +1135,70 @@ mod tests {
             result,
             Err(ModbusError::RequestResponseMismatch(_))
         ));
+    }
+
+    #[test]
+    fn align_write_multiple_coils_with_oversized_request_quantity_errors() {
+        // Bypass `ModbusRequest::serialize` validation by constructing the
+        // request directly with a length that exceeds u16::MAX. This is the
+        // only way to exercise the defensive `u16::try_from` branch in
+        // `align_response_to_request`.
+        let request = ModbusRequest::WriteMultipleCoils {
+            starting_address: 0,
+            values: vec![true; usize::from(u16::MAX) + 1],
+        };
+        let response = ModbusResponse::WriteMultipleCoils {
+            starting_address: 0,
+            quantity: 1,
+        };
+        let err = align_response_to_request(&request, response).unwrap_err();
+        match err {
+            ModbusError::RequestResponseMismatch(msg) => {
+                assert!(msg.contains("WriteMultipleCoils"));
+            }
+            other => panic!("expected RequestResponseMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn align_write_multiple_registers_with_oversized_request_quantity_errors() {
+        let request = ModbusRequest::WriteMultipleRegisters {
+            starting_address: 0,
+            values: vec![0; usize::from(u16::MAX) + 1],
+        };
+        let response = ModbusResponse::WriteMultipleRegisters {
+            starting_address: 0,
+            quantity: 1,
+        };
+        let err = align_response_to_request(&request, response).unwrap_err();
+        match err {
+            ModbusError::RequestResponseMismatch(msg) => {
+                assert!(msg.contains("WriteMultipleRegisters"));
+            }
+            other => panic!("expected RequestResponseMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn align_to_request_method_delegates_to_free_function() {
+        let request = ModbusRequest::ReadCoils {
+            starting_address: 0,
+            quantity: 2,
+        };
+        let response = ModbusResponse::ReadCoils {
+            coils: vec![true, false],
+        };
+        let via_method = response.clone().align_to_request(&request).unwrap();
+        let via_fn = align_response_to_request(&request, response).unwrap();
+        assert_eq!(via_method, via_fn);
+    }
+
+    #[test]
+    fn deserialize_modbus_response_free_function_matches_method() {
+        let bytes = [3u8, 2, 0x12, 0x34];
+        let via_fn = deserialize_modbus_response(&bytes).unwrap();
+        let via_method = ModbusResponse::deserialize(&bytes).unwrap();
+        assert_eq!(via_fn, via_method);
     }
 
     #[test]

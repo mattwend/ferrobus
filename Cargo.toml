@@ -2,6 +2,7 @@
 name = "tiny-mb"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
 license = "MIT"
 
 [features]
@@ -9,12 +10,23 @@ default = []
 cli = ["dep:clap", "dep:tracing-subscriber"]
 
 [dependencies]
-backoff = { version = "0.4", features = ["tokio"] }
+backon = { version = "1", default-features = false, features = ["tokio-sleep"] }
 clap = { version = "4", features = ["derive"], optional = true }
 thiserror = "2.0"
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
+
+[lints.rust]
+missing_docs = "warn"
+unreachable_pub = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
 
 [[example]]
 name = "modbus_cli"

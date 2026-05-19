@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2025 tiny-mb contributors
 
+#![allow(missing_docs, clippy::match_same_arms, clippy::uninlined_format_args)]
+
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::error::Error;
 use std::net::IpAddr;

@@ -1,6 +1,14 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2025 tinymb contributors
 
+#![allow(
+    missing_docs,
+    unreachable_pub,
+    clippy::cast_possible_truncation,
+    clippy::no_effect_underscore_binding,
+    clippy::unwrap_used
+)]
+
 use std::net::SocketAddr;
 use std::time::Duration;
 
