@@ -80,3 +80,22 @@ pub enum ModbusError {
     #[error("Validation error: {0}")]
     ValidationError(String),
 }
+
+impl ModbusError {
+    /// Returns `true` if this error represents a transient transport failure
+    /// that callers may safely retry (connect, read, or write I/O failures and
+    /// their associated timeouts). Protocol-level and validation errors are
+    /// considered permanent.
+    #[must_use]
+    pub fn is_transient(&self) -> bool {
+        matches!(
+            self,
+            Self::ConnectError(_)
+                | Self::ConnectTimeout
+                | Self::WriteError(_)
+                | Self::WriteTimeout
+                | Self::ReadError(_)
+                | Self::ReadTimeout
+        )
+    }
+}

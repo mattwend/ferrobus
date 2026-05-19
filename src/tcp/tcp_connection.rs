@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2025 tinymb contributors
 
-use backoff::{
-    Error as BackoffError, ExponentialBackoff, ExponentialBackoffBuilder, future::retry,
-};
+use backon::{ExponentialBuilder, Retryable};
 use std::net::IpAddr;
 use std::sync::{
     Arc,
@@ -177,10 +175,15 @@ impl ModbusTcpConnection {
         Ok(body_len)
     }
 
-    fn retry_backoff() -> ExponentialBackoff {
-        ExponentialBackoffBuilder::new()
-            .with_max_elapsed_time(Some(RETRY_MAX_ELAPSED_TIME))
-            .build()
+    /// Returns the exponential backoff policy used to retry transient I/O failures.
+    ///
+    /// The total time spent retrying is capped by [`RETRY_MAX_ELAPSED_TIME`].
+    fn retry_backoff() -> ExponentialBuilder {
+        ExponentialBuilder::default()
+            .with_min_delay(Duration::from_millis(500))
+            .with_factor(1.5)
+            .with_jitter()
+            .with_total_delay(Some(RETRY_MAX_ELAPSED_TIME))
     }
 
     async fn ensure_connected_stream(
@@ -274,19 +277,17 @@ impl ModbusTcpConnection {
 
         let tid = transaction_id.fetch_add(1, Ordering::Relaxed);
 
-        retry(backoff, || {
+        (|| {
             let pdu = pdu.clone();
             let stream = Arc::clone(&stream);
             async move {
-                let adu =
-                    build_modbus_tcp_adu(tid, unit_id, &pdu).map_err(BackoffError::permanent)?;
+                let adu = build_modbus_tcp_adu(tid, unit_id, &pdu)?;
                 debug!("Modbus TCP Frame: {:02X?}", adu);
 
                 let mut stream_guard = stream.lock().await;
                 let socket =
                     Self::ensure_connected_stream(&mut stream_guard, address, port, timeouts)
-                        .await
-                        .map_err(BackoffError::transient)?;
+                        .await?;
 
                 let response_buffer = match Self::exchange_frame(socket, &adu, timeouts).await {
                     Ok(response_buffer) => response_buffer,
@@ -299,49 +300,45 @@ impl ModbusTcpConnection {
                         | ModbusError::ReadTimeout),
                     ) => {
                         *stream_guard = None;
-                        return Err(BackoffError::transient(error));
+                        return Err(error);
                     }
-                    Err(error) => return Err(BackoffError::permanent(error)),
+                    Err(error) => return Err(error),
                 };
 
                 let protocol_id = u16::from_be_bytes([response_buffer[2], response_buffer[3]]);
                 if protocol_id != 0 {
-                    return Err(BackoffError::permanent(ModbusError::ProtocolIdMismatch {
+                    return Err(ModbusError::ProtocolIdMismatch {
                         actual: protocol_id,
-                    }));
+                    });
                 }
 
                 let received_unit_id = response_buffer[6];
                 if received_unit_id != unit_id {
-                    return Err(BackoffError::permanent(ModbusError::UnitIdMismatch {
+                    return Err(ModbusError::UnitIdMismatch {
                         expected: unit_id,
                         actual: received_unit_id,
-                    }));
+                    });
                 }
 
                 let received_transaction_id =
                     u16::from_be_bytes([response_buffer[0], response_buffer[1]]);
                 if received_transaction_id != tid {
-                    return Err(BackoffError::permanent(
-                        ModbusError::TransactionIdMismatch {
-                            expected: tid,
-                            actual: received_transaction_id,
-                        },
-                    ));
+                    return Err(ModbusError::TransactionIdMismatch {
+                        expected: tid,
+                        actual: received_transaction_id,
+                    });
                 }
 
                 let pdu_bytes = &response_buffer[MBAP_HEADER_LEN..];
-                let response =
-                    ModbusResponse::try_from(pdu_bytes).map_err(BackoffError::permanent)?;
+                let response = ModbusResponse::try_from(pdu_bytes)?;
                 if let ModbusResponse::Exception { function, code } = response {
-                    return Err(BackoffError::permanent(ModbusError::ExceptionResponse {
-                        function,
-                        code,
-                    }));
+                    return Err(ModbusError::ExceptionResponse { function, code });
                 }
-                align_response_to_request(&pdu, response).map_err(BackoffError::permanent)
+                align_response_to_request(&pdu, response)
             }
         })
+        .retry(backoff)
+        .when(ModbusError::is_transient)
         .await
     }
 }
@@ -428,9 +425,17 @@ mod tests {
     }
 
     #[test]
-    fn retry_backoff_has_bounded_elapsed_time() {
-        let backoff = ModbusTcpConnection::retry_backoff();
-        assert_eq!(backoff.max_elapsed_time, Some(RETRY_MAX_ELAPSED_TIME));
+    fn retry_backoff_builds_without_panicking() {
+        // `backon::ExponentialBuilder` does not expose its fields, so we only
+        // smoke-test that the policy can be constructed. The bounded total
+        // delay is enforced by `RETRY_MAX_ELAPSED_TIME`, which is asserted
+        // by `retry_max_elapsed_time_is_two_seconds` below.
+        let _ = ModbusTcpConnection::retry_backoff();
+    }
+
+    #[test]
+    fn retry_max_elapsed_time_is_two_seconds() {
+        assert_eq!(RETRY_MAX_ELAPSED_TIME, Duration::from_secs(2));
     }
 
     #[test]
