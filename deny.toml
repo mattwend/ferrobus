@@ -1,0 +1,39 @@
+# cargo-deny configuration for tiny-mb.
+#
+# Run `cargo deny check` to validate the dependency graph against the
+# policies below. The config uses the v2 schema; see
+# https://embarkstudios.github.io/cargo-deny/ for documentation.
+
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+# Advisories we accept for now must be listed here with a justification.
+ignore = []
+
+[licenses]
+version = 2
+# Explicit allow-list of SPDX license identifiers we accept in the
+# dependency tree. All entries are OSI-approved and FSF Free/Libre.
+# Keep this list sorted and add a comment when introducing a new entry.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "Unicode-3.0",
+]
+# Refuse to evaluate any crate whose license fields fall below this
+# clarity threshold; forces us to explicitly handle ambiguous cases.
+confidence-threshold = 0.93
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# Crates we never want pulled in, even transitively. Empty for now.
+deny = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
