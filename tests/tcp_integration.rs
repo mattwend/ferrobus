@@ -442,6 +442,39 @@ async fn send_message_returns_protocol_id_mismatch_as_typed_error() {
 }
 
 #[tokio::test]
+async fn send_message_returns_unit_id_mismatch_as_typed_error() {
+    let addr = spawn_mock_server(|mut stream| async move {
+        let request = read_request_frame(&mut stream).await.unwrap();
+        // Reply with a different unit id than was requested to exercise the
+        // `UnitIdMismatch` validation path in `send_message_with_unit_id`.
+        let response = make_read_coils_response(
+            request.transaction_id,
+            request.unit_id.wrapping_add(1),
+            &[true, false],
+        );
+        stream.write_all(&response).await.unwrap();
+    })
+    .await;
+
+    let conn = ModbusTcpConnection::new(addr.ip(), addr.port(), 1, 0);
+    conn.connect().await.unwrap();
+
+    let request = ModbusRequest::ReadCoils {
+        starting_address: 0x0000,
+        quantity: 2,
+    };
+
+    let error = conn.send_message(&request).await.unwrap_err();
+    match error {
+        ModbusError::UnitIdMismatch { expected, actual } => {
+            assert_eq!(expected, 1);
+            assert_eq!(actual, 2);
+        }
+        other => panic!("Expected UnitIdMismatch, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn send_message_returns_read_timeout_from_slow_server() {
     let addr = spawn_slow_server(Duration::from_millis(200)).await.unwrap();
 

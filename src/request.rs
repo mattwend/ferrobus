@@ -171,7 +171,9 @@ fn pack_coils(coils: &[bool]) -> Vec<u8> {
     bytes
 }
 
-fn serialize_modbus_request_internal(pdu: &ModbusRequest) -> Result<Vec<u8>, ModbusError> {
+pub(crate) fn serialize_modbus_request_internal(
+    pdu: &ModbusRequest,
+) -> Result<Vec<u8>, ModbusError> {
     let mut frame = Vec::with_capacity(MAX_REQUEST_PDU_LEN);
     match pdu {
         ModbusRequest::ReadCoils {
@@ -221,8 +223,9 @@ fn serialize_modbus_request_internal(pdu: &ModbusRequest) -> Result<Vec<u8>, Mod
             starting_address,
             values,
         } => {
-            debug_assert!(values.len() <= usize::from(MAX_WRITE_MULTIPLE_COILS));
-
+            // `serialize_modbus_request` validates the public API bounds first.
+            // Keep the conversions defensive here as a backstop for crate-internal
+            // callers and tests that bypass validation.
             frame.push(15u8);
             let quantity = u16::try_from(values.len()).map_err(|_| {
                 ModbusError::ValidationError(format!(
@@ -246,8 +249,9 @@ fn serialize_modbus_request_internal(pdu: &ModbusRequest) -> Result<Vec<u8>, Mod
             starting_address,
             values,
         } => {
-            debug_assert!(values.len() <= usize::from(MAX_WRITE_MULTIPLE_REGISTERS));
-
+            // `serialize_modbus_request` validates the public API bounds first.
+            // Keep the conversions defensive here as a backstop for crate-internal
+            // callers and tests that bypass validation.
             frame.push(16u8);
             let quantity = u16::try_from(values.len()).map_err(|_| {
                 ModbusError::ValidationError(format!(
@@ -257,11 +261,10 @@ fn serialize_modbus_request_internal(pdu: &ModbusRequest) -> Result<Vec<u8>, Mod
             })?;
             frame.extend_from_slice(&starting_address.to_be_bytes());
             frame.extend_from_slice(&quantity.to_be_bytes());
-            debug_assert!(values.len() <= usize::from(MAX_WRITE_MULTIPLE_REGISTERS));
-            let byte_count = u8::try_from(values.len() * 2).map_err(|_| {
+            let register_byte_len = values.len().saturating_mul(2);
+            let byte_count = u8::try_from(register_byte_len).map_err(|_| {
                 ModbusError::ValidationError(format!(
-                    "WriteMultipleRegisters byte count must fit in u8, got {}",
-                    values.len() * 2
+                    "WriteMultipleRegisters byte count must fit in u8, got {register_byte_len}"
                 ))
             })?;
             frame.push(byte_count);
@@ -279,7 +282,7 @@ pub(crate) fn serialize_modbus_request(pdu: &ModbusRequest) -> Result<Vec<u8>, M
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::panic, clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -531,6 +534,117 @@ mod tests {
         };
         let result = pdu.serialize();
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_read_discrete_inputs_validation_error() {
+        let pdu = ModbusRequest::ReadDiscreteInputs {
+            starting_address: 0x0000,
+            quantity: 0,
+        };
+        let err = pdu.serialize().unwrap_err();
+        match err {
+            ModbusError::ValidationError(msg) => {
+                assert!(msg.contains("ReadDiscreteInputs"));
+            }
+            other => panic!("expected ValidationError, got {other:?}"),
+        }
+
+        let pdu = ModbusRequest::ReadDiscreteInputs {
+            starting_address: 0x0000,
+            quantity: 0x07D1,
+        };
+        assert!(pdu.serialize().is_err());
+    }
+
+    #[test]
+    fn test_read_input_registers_validation_error() {
+        let pdu = ModbusRequest::ReadInputRegisters {
+            starting_address: 0x0000,
+            quantity: 0,
+        };
+        let err = pdu.serialize().unwrap_err();
+        match err {
+            ModbusError::ValidationError(msg) => {
+                assert!(msg.contains("ReadInputRegisters"));
+            }
+            other => panic!("expected ValidationError, got {other:?}"),
+        }
+
+        let pdu = ModbusRequest::ReadInputRegisters {
+            starting_address: 0x0000,
+            quantity: 0x007E,
+        };
+        assert!(pdu.serialize().is_err());
+    }
+
+    /// Exercises the defensive `u16::try_from`/`u8::try_from` branches inside
+    /// `serialize_modbus_request_internal` by bypassing [`ModbusRequest::serialize`]'s
+    /// validation step.
+    #[test]
+    fn serialize_internal_write_multiple_coils_rejects_oversized_quantity() {
+        let pdu = ModbusRequest::WriteMultipleCoils {
+            starting_address: 0x0000,
+            values: vec![true; usize::from(u16::MAX) + 1],
+        };
+        let err = serialize_modbus_request_internal(&pdu).unwrap_err();
+        match err {
+            ModbusError::ValidationError(msg) => {
+                assert!(msg.contains("WriteMultipleCoils"));
+            }
+            other => panic!("expected ValidationError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn serialize_internal_write_multiple_coils_rejects_oversized_byte_count() {
+        // Quantity fits in u16, but the packed-coil byte count overflows u8.
+        // It intentionally exceeds the Modbus spec max to bypass public validation
+        // and exercise the crate-internal defensive conversion.
+        let pdu = ModbusRequest::WriteMultipleCoils {
+            starting_address: 0x0000,
+            values: vec![true; (usize::from(u8::MAX) + 1) * 8],
+        };
+        let err = serialize_modbus_request_internal(&pdu).unwrap_err();
+        match err {
+            ModbusError::ValidationError(msg) => {
+                assert!(msg.contains("byte count"));
+            }
+            other => panic!("expected ValidationError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn serialize_internal_write_multiple_registers_rejects_oversized_quantity() {
+        let pdu = ModbusRequest::WriteMultipleRegisters {
+            starting_address: 0x0000,
+            values: vec![0x0000; usize::from(u16::MAX) + 1],
+        };
+        let err = serialize_modbus_request_internal(&pdu).unwrap_err();
+        match err {
+            ModbusError::ValidationError(msg) => {
+                assert!(msg.contains("WriteMultipleRegisters"));
+            }
+            other => panic!("expected ValidationError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn serialize_internal_write_multiple_registers_rejects_oversized_byte_count() {
+        // Quantity fits in u16, but byte count (quantity * 2) overflows u8.
+        // It intentionally exceeds the Modbus spec max (123 registers) to bypass
+        // public validation and exercise the crate-internal defensive conversion.
+        let pdu = ModbusRequest::WriteMultipleRegisters {
+            starting_address: 0x0000,
+            values: vec![0x0000; 200],
+        };
+        let err = serialize_modbus_request_internal(&pdu).unwrap_err();
+        match err {
+            ModbusError::ValidationError(msg) => {
+                assert!(msg.contains("byte count"));
+            }
+            other => panic!("expected ValidationError, got {other:?}"),
+        }
     }
 
     #[test]
