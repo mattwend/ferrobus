@@ -1138,6 +1138,70 @@ mod tests {
     }
 
     #[test]
+    fn align_write_multiple_coils_with_oversized_request_quantity_errors() {
+        // Bypass `ModbusRequest::serialize` validation by constructing the
+        // request directly with a length that exceeds u16::MAX. This is the
+        // only way to exercise the defensive `u16::try_from` branch in
+        // `align_response_to_request`.
+        let request = ModbusRequest::WriteMultipleCoils {
+            starting_address: 0,
+            values: vec![true; usize::from(u16::MAX) + 1],
+        };
+        let response = ModbusResponse::WriteMultipleCoils {
+            starting_address: 0,
+            quantity: 1,
+        };
+        let err = align_response_to_request(&request, response).unwrap_err();
+        match err {
+            ModbusError::RequestResponseMismatch(msg) => {
+                assert!(msg.contains("WriteMultipleCoils"));
+            }
+            other => panic!("expected RequestResponseMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn align_write_multiple_registers_with_oversized_request_quantity_errors() {
+        let request = ModbusRequest::WriteMultipleRegisters {
+            starting_address: 0,
+            values: vec![0; usize::from(u16::MAX) + 1],
+        };
+        let response = ModbusResponse::WriteMultipleRegisters {
+            starting_address: 0,
+            quantity: 1,
+        };
+        let err = align_response_to_request(&request, response).unwrap_err();
+        match err {
+            ModbusError::RequestResponseMismatch(msg) => {
+                assert!(msg.contains("WriteMultipleRegisters"));
+            }
+            other => panic!("expected RequestResponseMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn align_to_request_method_delegates_to_free_function() {
+        let request = ModbusRequest::ReadCoils {
+            starting_address: 0,
+            quantity: 2,
+        };
+        let response = ModbusResponse::ReadCoils {
+            coils: vec![true, false],
+        };
+        let via_method = response.clone().align_to_request(&request).unwrap();
+        let via_fn = align_response_to_request(&request, response).unwrap();
+        assert_eq!(via_method, via_fn);
+    }
+
+    #[test]
+    fn deserialize_modbus_response_free_function_matches_method() {
+        let bytes = [3u8, 2, 0x12, 0x34];
+        let via_fn = deserialize_modbus_response(&bytes).unwrap();
+        let via_method = ModbusResponse::deserialize(&bytes).unwrap();
+        assert_eq!(via_fn, via_method);
+    }
+
+    #[test]
     fn test_modbus_response_clone() {
         let response = ModbusResponse::ReadHoldingRegisters {
             registers: vec![0x0102, 0x0304],
