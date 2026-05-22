@@ -295,7 +295,7 @@ impl ModbusResponse {
     ///
     /// Returns [`ModbusError::DeserializationError`] when the bytes are not a supported response.
     pub fn deserialize(response: &[u8]) -> Result<ModbusResponse, ModbusError> {
-        deserialize_modbus_response_internal(response, None)
+        deserialize_modbus_response(response, None)
     }
 
     /// Deserializes a Modbus response PDU and truncates bit-packed reads to `count` values.
@@ -307,7 +307,7 @@ impl ModbusResponse {
         response: &[u8],
         count: usize,
     ) -> Result<ModbusResponse, ModbusError> {
-        deserialize_modbus_response_internal(response, Some(count))
+        deserialize_modbus_response(response, Some(count))
     }
 
     /// Aligns this response with the request that produced it.
@@ -320,7 +320,7 @@ impl ModbusResponse {
     }
 }
 
-fn deserialize_modbus_response_internal(
+fn deserialize_modbus_response(
     response: &[u8],
     bit_count: Option<usize>,
 ) -> Result<ModbusResponse, ModbusError> {
@@ -423,15 +423,6 @@ fn deserialize_modbus_response_internal(
             "Unsupported function code: {function_code}"
         ))),
     }
-}
-
-/// Deserializes a Modbus response PDU.
-///
-/// # Errors
-///
-/// Returns [`ModbusError::DeserializationError`] when the bytes are not a supported response.
-pub fn deserialize_modbus_response(response: &[u8]) -> Result<ModbusResponse, ModbusError> {
-    ModbusResponse::deserialize(response)
 }
 
 impl TryFrom<&[u8]> for ModbusResponse {
@@ -1191,14 +1182,6 @@ mod tests {
         let via_method = response.clone().align_to_request(&request).unwrap();
         let via_fn = align_response_to_request(&request, response).unwrap();
         assert_eq!(via_method, via_fn);
-    }
-
-    #[test]
-    fn deserialize_modbus_response_free_function_matches_method() {
-        let bytes = [3u8, 2, 0x12, 0x34];
-        let via_fn = deserialize_modbus_response(&bytes).unwrap();
-        let via_method = ModbusResponse::deserialize(&bytes).unwrap();
-        assert_eq!(via_fn, via_method);
     }
 
     #[test]
