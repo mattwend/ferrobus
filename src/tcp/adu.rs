@@ -2,7 +2,7 @@
 // Copyright (c) 2025 tinymb contributors
 
 use crate::error::ModbusError;
-use crate::request::{ModbusRequest, serialize_modbus_request};
+use crate::request::ModbusRequest;
 
 const MBAP_HEADER_LEN: usize = 7;
 
@@ -31,7 +31,7 @@ pub fn build_modbus_tcp_adu(
     unit_id: u8,
     pdu: &ModbusRequest,
 ) -> Result<Vec<u8>, ModbusError> {
-    let pdu_bytes = serialize_modbus_request(pdu)?;
+    let pdu_bytes = pdu.serialize()?;
     build_modbus_tcp_adu_from_pdu_bytes(transaction_id, unit_id, &pdu_bytes)
 }
 
