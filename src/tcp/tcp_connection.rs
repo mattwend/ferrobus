@@ -14,7 +14,6 @@ use tokio::sync::Mutex;
 use tokio::time::timeout;
 use tracing::debug;
 
-use crate::response::align_response_to_request;
 use crate::{ModbusRequest, ModbusResponse, error::ModbusError, tcp::adu::build_modbus_tcp_adu};
 
 const MBAP_HEADER_LEN: usize = 7;
@@ -334,7 +333,7 @@ impl ModbusTcpConnection {
                 if let ModbusResponse::Exception { function, code } = response {
                     return Err(ModbusError::ExceptionResponse { function, code });
                 }
-                align_response_to_request(&pdu, response)
+                response.align_to_request(&pdu)
             }
         })
         .retry(backoff)
