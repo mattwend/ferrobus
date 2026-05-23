@@ -1,18 +1,25 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2025 tinymb contributors
 
-use backon::{ExponentialBuilder, Retryable};
+use std::collections::{HashMap, hash_map::Entry};
+use std::io;
 use std::net::IpAddr;
+use std::panic::AssertUnwindSafe;
 use std::sync::{
-    Arc,
-    atomic::{AtomicU16, Ordering},
+    Arc, Mutex as StdMutex,
+    atomic::{AtomicU16, AtomicU64, Ordering},
 };
 use std::time::Duration;
+
+use backon::{ExponentialBuilder, Retryable};
+use futures::FutureExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::Mutex;
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::sync::{Mutex, oneshot};
+use tokio::task::JoinHandle;
 use tokio::time::timeout;
-use tracing::debug;
+use tracing::{debug, error};
 
 use crate::{ModbusRequest, ModbusResponse, error::ModbusError, tcp::adu::build_modbus_tcp_adu};
 
@@ -22,6 +29,9 @@ const RETRY_MAX_ELAPSED_TIME: Duration = Duration::from_secs(2);
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_TID_PROBES: usize = 256;
+
+type Pending = StdMutex<HashMap<u16, oneshot::Sender<Result<Vec<u8>, ModbusError>>>>;
 
 /// Per-operation time limits used by [`ModbusTcpConnection`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -44,17 +54,161 @@ impl Default for ModbusTcpTimeouts {
     }
 }
 
+struct ConnectedState {
+    writer: Mutex<OwnedWriteHalf>,
+    pending: Arc<Pending>,
+    reader_task: JoinHandle<()>,
+    generation: u64,
+}
+
+impl std::fmt::Debug for ConnectedState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConnectedState")
+            .field("generation", &self.generation)
+            .field("reader_finished", &self.reader_task.is_finished())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for ConnectedState {
+    fn drop(&mut self) {
+        self.reader_task.abort();
+        Self::drain_pending(
+            &self.pending,
+            io::ErrorKind::ConnectionAborted,
+            "connection state replaced or dropped",
+        );
+    }
+}
+
+impl ConnectedState {
+    /// Drains all in-flight request waiters with a transport error.
+    fn drain_pending(pending: &Pending, kind: io::ErrorKind, reason: &'static str) {
+        if let Ok(mut map) = pending.lock() {
+            for (_, tx) in map.drain() {
+                let _ = tx.send(Err(ModbusError::ReadError(io::Error::new(kind, reason))));
+            }
+        }
+    }
+
+    async fn reader_loop(mut read_half: OwnedReadHalf, pending: Arc<Pending>) {
+        let reader_pending = Arc::clone(&pending);
+        let reader = async move {
+            loop {
+                let mut header_buffer = [0u8; MBAP_HEADER_LEN];
+                read_half
+                    .read_exact(&mut header_buffer)
+                    .await
+                    .map_err(ModbusError::ReadError)?;
+
+                let body_len = ModbusTcpConnection::response_body_len_from_header(header_buffer)
+                    .map_err(|error| {
+                        ModbusError::MalformedResponse(format!("invalid MBAP header: {error}"))
+                    })?;
+
+                let mut response_buffer = vec![0u8; MBAP_HEADER_LEN + body_len];
+                response_buffer[..MBAP_HEADER_LEN].copy_from_slice(&header_buffer);
+                read_half
+                    .read_exact(&mut response_buffer[MBAP_HEADER_LEN..])
+                    .await
+                    .map_err(ModbusError::ReadError)?;
+
+                let tid = u16::from_be_bytes([header_buffer[0], header_buffer[1]]);
+                let sender = {
+                    let mut map = reader_pending.lock().map_err(|_| {
+                        ModbusError::ReadError(io::Error::other("pending map poisoned"))
+                    })?;
+                    map.remove(&tid)
+                };
+
+                match sender {
+                    Some(tx) => {
+                        let _ = tx.send(Ok(response_buffer));
+                    }
+                    None => {
+                        debug!(tid, "stray response, ignored");
+                    }
+                }
+            }
+        };
+
+        let result = AssertUnwindSafe(reader)
+            .catch_unwind()
+            .await
+            .map_err(|panic| {
+                let message = if let Some(message) = panic.downcast_ref::<&str>() {
+                    *message
+                } else if let Some(message) = panic.downcast_ref::<String>() {
+                    message.as_str()
+                } else {
+                    "unknown panic payload"
+                };
+                error!(message, "reader task panicked");
+                ModbusError::ReadError(io::Error::other("reader task panicked"))
+            })
+            .and_then(|inner| inner);
+
+        match result {
+            Ok(()) => {}
+            Err(ModbusError::ReadError(error)) => {
+                let kind = error.kind();
+                Self::drain_pending(&pending, kind, "reader task terminated");
+            }
+            Err(ModbusError::MalformedResponse(_)) => {
+                Self::drain_pending(
+                    &pending,
+                    io::ErrorKind::InvalidData,
+                    "reader task received malformed response",
+                );
+            }
+            Err(_) => {
+                Self::drain_pending(&pending, io::ErrorKind::Other, "reader task terminated");
+            }
+        }
+    }
+}
+
+struct PendingGuard {
+    pending: Arc<Pending>,
+    tid: u16,
+    armed: bool,
+}
+
+impl PendingGuard {
+    /// Disables automatic pending-map removal on drop.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PendingGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            if let Ok(mut map) = self.pending.lock() {
+                let _ = map.remove(&self.tid);
+                debug!(
+                    tid = self.tid,
+                    in_flight = map.len(),
+                    "pending request removed"
+                );
+            }
+        }
+    }
+}
+
 /// Reusable Modbus TCP client handle.
 ///
-/// Cloned handles share the same underlying TCP stream and transaction counter.
+/// Cloned handles may issue requests concurrently over one shared TCP socket.
+/// Responses are matched back to callers by MBAP transaction identifier.
 #[derive(Clone, Debug)]
 pub struct ModbusTcpConnection {
-    stream: Arc<Mutex<Option<TcpStream>>>,
+    state: Arc<Mutex<Option<Arc<ConnectedState>>>>,
     address: IpAddr,
     port: u16,
     unit_id: u8,
     transaction_id: Arc<AtomicU16>,
     timeouts: ModbusTcpTimeouts,
+    generation: Arc<AtomicU64>,
 }
 
 impl ModbusTcpConnection {
@@ -80,12 +234,13 @@ impl ModbusTcpConnection {
         timeouts: ModbusTcpTimeouts,
     ) -> Self {
         Self {
-            stream: Arc::new(Mutex::new(None)),
+            state: Arc::new(Mutex::new(None)),
             address,
             port,
             unit_id,
             transaction_id: Arc::new(AtomicU16::new(transaction_id)),
             timeouts,
+            generation: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -105,12 +260,13 @@ impl ModbusTcpConnection {
     #[must_use]
     pub fn with_unit_id(&self, unit_id: u8) -> Self {
         Self {
-            stream: Arc::clone(&self.stream),
+            state: Arc::clone(&self.state),
             address: self.address,
             port: self.port,
             unit_id,
             transaction_id: Arc::clone(&self.transaction_id),
             timeouts: self.timeouts,
+            generation: Arc::clone(&self.generation),
         }
     }
 
@@ -124,8 +280,84 @@ impl ModbusTcpConnection {
             .await
             .map_err(|_| ModbusError::ConnectTimeout)?
             .map_err(ModbusError::ConnectError)?;
-        debug!("Connected to Modbus TCP server at {}", &server_addr);
+        debug!(server_addr, "connected to Modbus TCP server");
         Ok(stream)
+    }
+
+    async fn create_connected_state(
+        &self,
+        generation: u64,
+    ) -> Result<Arc<ConnectedState>, ModbusError> {
+        let stream =
+            Self::connect_stream(self.address, self.port, self.timeouts.connect_timeout).await?;
+        let (read_half, write_half) = stream.into_split();
+        let pending = Arc::new(StdMutex::new(HashMap::new()));
+        let reader_pending = Arc::clone(&pending);
+        let reader_task = tokio::spawn(async move {
+            ConnectedState::reader_loop(read_half, reader_pending).await;
+        });
+
+        Ok(Arc::new(ConnectedState {
+            writer: Mutex::new(write_half),
+            pending,
+            reader_task,
+            generation,
+        }))
+    }
+
+    async fn ensure_connected_state(&self) -> Result<Arc<ConnectedState>, ModbusError> {
+        let mut state_guard = self.state.lock().await;
+        if let Some(state) = state_guard.as_ref() {
+            if !state.reader_task.is_finished() {
+                return Ok(Arc::clone(state));
+            }
+
+            *state_guard = None;
+            let current_generation = self.generation.load(Ordering::SeqCst);
+            self.generation
+                .store(current_generation.saturating_add(1), Ordering::SeqCst);
+        }
+
+        let generation = self.generation.load(Ordering::SeqCst).saturating_add(1);
+        let connected_state = self.create_connected_state(generation).await?;
+        *state_guard = Some(Arc::clone(&connected_state));
+        self.generation.store(generation, Ordering::SeqCst);
+        Ok(connected_state)
+    }
+
+    fn allocate_pending_transaction_id(
+        &self,
+        pending: &Pending,
+        sender: oneshot::Sender<Result<Vec<u8>, ModbusError>>,
+    ) -> Result<u16, ModbusError> {
+        let mut map = pending
+            .lock()
+            .map_err(|_| ModbusError::ReadError(io::Error::other("pending map poisoned")))?;
+
+        for _ in 0..MAX_TID_PROBES {
+            let tid = self.transaction_id.fetch_add(1, Ordering::Relaxed);
+            if let Entry::Vacant(entry) = map.entry(tid) {
+                entry.insert(sender);
+                debug!(tid, in_flight = map.len(), "pending request inserted");
+                return Ok(tid);
+            }
+        }
+
+        Err(ModbusError::NoFreeTransactionId)
+    }
+
+    async fn tear_down(&self, captured_generation: u64) {
+        let current_generation = self.generation.load(Ordering::SeqCst);
+        if captured_generation != current_generation {
+            return;
+        }
+
+        let mut state_guard = self.state.lock().await;
+        if self.generation.load(Ordering::SeqCst) == captured_generation {
+            *state_guard = None;
+            self.generation
+                .store(captured_generation.saturating_add(1), Ordering::SeqCst);
+        }
     }
 
     /// Opens the TCP connection eagerly.
@@ -137,22 +369,26 @@ impl ModbusTcpConnection {
     ///
     /// Returns [`ModbusError::ConnectError`] or [`ModbusError::ConnectTimeout`] if opening the socket fails.
     pub async fn connect(&self) -> Result<(), ModbusError> {
-        let stream =
-            Self::connect_stream(self.address, self.port, self.timeouts.connect_timeout).await?;
-        let mut stream_guard = self.stream.lock().await;
-        *stream_guard = Some(stream);
+        let _ = self.ensure_connected_state().await?;
         Ok(())
     }
 
     /// Closes the current TCP session if one is open.
     pub async fn disconnect(&self) {
-        let mut stream_guard = self.stream.lock().await;
-        *stream_guard = None;
+        let mut state_guard = self.state.lock().await;
+        *state_guard = None;
+        let current_generation = self.generation.load(Ordering::SeqCst);
+        self.generation
+            .store(current_generation.saturating_add(1), Ordering::SeqCst);
     }
 
     /// Returns whether this handle currently owns an open TCP stream.
     pub async fn is_connected(&self) -> bool {
-        self.stream.lock().await.is_some()
+        self.state
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|state| !state.reader_task.is_finished())
     }
 
     fn response_body_len_from_header(header: [u8; MBAP_HEADER_LEN]) -> Result<usize, ModbusError> {
@@ -185,63 +421,6 @@ impl ModbusTcpConnection {
             .with_total_delay(Some(RETRY_MAX_ELAPSED_TIME))
     }
 
-    async fn ensure_connected_stream(
-        stream: &mut Option<TcpStream>,
-        address: IpAddr,
-        port: u16,
-        timeouts: ModbusTcpTimeouts,
-    ) -> Result<&mut TcpStream, ModbusError> {
-        if stream.is_none() {
-            let tcp_stream = Self::connect_stream(address, port, timeouts.connect_timeout).await?;
-            *stream = Some(tcp_stream);
-        }
-
-        stream.as_mut().ok_or_else(|| {
-            ModbusError::ConnectError(std::io::Error::new(
-                std::io::ErrorKind::NotConnected,
-                "stream missing after successful connect",
-            ))
-        })
-    }
-
-    async fn exchange_frame(
-        socket: &mut TcpStream,
-        adu: &[u8],
-        timeouts: ModbusTcpTimeouts,
-    ) -> Result<Vec<u8>, ModbusError> {
-        match timeout(timeouts.write_timeout, socket.write_all(adu)).await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => return Err(ModbusError::WriteError(error)),
-            Err(_) => return Err(ModbusError::WriteTimeout),
-        }
-
-        socket.flush().await.map_err(ModbusError::WriteError)?;
-
-        let mut header_buffer = [0u8; MBAP_HEADER_LEN];
-        match timeout(timeouts.read_timeout, socket.read_exact(&mut header_buffer)).await {
-            Ok(Ok(_)) => {}
-            Ok(Err(error)) => return Err(ModbusError::ReadError(error)),
-            Err(_) => return Err(ModbusError::ReadTimeout),
-        }
-
-        let body_len = Self::response_body_len_from_header(header_buffer).map_err(|error| {
-            ModbusError::MalformedResponse(format!("invalid MBAP header: {error}"))
-        })?;
-        let mut response_buffer = vec![0u8; MBAP_HEADER_LEN + body_len];
-        response_buffer[..MBAP_HEADER_LEN].copy_from_slice(&header_buffer);
-
-        match timeout(
-            timeouts.read_timeout,
-            socket.read_exact(&mut response_buffer[MBAP_HEADER_LEN..]),
-        )
-        .await
-        {
-            Ok(Ok(_)) => Ok(response_buffer),
-            Ok(Err(error)) => Err(ModbusError::ReadError(error)),
-            Err(_) => Err(ModbusError::ReadTimeout),
-        }
-    }
-
     /// Sends one request using this connection's default unit id.
     ///
     /// The connection is opened on demand, and transient I/O failures are retried
@@ -267,42 +446,66 @@ impl ModbusTcpConnection {
         pdu: &ModbusRequest,
     ) -> Result<ModbusResponse, ModbusError> {
         let backoff = Self::retry_backoff();
-        let stream = Arc::clone(&self.stream);
-        let transaction_id = Arc::clone(&self.transaction_id);
-        let address = self.address;
-        let port = self.port;
-        let timeouts = self.timeouts;
+        let connection = self.clone();
         let pdu = pdu.clone();
 
-        let tid = transaction_id.fetch_add(1, Ordering::Relaxed);
-
         (|| {
+            let connection = connection.clone();
             let pdu = pdu.clone();
-            let stream = Arc::clone(&stream);
             async move {
+                let state = connection.ensure_connected_state().await?;
+                let captured_generation = state.generation;
+                let (tx, rx) = oneshot::channel();
+                let tid = connection.allocate_pending_transaction_id(&state.pending, tx)?;
+                let mut pending_guard = PendingGuard {
+                    pending: Arc::clone(&state.pending),
+                    tid,
+                    armed: true,
+                };
+
                 let adu = build_modbus_tcp_adu(tid, unit_id, &pdu)?;
-                debug!("Modbus TCP Frame: {:02X?}", adu);
+                debug!(tid, "Modbus TCP Frame: {:02X?}", adu);
 
-                let mut stream_guard = stream.lock().await;
-                let socket =
-                    Self::ensure_connected_stream(&mut stream_guard, address, port, timeouts)
-                        .await?;
+                {
+                    let mut writer = state.writer.lock().await;
+                    match timeout(connection.timeouts.write_timeout, writer.write_all(&adu)).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => {
+                            connection.tear_down(captured_generation).await;
+                            return Err(ModbusError::WriteError(error));
+                        }
+                        Err(_) => {
+                            connection.tear_down(captured_generation).await;
+                            return Err(ModbusError::WriteTimeout);
+                        }
+                    }
 
-                let response_buffer = match Self::exchange_frame(socket, &adu, timeouts).await {
-                    Ok(response_buffer) => response_buffer,
-                    Err(
-                        error @ (ModbusError::ConnectError(_)
-                        | ModbusError::ConnectTimeout
-                        | ModbusError::WriteError(_)
-                        | ModbusError::WriteTimeout
-                        | ModbusError::ReadError(_)
-                        | ModbusError::ReadTimeout),
-                    ) => {
-                        *stream_guard = None;
+                    if let Err(error) = writer.flush().await {
+                        connection.tear_down(captured_generation).await;
+                        return Err(ModbusError::WriteError(error));
+                    }
+                }
+
+                let response_buffer = match timeout(connection.timeouts.read_timeout, rx).await {
+                    Ok(Ok(Ok(frame))) => frame,
+                    Ok(Ok(Err(error))) => {
+                        connection.tear_down(captured_generation).await;
                         return Err(error);
                     }
-                    Err(error) => return Err(error),
+                    Ok(Err(_)) => {
+                        connection.tear_down(captured_generation).await;
+                        return Err(ModbusError::ReadError(io::Error::new(
+                            io::ErrorKind::ConnectionAborted,
+                            "reader task terminated",
+                        )));
+                    }
+                    Err(_) => {
+                        connection.tear_down(captured_generation).await;
+                        return Err(ModbusError::ReadTimeout);
+                    }
                 };
+
+                pending_guard.disarm();
 
                 let protocol_id = u16::from_be_bytes([response_buffer[2], response_buffer[3]]);
                 if protocol_id != 0 {
@@ -425,10 +628,6 @@ mod tests {
 
     #[test]
     fn retry_backoff_builds_without_panicking() {
-        // `backon::ExponentialBuilder` does not expose its fields, so we only
-        // smoke-test that the policy can be constructed. The bounded total
-        // delay is enforced by `RETRY_MAX_ELAPSED_TIME`, which is asserted
-        // by `retry_max_elapsed_time_is_two_seconds` below.
         let _ = ModbusTcpConnection::retry_backoff();
     }
 
@@ -476,7 +675,7 @@ mod tests {
         assert_eq!(connection.unit_id(), 1);
         assert_eq!(child.unit_id(), 42);
         assert_eq!(child.timeouts(), connection.timeouts());
-        assert!(Arc::ptr_eq(&connection.stream, &child.stream));
+        assert!(Arc::ptr_eq(&connection.state, &child.state));
         assert!(Arc::ptr_eq(
             &connection.transaction_id,
             &child.transaction_id,
@@ -521,5 +720,77 @@ mod tests {
         connection.disconnect().await;
 
         assert!(!connection.is_connected().await);
+    }
+
+    #[test]
+    fn allocate_pending_transaction_id_inserts_atomically() {
+        let connection = ModbusTcpConnection::new("127.0.0.1".parse().unwrap(), 502, 1, 0);
+        let pending = StdMutex::new(HashMap::new());
+        let (tx, _rx) = oneshot::channel();
+
+        let tid = connection
+            .allocate_pending_transaction_id(&pending, tx)
+            .unwrap();
+
+        let map = pending.lock().unwrap();
+        assert_eq!(tid, 0);
+        assert!(map.contains_key(&0));
+    }
+
+    #[test]
+    fn allocate_pending_transaction_id_reports_no_free_tid_after_probe_limit() {
+        let connection = ModbusTcpConnection::new("127.0.0.1".parse().unwrap(), 502, 1, 0);
+        let pending = StdMutex::new(HashMap::new());
+        {
+            let mut map = pending.lock().unwrap();
+            for tid in 0..u16::try_from(MAX_TID_PROBES).unwrap() {
+                let (tx, _rx) = oneshot::channel();
+                map.insert(tid, tx);
+            }
+        }
+        let (tx, _rx) = oneshot::channel();
+
+        let error = connection
+            .allocate_pending_transaction_id(&pending, tx)
+            .unwrap_err();
+
+        assert!(matches!(error, ModbusError::NoFreeTransactionId));
+    }
+
+    #[test]
+    fn allocate_pending_transaction_id_wraps_around_u16_max() {
+        let connection = ModbusTcpConnection::new("127.0.0.1".parse().unwrap(), 502, 1, u16::MAX);
+        let pending = StdMutex::new(HashMap::new());
+        let (first_tx, _first_rx) = oneshot::channel();
+        let (second_tx, _second_rx) = oneshot::channel();
+
+        let first_tid = connection
+            .allocate_pending_transaction_id(&pending, first_tx)
+            .unwrap();
+        let second_tid = connection
+            .allocate_pending_transaction_id(&pending, second_tx)
+            .unwrap();
+
+        let map = pending.lock().unwrap();
+        assert_eq!(first_tid, u16::MAX);
+        assert_eq!(second_tid, 0);
+        assert!(map.contains_key(&u16::MAX));
+        assert!(map.contains_key(&0));
+    }
+
+    #[test]
+    fn pending_guard_removes_cancelled_request_entry() {
+        let pending = Arc::new(StdMutex::new(HashMap::new()));
+        let (tx, _rx) = oneshot::channel();
+        pending.lock().unwrap().insert(7, tx);
+
+        let guard = PendingGuard {
+            pending: Arc::clone(&pending),
+            tid: 7,
+            armed: true,
+        };
+        drop(guard);
+
+        assert!(pending.lock().unwrap().is_empty());
     }
 }
