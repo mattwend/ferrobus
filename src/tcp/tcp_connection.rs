@@ -63,6 +63,12 @@ struct ConnectedState {
     generation: u64,
 }
 
+#[derive(Clone)]
+struct TearDown {
+    connection: ModbusTcpConnection,
+    generation: u64,
+}
+
 impl std::fmt::Debug for ConnectedState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ConnectedState")
@@ -458,8 +464,7 @@ impl ModbusTcpConnection {
     /// * `writer` - Shared TCP write half for the connected state.
     /// * `adu` - Complete Modbus TCP ADU bytes to send.
     /// * `write_timeout` - Maximum duration for the write and flush operation.
-    /// * `connection` - Handle used by the writer task to tear down stale state on failure.
-    /// * `captured_generation` - Generation that must still be current for tear-down.
+    /// * `teardown` - Connection state and generation used to tear down stale state on failure.
     ///
     /// # Errors
     ///
@@ -470,13 +475,12 @@ impl ModbusTcpConnection {
         writer: Arc<Mutex<OwnedWriteHalf>>,
         adu: Vec<u8>,
         write_timeout: Duration,
-        connection: Self,
-        captured_generation: u64,
+        teardown: TearDown,
     ) -> Result<(), ModbusError> {
         // Keep this spawned instead of inlining the write in the caller future:
         // dropping a `JoinHandle` does not abort its task, so caller cancellation
         // cannot leave a partial ADU on the socket before the next writer runs.
-        let teardown_connection = connection.clone();
+        let writer_teardown = teardown.clone();
         let writer_task = tokio::spawn(async move {
             let mut writer = writer.lock_owned().await;
             let result = timeout(write_timeout, async {
@@ -488,7 +492,10 @@ impl ModbusTcpConnection {
             .map_err(ModbusError::WriteError);
 
             if result.is_err() {
-                teardown_connection.tear_down(captured_generation).await;
+                writer_teardown
+                    .connection
+                    .tear_down(writer_teardown.generation)
+                    .await;
             }
 
             result
@@ -497,7 +504,7 @@ impl ModbusTcpConnection {
         match writer_task.await {
             Ok(result) => result,
             Err(error) => {
-                connection.tear_down(captured_generation).await;
+                teardown.connection.tear_down(teardown.generation).await;
                 Err(ModbusError::WriteError(io::Error::other(format!(
                     "writer task failed: {error}"
                 ))))
@@ -554,8 +561,10 @@ impl ModbusTcpConnection {
                     Arc::clone(&state.writer),
                     adu,
                     connection.timeouts.write_timeout,
-                    connection.clone(),
-                    captured_generation,
+                    TearDown {
+                        connection: connection.clone(),
+                        generation: captured_generation,
+                    },
                 )
                 .await?;
 

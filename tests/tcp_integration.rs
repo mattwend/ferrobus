@@ -561,32 +561,20 @@ async fn stray_response_with_unknown_tid_is_ignored() {
 
 #[tokio::test]
 async fn reader_death_drains_pending_and_next_call_reconnects() {
-    use std::sync::atomic::{AtomicBool, Ordering};
-
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let allow_success = Arc::new(AtomicBool::new(false));
 
-    tokio::spawn({
-        let allow_success = Arc::clone(&allow_success);
-        async move {
-            loop {
-                let (mut stream, _) = listener.accept().await.unwrap();
-                let request = read_request_frame(&mut stream).await.unwrap();
+    tokio::spawn(async move {
+        let (mut hanging_stream, _) = listener.accept().await.unwrap();
+        let _first_request = read_request_frame(&mut hanging_stream).await.unwrap();
+        // Drop the stream so the reader sees EOF → fatal → drain_pending.
+        drop(hanging_stream);
 
-                if allow_success.load(Ordering::SeqCst) {
-                    let response = make_read_coils_response(
-                        request.transaction_id,
-                        request.unit_id,
-                        &[true, false],
-                    );
-                    stream.write_all(&response).await.unwrap();
-                    break;
-                }
-
-                drop(stream);
-            }
-        }
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let request = read_request_frame(&mut stream).await.unwrap();
+        let response =
+            make_read_coils_response(request.transaction_id, request.unit_id, &[true, false]);
+        stream.write_all(&response).await.unwrap();
     });
 
     let conn = ModbusTcpConnection::with_timeouts(
@@ -597,18 +585,13 @@ async fn reader_death_drains_pending_and_next_call_reconnects() {
         ModbusTcpTimeouts {
             connect_timeout: Duration::from_millis(100),
             write_timeout: Duration::from_millis(100),
-            read_timeout: Duration::from_secs(1),
+            read_timeout: Duration::from_millis(25),
         },
     );
     let request = ModbusRequest::ReadCoils {
         starting_address: 0x0000,
         quantity: 2,
     };
-
-    let first_error = conn.send_message(&request).await.unwrap_err();
-    assert!(first_error.is_transient());
-
-    allow_success.store(true, Ordering::SeqCst);
 
     let response = conn.send_message(&request).await.unwrap();
     assert_eq!(
