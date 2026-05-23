@@ -55,7 +55,9 @@ impl Default for ModbusTcpTimeouts {
 }
 
 struct ConnectedState {
-    writer: Mutex<OwnedWriteHalf>,
+    // `lock_owned` requires an `Arc<Mutex<_>>`; the spawned writer task uses it to
+    // keep a full ADU write cancellation-safe after the caller future is dropped.
+    writer: Arc<Mutex<OwnedWriteHalf>>,
     pending: Arc<Pending>,
     reader_task: JoinHandle<()>,
     generation: u64,
@@ -84,9 +86,19 @@ impl Drop for ConnectedState {
 impl ConnectedState {
     /// Drains all in-flight request waiters with a transport error.
     fn drain_pending(pending: &Pending, kind: io::ErrorKind, reason: &'static str) {
-        if let Ok(mut map) = pending.lock() {
-            for (_, tx) in map.drain() {
-                let _ = tx.send(Err(ModbusError::ReadError(io::Error::new(kind, reason))));
+        match pending.lock() {
+            Ok(mut map) => {
+                for (_, tx) in map.drain() {
+                    let _ = tx.send(Err(ModbusError::ReadError(io::Error::new(kind, reason))));
+                }
+            }
+            Err(_) => {
+                // A poisoned pending map cannot be drained safely; log the degradation so
+                // callers blocked on removed senders are not silently abandoned.
+                error!(
+                    reason,
+                    "pending map poisoned while draining in-flight requests"
+                );
             }
         }
     }
@@ -118,7 +130,13 @@ impl ConnectedState {
                     let mut map = reader_pending.lock().map_err(|_| {
                         ModbusError::ReadError(io::Error::other("pending map poisoned"))
                     })?;
-                    map.remove(&tid)
+                    match map.remove(&tid) {
+                        Some(sender) => {
+                            debug!(tid, in_flight = map.len(), "pending response matched");
+                            Some(sender)
+                        }
+                        None => None,
+                    }
                 };
 
                 match sender {
@@ -184,13 +202,21 @@ impl PendingGuard {
 impl Drop for PendingGuard {
     fn drop(&mut self) {
         if self.armed {
-            if let Ok(mut map) = self.pending.lock() {
-                let _ = map.remove(&self.tid);
-                debug!(
-                    tid = self.tid,
-                    in_flight = map.len(),
-                    "pending request removed"
-                );
+            match self.pending.lock() {
+                Ok(mut map) => {
+                    let _ = map.remove(&self.tid);
+                    debug!(
+                        tid = self.tid,
+                        in_flight = map.len(),
+                        "pending request removed"
+                    );
+                }
+                Err(_) => {
+                    error!(
+                        tid = self.tid,
+                        "pending map poisoned while removing request"
+                    );
+                }
             }
         }
     }
@@ -298,7 +324,7 @@ impl ModbusTcpConnection {
         });
 
         Ok(Arc::new(ConnectedState {
-            writer: Mutex::new(write_half),
+            writer: Arc::new(Mutex::new(write_half)),
             pending,
             reader_task,
             generation,
@@ -313,15 +339,14 @@ impl ModbusTcpConnection {
             }
 
             *state_guard = None;
-            let current_generation = self.generation.load(Ordering::SeqCst);
-            self.generation
-                .store(current_generation.saturating_add(1), Ordering::SeqCst);
         }
 
-        let generation = self.generation.load(Ordering::SeqCst).saturating_add(1);
+        let generation = self
+            .generation
+            .fetch_add(1, Ordering::SeqCst)
+            .saturating_add(1);
         let connected_state = self.create_connected_state(generation).await?;
         *state_guard = Some(Arc::clone(&connected_state));
-        self.generation.store(generation, Ordering::SeqCst);
         Ok(connected_state)
     }
 
@@ -421,6 +446,65 @@ impl ModbusTcpConnection {
             .with_total_delay(Some(RETRY_MAX_ELAPSED_TIME))
     }
 
+    /// Writes one complete Modbus TCP ADU on a background task.
+    ///
+    /// The background task owns the writer mutex guard until the frame is fully
+    /// written and flushed, or until `write_timeout` expires. If the caller future
+    /// is cancelled while the write is in progress, the task continues to preserve
+    /// stream framing for subsequent requests.
+    ///
+    /// # Arguments
+    ///
+    /// * `writer` - Shared TCP write half for the connected state.
+    /// * `adu` - Complete Modbus TCP ADU bytes to send.
+    /// * `write_timeout` - Maximum duration for the write and flush operation.
+    /// * `connection` - Handle used by the writer task to tear down stale state on failure.
+    /// * `captured_generation` - Generation that must still be current for tear-down.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ModbusError::WriteError`] for socket failures or writer task
+    /// failures, and [`ModbusError::WriteTimeout`] when the operation exceeds
+    /// `write_timeout`.
+    async fn write_adu_cancellation_safe(
+        writer: Arc<Mutex<OwnedWriteHalf>>,
+        adu: Vec<u8>,
+        write_timeout: Duration,
+        connection: Self,
+        captured_generation: u64,
+    ) -> Result<(), ModbusError> {
+        // Keep this spawned instead of inlining the write in the caller future:
+        // dropping a `JoinHandle` does not abort its task, so caller cancellation
+        // cannot leave a partial ADU on the socket before the next writer runs.
+        let teardown_connection = connection.clone();
+        let writer_task = tokio::spawn(async move {
+            let mut writer = writer.lock_owned().await;
+            let result = timeout(write_timeout, async {
+                writer.write_all(&adu).await?;
+                writer.flush().await
+            })
+            .await
+            .map_err(|_| ModbusError::WriteTimeout)?
+            .map_err(ModbusError::WriteError);
+
+            if result.is_err() {
+                teardown_connection.tear_down(captured_generation).await;
+            }
+
+            result
+        });
+
+        match writer_task.await {
+            Ok(result) => result,
+            Err(error) => {
+                connection.tear_down(captured_generation).await;
+                Err(ModbusError::WriteError(io::Error::other(format!(
+                    "writer task failed: {error}"
+                ))))
+            }
+        }
+    }
+
     /// Sends one request using this connection's default unit id.
     ///
     /// The connection is opened on demand, and transient I/O failures are retried
@@ -466,25 +550,14 @@ impl ModbusTcpConnection {
                 let adu = build_modbus_tcp_adu(tid, unit_id, &pdu)?;
                 debug!(tid, "Modbus TCP Frame: {:02X?}", adu);
 
-                {
-                    let mut writer = state.writer.lock().await;
-                    match timeout(connection.timeouts.write_timeout, writer.write_all(&adu)).await {
-                        Ok(Ok(())) => {}
-                        Ok(Err(error)) => {
-                            connection.tear_down(captured_generation).await;
-                            return Err(ModbusError::WriteError(error));
-                        }
-                        Err(_) => {
-                            connection.tear_down(captured_generation).await;
-                            return Err(ModbusError::WriteTimeout);
-                        }
-                    }
-
-                    if let Err(error) = writer.flush().await {
-                        connection.tear_down(captured_generation).await;
-                        return Err(ModbusError::WriteError(error));
-                    }
-                }
+                Self::write_adu_cancellation_safe(
+                    Arc::clone(&state.writer),
+                    adu,
+                    connection.timeouts.write_timeout,
+                    connection.clone(),
+                    captured_generation,
+                )
+                .await?;
 
                 let response_buffer = match timeout(connection.timeouts.read_timeout, rx).await {
                     Ok(Ok(Ok(frame))) => frame,

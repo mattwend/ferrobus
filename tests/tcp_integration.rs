@@ -560,6 +560,66 @@ async fn stray_response_with_unknown_tid_is_ignored() {
 }
 
 #[tokio::test]
+async fn reader_death_drains_pending_and_next_call_reconnects() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let allow_success = Arc::new(AtomicBool::new(false));
+
+    tokio::spawn({
+        let allow_success = Arc::clone(&allow_success);
+        async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request = read_request_frame(&mut stream).await.unwrap();
+
+                if allow_success.load(Ordering::SeqCst) {
+                    let response = make_read_coils_response(
+                        request.transaction_id,
+                        request.unit_id,
+                        &[true, false],
+                    );
+                    stream.write_all(&response).await.unwrap();
+                    break;
+                }
+
+                drop(stream);
+            }
+        }
+    });
+
+    let conn = ModbusTcpConnection::with_timeouts(
+        addr.ip(),
+        addr.port(),
+        1,
+        0,
+        ModbusTcpTimeouts {
+            connect_timeout: Duration::from_millis(100),
+            write_timeout: Duration::from_millis(100),
+            read_timeout: Duration::from_secs(1),
+        },
+    );
+    let request = ModbusRequest::ReadCoils {
+        starting_address: 0x0000,
+        quantity: 2,
+    };
+
+    let first_error = conn.send_message(&request).await.unwrap_err();
+    assert!(first_error.is_transient());
+
+    allow_success.store(true, Ordering::SeqCst);
+
+    let response = conn.send_message(&request).await.unwrap();
+    assert_eq!(
+        response,
+        ModbusResponse::ReadCoils {
+            coils: vec![true, false]
+        }
+    );
+}
+
+#[tokio::test]
 async fn caller_future_cancellation_does_not_break_following_requests() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
