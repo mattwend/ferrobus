@@ -2,6 +2,7 @@
 // Copyright (c) 2025 tinymb contributors
 
 use std::collections::{HashMap, hash_map::Entry};
+use std::convert::Infallible;
 use std::io;
 use std::net::IpAddr;
 use std::panic::AssertUnwindSafe;
@@ -110,52 +111,14 @@ impl ConnectedState {
     }
 
     async fn reader_loop(mut read_half: OwnedReadHalf, pending: Arc<Pending>) {
-        let reader_pending = Arc::clone(&pending);
-        let reader = async move {
-            loop {
-                let mut header_buffer = [0u8; MBAP_HEADER_LEN];
-                read_half
-                    .read_exact(&mut header_buffer)
-                    .await
-                    .map_err(ModbusError::ReadError)?;
+        let reader = Self::run_reader_loop(&mut read_half, Arc::clone(&pending));
 
-                let body_len = ModbusTcpConnection::response_body_len_from_header(header_buffer)
-                    .map_err(|error| {
-                        ModbusError::MalformedResponse(format!("invalid MBAP header: {error}"))
-                    })?;
-
-                let mut response_buffer = vec![0u8; MBAP_HEADER_LEN + body_len];
-                response_buffer[..MBAP_HEADER_LEN].copy_from_slice(&header_buffer);
-                read_half
-                    .read_exact(&mut response_buffer[MBAP_HEADER_LEN..])
-                    .await
-                    .map_err(ModbusError::ReadError)?;
-
-                let tid = u16::from_be_bytes([header_buffer[0], header_buffer[1]]);
-                let sender = {
-                    let mut map = reader_pending.lock().map_err(|_| {
-                        ModbusError::ReadError(io::Error::other("pending map poisoned"))
-                    })?;
-                    match map.remove(&tid) {
-                        Some(sender) => {
-                            debug!(tid, in_flight = map.len(), "pending response matched");
-                            Some(sender)
-                        }
-                        None => None,
-                    }
-                };
-
-                match sender {
-                    Some(tx) => {
-                        let _ = tx.send(Ok(response_buffer));
-                    }
-                    None => {
-                        debug!(tid, "stray response, ignored");
-                    }
-                }
-            }
-        };
-
+        // Safety net: the reader loop should never panic (all fallible ops use `?`),
+        // but if a bug or dependency causes one, catch_unwind ensures pending callers
+        // get an error instead of silently deadlocking on their oneshot receivers.
+        // AssertUnwindSafe is required because the captured state (Arc<StdMutex<…>>,
+        // OwnedReadHalf) is !UnwindSafe; the drain_pending call below either restores
+        // state or logs the degradation.
         let result = AssertUnwindSafe(reader)
             .catch_unwind()
             .await
@@ -173,7 +136,6 @@ impl ConnectedState {
             .and_then(|inner| inner);
 
         match result {
-            Ok(()) => {}
             Err(ModbusError::ReadError(error)) => {
                 let kind = error.kind();
                 Self::drain_pending(&pending, kind, "reader task terminated");
@@ -187,6 +149,63 @@ impl ConnectedState {
             }
             Err(_) => {
                 Self::drain_pending(&pending, io::ErrorKind::Other, "reader task terminated");
+            }
+        }
+    }
+
+    /// Continuously reads Modbus TCP responses and routes them to waiting callers.
+    ///
+    /// # Arguments
+    /// * `read_half` - The TCP read half used to receive MBAP-framed responses.
+    /// * `pending` - Map of in-flight transaction IDs to waiting response channels.
+    ///
+    /// # Returns
+    /// Returns `Err(ModbusError)` when reading, frame validation, or pending-map access fails.
+    /// On success this function never returns.
+    async fn run_reader_loop(
+        read_half: &mut OwnedReadHalf,
+        pending: Arc<Pending>,
+    ) -> Result<Infallible, ModbusError> {
+        loop {
+            let mut header_buffer = [0u8; MBAP_HEADER_LEN];
+            read_half
+                .read_exact(&mut header_buffer)
+                .await
+                .map_err(ModbusError::ReadError)?;
+
+            let body_len = ModbusTcpConnection::response_body_len_from_header(header_buffer)
+                .map_err(|error| {
+                    ModbusError::MalformedResponse(format!("invalid MBAP header: {error}"))
+                })?;
+
+            let mut response_buffer = vec![0u8; MBAP_HEADER_LEN + body_len];
+            response_buffer[..MBAP_HEADER_LEN].copy_from_slice(&header_buffer);
+            read_half
+                .read_exact(&mut response_buffer[MBAP_HEADER_LEN..])
+                .await
+                .map_err(ModbusError::ReadError)?;
+
+            let tid = u16::from_be_bytes([header_buffer[0], header_buffer[1]]);
+            let sender = {
+                let mut map = pending.lock().map_err(|_| {
+                    ModbusError::ReadError(io::Error::other("pending map poisoned"))
+                })?;
+                match map.remove(&tid) {
+                    Some(sender) => {
+                        debug!(tid, in_flight = map.len(), "pending response matched");
+                        Some(sender)
+                    }
+                    None => None,
+                }
+            };
+
+            match sender {
+                Some(tx) => {
+                    let _ = tx.send(Ok(response_buffer));
+                }
+                None => {
+                    debug!(tid, "stray response, ignored");
+                }
             }
         }
     }
