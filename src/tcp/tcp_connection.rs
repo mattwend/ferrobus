@@ -33,6 +33,7 @@ const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_TID_PROBES: usize = 256;
 
 type Pending = StdMutex<HashMap<u16, oneshot::Sender<Result<Vec<u8>, ModbusError>>>>;
+type SharedConnectedState = Arc<Mutex<Option<Arc<ConnectedState>>>>;
 
 /// Per-operation time limits used by [`ModbusTcpConnection`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -253,7 +254,7 @@ impl Drop for PendingGuard {
 /// Responses are matched back to callers by MBAP transaction identifier.
 #[derive(Clone, Debug)]
 pub struct ModbusTcpConnection {
-    state: Arc<Mutex<Option<Arc<ConnectedState>>>>,
+    state: SharedConnectedState,
     address: IpAddr,
     port: u16,
     unit_id: u8,
