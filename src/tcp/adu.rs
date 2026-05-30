@@ -54,6 +54,8 @@ pub(crate) fn build_modbus_tcp_adu_from_pdu_bytes(
     unit_id: u8,
     pdu_bytes: &[u8],
 ) -> Result<Vec<u8>, ModbusError> {
+    // The MBAP Length field counts everything after the length field itself,
+    // i.e. the 1-byte Unit Identifier + the PDU bytes.
     let payload_len = pdu_bytes.len().checked_add(1).ok_or_else(|| {
         ModbusError::ValidationError("Modbus TCP ADU length is too large".to_string())
     })?;
