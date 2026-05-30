@@ -48,6 +48,9 @@ pub enum ModbusError {
     },
 
     /// The response transaction identifier did not match the request.
+    ///
+    /// This is unreachable in normal operation and indicates internal response
+    /// routing corruption or a reader bug.
     #[error("Transaction ID mismatch: sent {expected}, received {actual}")]
     TransactionIdMismatch {
         /// Transaction identifier sent in the request.
@@ -62,6 +65,10 @@ pub enum ModbusError {
         /// Protocol identifier received in the response.
         actual: u16,
     },
+
+    /// All candidate Modbus transaction identifiers are already in flight.
+    #[error("no free Modbus transaction id available")]
+    NoFreeTransactionId,
 
     /// The response unit identifier did not match the request.
     #[error("Unit ID mismatch: expected {expected}, received {actual}")]

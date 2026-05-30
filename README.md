@@ -20,6 +20,7 @@ Small Rust Modbus library with typed request/response PDUs and a reusable Modbus
 - Modbus TCP transport with:
   - lazy connect or explicit `connect()`
   - reusable connections
+  - concurrent in-flight requests across cloned handles on one socket
   - retry of transient I/O failures
   - per-phase timeouts for connect, write, and read
   - request/response validation for transaction ID, protocol ID, unit ID, and echoed payloads
@@ -74,7 +75,9 @@ async fn main() -> Result<(), tiny_mb::ModbusError> {
 ```
 
 The TCP client opens connections lazily, retries short-lived I/O failures, and can reuse the
-same socket across multiple requests.
+same socket across multiple requests. Cloned handles, including those returned by `with_unit_id`,
+may issue requests concurrently; responses are matched by MBAP transaction ID. Writes are
+serialized and a cancellation in one caller cannot interrupt a partially written Modbus TCP frame.
 
 Use `send_message_with_unit_id` or `with_unit_id(...)` when talking to multiple devices behind one
 Modbus TCP gateway.
@@ -82,7 +85,8 @@ Modbus TCP gateway.
 ## Timeouts
 
 `ModbusTcpConnection::new(...)` uses sensible defaults for connect, write, and read timeouts.
-If you need custom limits, construct the connection with `with_timeouts(...)`.
+The write timeout covers both sending the frame and flushing the socket. If you need custom limits,
+construct the connection with `with_timeouts(...)`.
 
 ```rust
 use std::net::{IpAddr, Ipv4Addr};

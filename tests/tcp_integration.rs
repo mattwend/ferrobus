@@ -11,9 +11,11 @@
 )]
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Mutex;
 
 mod support;
 
@@ -151,14 +153,23 @@ async fn transaction_id_increments() {
 }
 
 #[tokio::test]
-async fn transaction_id_mismatch() {
-    let addr = spawn_mock_server(|mut stream| async move {
-        let request = read_request_frame(&mut stream).await.unwrap();
-        let response =
-            make_read_coils_response(request.transaction_id + 1, request.unit_id, &[true, false]);
-        stream.write_all(&response).await.unwrap();
-    })
-    .await;
+async fn concurrent_in_flight_requests_are_matched_out_of_order() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let first = read_request_frame(&mut stream).await.unwrap();
+        let second = read_request_frame(&mut stream).await.unwrap();
+
+        let second_response =
+            make_read_coils_response(second.transaction_id, second.unit_id, &[false, true]);
+        stream.write_all(&second_response).await.unwrap();
+
+        let first_response =
+            make_read_coils_response(first.transaction_id, first.unit_id, &[true, false]);
+        stream.write_all(&first_response).await.unwrap();
+    });
 
     let conn = ModbusTcpConnection::new(addr.ip(), addr.port(), 1, 0);
     conn.connect().await.unwrap();
@@ -167,13 +178,27 @@ async fn transaction_id_mismatch() {
         starting_address: 0x0000,
         quantity: 2,
     };
-    let result = conn.send_message(&request).await;
 
-    assert!(result.is_err());
-    match result.unwrap_err() {
-        tiny_mb::ModbusError::TransactionIdMismatch { .. } => {}
-        e => panic!("Expected TransactionIdMismatch, got {:?}", e),
-    }
+    let first_conn = conn.clone();
+    let second_conn = conn.with_unit_id(2);
+
+    let (first_response, second_response) = tokio::join!(
+        first_conn.send_message(&request),
+        second_conn.send_message(&request)
+    );
+
+    assert_eq!(
+        first_response.unwrap(),
+        ModbusResponse::ReadCoils {
+            coils: vec![true, false]
+        }
+    );
+    assert_eq!(
+        second_response.unwrap(),
+        ModbusResponse::ReadCoils {
+            coils: vec![false, true]
+        }
+    );
 }
 
 #[tokio::test]
@@ -335,14 +360,13 @@ async fn server_sends_invalid_mbap_length() {
         starting_address: 0x0000,
         quantity: 2,
     };
-    let error = conn.send_message(&request).await.unwrap_err();
-
-    match error {
-        ModbusError::MalformedResponse(message) => {
-            assert!(message.contains("invalid MBAP header"));
+    let response = conn.send_message(&request).await.unwrap();
+    assert_eq!(
+        response,
+        ModbusResponse::ReadCoils {
+            coils: vec![true, false]
         }
-        other => panic!("Expected MalformedResponse, got {other:?}"),
-    }
+    );
 }
 
 #[tokio::test]
@@ -501,4 +525,140 @@ async fn send_message_returns_read_timeout_from_slow_server() {
         ModbusError::ReadTimeout => {}
         other => panic!("Expected ReadTimeout, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn stray_response_with_unknown_tid_is_ignored() {
+    let addr = spawn_mock_server(|mut stream| async move {
+        let request = read_request_frame(&mut stream).await.unwrap();
+        let stray = make_read_coils_response(
+            request.transaction_id.wrapping_add(100),
+            request.unit_id,
+            &[true],
+        );
+        stream.write_all(&stray).await.unwrap();
+
+        let response =
+            make_read_coils_response(request.transaction_id, request.unit_id, &[true, false]);
+        stream.write_all(&response).await.unwrap();
+    })
+    .await;
+
+    let conn = ModbusTcpConnection::new(addr.ip(), addr.port(), 1, 0);
+    let request = ModbusRequest::ReadCoils {
+        starting_address: 0x0000,
+        quantity: 2,
+    };
+
+    let response = conn.send_message(&request).await.unwrap();
+    assert_eq!(
+        response,
+        ModbusResponse::ReadCoils {
+            coils: vec![true, false]
+        }
+    );
+}
+
+#[tokio::test]
+async fn reader_death_drains_pending_and_next_call_reconnects() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        let (mut hanging_stream, _) = listener.accept().await.unwrap();
+        let _first_request = read_request_frame(&mut hanging_stream).await.unwrap();
+        // Drop the stream so the reader sees EOF → fatal → drain_pending.
+        drop(hanging_stream);
+
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let request = read_request_frame(&mut stream).await.unwrap();
+        let response =
+            make_read_coils_response(request.transaction_id, request.unit_id, &[true, false]);
+        stream.write_all(&response).await.unwrap();
+    });
+
+    let conn = ModbusTcpConnection::with_timeouts(
+        addr.ip(),
+        addr.port(),
+        1,
+        0,
+        ModbusTcpTimeouts {
+            connect_timeout: Duration::from_millis(100),
+            write_timeout: Duration::from_millis(100),
+            read_timeout: Duration::from_millis(25),
+        },
+    );
+    let request = ModbusRequest::ReadCoils {
+        starting_address: 0x0000,
+        quantity: 2,
+    };
+
+    let response = conn.send_message(&request).await.unwrap();
+    assert_eq!(
+        response,
+        ModbusResponse::ReadCoils {
+            coils: vec![true, false]
+        }
+    );
+}
+
+#[tokio::test]
+async fn caller_future_cancellation_does_not_break_following_requests() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+    let release_rx = Arc::new(Mutex::new(Some(release_rx)));
+
+    tokio::spawn({
+        let release_rx = Arc::clone(&release_rx);
+        async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let first = read_request_frame(&mut stream).await.unwrap();
+            let _ = first;
+            let _ = started_tx.send(());
+            if let Some(rx) = release_rx.lock().await.take() {
+                let _ = rx.await;
+            }
+
+            let second = read_request_frame(&mut stream).await.unwrap();
+            let response =
+                make_read_coils_response(second.transaction_id, second.unit_id, &[true, false]);
+            stream.write_all(&response).await.unwrap();
+        }
+    });
+
+    let conn = ModbusTcpConnection::with_timeouts(
+        addr.ip(),
+        addr.port(),
+        1,
+        0,
+        ModbusTcpTimeouts {
+            connect_timeout: Duration::from_secs(1),
+            write_timeout: Duration::from_secs(1),
+            read_timeout: Duration::from_secs(1),
+        },
+    );
+
+    let request = ModbusRequest::ReadCoils {
+        starting_address: 0x0000,
+        quantity: 2,
+    };
+
+    let task = tokio::spawn({
+        let conn = conn.clone();
+        let request = request.clone();
+        async move { conn.send_message(&request).await }
+    });
+    started_rx.await.unwrap();
+    task.abort();
+    let _ = release_tx.send(());
+
+    let response = conn.send_message(&request).await.unwrap();
+    assert_eq!(
+        response,
+        ModbusResponse::ReadCoils {
+            coils: vec![true, false]
+        }
+    );
 }
