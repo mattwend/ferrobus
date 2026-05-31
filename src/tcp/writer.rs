@@ -15,9 +15,17 @@ use tokio::time::timeout;
 use crate::error::ModbusError;
 use crate::tcp::tcp_connection::ModbusTcpConnection;
 
+/// Connection invalidation context for write failures.
+///
+/// Writer tasks run independently from the request future so cancellation cannot
+/// interrupt a frame mid-write. If such a task fails, it uses this context to
+/// drop only the connection generation it wrote to; newer reconnects are left
+/// intact.
 #[derive(Clone)]
 pub(crate) struct TearDown {
+    /// Shared connection handle used to invalidate stale connected state.
     pub(crate) connection: ModbusTcpConnection,
+    /// Generation captured before the write started.
     pub(crate) generation: u64,
 }
 

@@ -19,12 +19,23 @@ use crate::error::ModbusError;
 use crate::tcp::frame::{MBAP_HEADER_LEN, response_body_len_from_header};
 use crate::tcp::pending::Pending;
 
+/// Shared state for one established Modbus TCP socket.
+///
+/// A [`ConnectedState`] owns the split TCP halves for a single connection
+/// generation. The writer half is shared by request tasks, while the reader task
+/// continuously receives MBAP frames and completes the matching pending waiter.
+/// Dropping the state aborts the reader and fails all still-pending requests.
 pub(crate) struct ConnectedState {
-    // `lock_owned` requires an `Arc<Mutex<_>>`; the spawned writer task uses it to
-    // keep a full ADU write cancellation-safe after the caller future is dropped.
+    /// Shared TCP write half used by cancellation-safe writer tasks.
+    ///
+    /// `lock_owned` requires an `Arc<Mutex<_>>`; the spawned writer task uses it to
+    /// keep a full ADU write cancellation-safe after the caller future is dropped.
     pub(crate) writer: Arc<Mutex<OwnedWriteHalf>>,
+    /// Transaction-id keyed response waiters for requests in flight on this socket.
     pub(crate) pending: Arc<Pending>,
+    /// Background task that reads response frames and routes them to `pending`.
     pub(crate) reader_task: JoinHandle<()>,
+    /// Monotonic connection generation used to ignore stale teardown attempts.
     pub(crate) generation: u64,
 }
 
@@ -66,6 +77,18 @@ impl ConnectedState {
         }
     }
 
+    /// Runs the response reader task and drains pending callers when it exits.
+    ///
+    /// # Arguments
+    ///
+    /// * `read_half` - TCP read half for the connected state.
+    /// * `pending` - Shared pending-response map for the same socket generation.
+    ///
+    /// # Returns
+    ///
+    /// Returns when the reader loop encounters a read or frame error, or when a
+    /// panic is caught by the safety net. All pending waiters receive an error
+    /// before the task exits.
     pub(crate) async fn reader_loop(mut read_half: OwnedReadHalf, pending: Arc<Pending>) {
         let reader = Self::run_reader_loop(&mut read_half, Arc::clone(&pending));
 
