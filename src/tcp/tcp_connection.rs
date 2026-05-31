@@ -30,8 +30,12 @@ type SharedConnectedState = Arc<Mutex<Option<Arc<ConnectedState>>>>;
 
 /// Reusable Modbus TCP client handle.
 ///
-/// Cloned handles may issue requests concurrently over one shared TCP socket.
-/// Responses are matched back to callers by MBAP transaction identifier.
+/// The handle owns shared connection state behind reference-counted locks, so
+/// clones reuse the same TCP socket and transaction-id counter. Requests may be
+/// in flight concurrently; the background reader routes each response to the
+/// caller waiting on the matching MBAP transaction identifier. A generation
+/// counter prevents stale read/write failures from tearing down a newer socket
+/// after a reconnect.
 #[derive(Clone, Debug)]
 pub struct ModbusTcpConnection {
     state: SharedConnectedState,
@@ -45,6 +49,19 @@ pub struct ModbusTcpConnection {
 
 impl ModbusTcpConnection {
     /// Creates a connection handle with default connect, write, and read timeouts.
+    ///
+    /// # Arguments
+    ///
+    /// * `address` - IP address of the Modbus TCP server or gateway.
+    /// * `port` - TCP port used by the server, commonly `502`.
+    /// * `unit_id` - Default Modbus unit identifier used by [`Self::send_message`].
+    /// * `transaction_id` - Initial MBAP transaction identifier. The value is
+    ///   incremented for each request and wraps around to `0` after `u16::MAX`.
+    ///
+    /// # Returns
+    ///
+    /// Returns a lazily connected handle. No socket is opened until [`Self::connect`],
+    /// [`Self::send_message`], or [`Self::send_message_with_unit_id`] is called.
     #[must_use]
     pub fn new(address: IpAddr, port: u16, unit_id: u8, transaction_id: u16) -> Self {
         Self::with_timeouts(
@@ -57,6 +74,20 @@ impl ModbusTcpConnection {
     }
 
     /// Creates a connection handle with explicit timeout settings.
+    ///
+    /// # Arguments
+    ///
+    /// * `address` - IP address of the Modbus TCP server or gateway.
+    /// * `port` - TCP port used by the server, commonly `502`.
+    /// * `unit_id` - Default Modbus unit identifier used by [`Self::send_message`].
+    /// * `transaction_id` - Initial MBAP transaction identifier. The value is
+    ///   incremented for each request and wraps around to `0` after `u16::MAX`.
+    /// * `timeouts` - Per-phase limits for connection establishment, frame writes,
+    ///   and response reads.
+    ///
+    /// # Returns
+    ///
+    /// Returns a lazily connected handle using the provided timeout configuration.
     #[must_use]
     pub fn with_timeouts(
         address: IpAddr,
@@ -77,18 +108,36 @@ impl ModbusTcpConnection {
     }
 
     /// Returns the timeout configuration used for future operations.
+    ///
+    /// # Returns
+    ///
+    /// Returns the connect, write, and read timeouts stored on this handle.
     #[must_use]
     pub fn timeouts(&self) -> ModbusTcpTimeouts {
         self.timeouts
     }
 
     /// Returns the default unit identifier used by [`Self::send_message`].
+    ///
+    /// # Returns
+    ///
+    /// Returns the unit id configured for this handle.
     #[must_use]
     pub fn unit_id(&self) -> u8 {
         self.unit_id
     }
 
     /// Returns a new handle that shares the same transport but overrides the default unit id.
+    ///
+    /// # Arguments
+    ///
+    /// * `unit_id` - Default unit identifier to use when the returned handle sends
+    ///   requests through [`Self::send_message`].
+    ///
+    /// # Returns
+    ///
+    /// Returns a clone-like handle with the same socket, transaction-id counter,
+    /// timeout configuration, and generation state as `self`.
     #[must_use]
     pub fn with_unit_id(&self, unit_id: u8) -> Self {
         Self {
@@ -195,11 +244,22 @@ impl ModbusTcpConnection {
     }
 
     /// Closes the current TCP session if one is open.
+    ///
+    /// This invalidates the shared connected state for all cloned handles. Any
+    /// in-flight request waiters are completed with a read error when the state is
+    /// dropped, and the next request reconnects lazily.
     pub async fn disconnect(&self) {
         self.invalidate(None).await;
     }
 
     /// Returns whether this handle currently owns an open TCP stream.
+    ///
+    /// # Returns
+    ///
+    /// Returns `true` when shared state exists and its reader task is still active.
+    /// Returns `false` before the first connection, after [`Self::disconnect`], or
+    /// after the reader task has terminated because the peer closed the socket or a
+    /// transport failure occurred.
     pub async fn is_connected(&self) -> bool {
         self.state
             .lock()
@@ -221,12 +281,24 @@ impl ModbusTcpConnection {
 
     /// Sends one request using this connection's default unit id.
     ///
-    /// The connection is opened on demand, and transient I/O failures are retried
-    /// with a short exponential backoff.
+    /// The connection is opened on demand. Transient connect, read, and write
+    /// failures invalidate the current socket and are retried with a short
+    /// exponential backoff. Protocol, validation, and request/response mismatch
+    /// failures are returned without retrying.
+    ///
+    /// # Arguments
+    ///
+    /// * `pdu` - Typed Modbus request to serialize and send.
+    ///
+    /// # Returns
+    ///
+    /// Returns the parsed response after validating the MBAP transaction id,
+    /// protocol id, unit id, and request/response shape.
     ///
     /// # Errors
     ///
-    /// Returns transport, protocol, validation, or request/response mismatch errors.
+    /// Returns transport, protocol, validation, exception-response, or
+    /// request/response mismatch errors.
     pub async fn send_message(&self, pdu: &ModbusRequest) -> Result<ModbusResponse, ModbusError> {
         self.send_message_with_unit_id(self.unit_id, pdu).await
     }
@@ -234,10 +306,23 @@ impl ModbusTcpConnection {
     /// Sends one request using an explicit unit id.
     ///
     /// This is useful when one TCP gateway fronts multiple logical Modbus devices.
+    /// The socket and transaction-id counter are shared with the default-unit-id
+    /// path, so calls for different unit ids may be in flight concurrently.
+    ///
+    /// # Arguments
+    ///
+    /// * `unit_id` - Modbus unit identifier to place in the MBAP header for this request.
+    /// * `pdu` - Typed Modbus request to serialize and send.
+    ///
+    /// # Returns
+    ///
+    /// Returns the parsed response after validating that it matches this request's
+    /// transaction id, unit id, and function-specific response shape.
     ///
     /// # Errors
     ///
-    /// Returns transport, protocol, validation, or request/response mismatch errors.
+    /// Returns transport, protocol, validation, exception-response, or
+    /// request/response mismatch errors.
     pub async fn send_message_with_unit_id(
         &self,
         unit_id: u8,

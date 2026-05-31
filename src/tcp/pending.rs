@@ -19,14 +19,27 @@ pub(crate) const MAX_TID_PROBES: usize = 256;
 
 pub(crate) type Pending = StdMutex<HashMap<u16, oneshot::Sender<Result<Vec<u8>, ModbusError>>>>;
 
+/// RAII cleanup for one pending transaction-id entry.
+///
+/// The guard is armed after a request inserts its response channel into the
+/// pending map. If the request future is cancelled before a response arrives,
+/// dropping the armed guard removes that entry so a later stray response is
+/// ignored instead of holding stale state. Once the reader has matched the
+/// response and removed the entry, callers must disarm the guard.
 pub(crate) struct PendingGuard {
+    /// Shared pending-response map containing this request's transaction id.
     pub(crate) pending: Arc<Pending>,
+    /// Transaction id allocated for the guarded request.
     pub(crate) tid: u16,
+    /// Whether drop should remove `tid` from `pending`.
     pub(crate) armed: bool,
 }
 
 impl PendingGuard {
     /// Disables automatic pending-map removal on drop.
+    ///
+    /// Call this after the reader has already removed the entry and delivered the
+    /// response to avoid logging a misleading second removal.
     pub(crate) fn disarm(&mut self) {
         self.armed = false;
     }
