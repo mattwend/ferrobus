@@ -156,18 +156,29 @@ impl ModbusTcpConnection {
         Ok(connected_state)
     }
 
-    pub(crate) async fn tear_down(&self, captured_generation: u64) {
-        let current_generation = self.generation.load(Ordering::SeqCst);
-        if captured_generation != current_generation {
-            return;
+    /// Drops the active connected state and advances the generation counter.
+    ///
+    /// # Arguments
+    ///
+    /// * `captured` - When `Some(g)`, the state is dropped only if `g` is still
+    ///   the current generation (guarded teardown from a request/writer path).
+    ///   When `None`, the state is dropped unconditionally (explicit disconnect).
+    pub(crate) async fn invalidate(&self, captured: Option<u64>) {
+        if let Some(captured_generation) = captured {
+            if self.generation.load(Ordering::SeqCst) != captured_generation {
+                return;
+            }
         }
 
         let mut state_guard = self.state.lock().await;
-        if self.generation.load(Ordering::SeqCst) == captured_generation {
-            *state_guard = None;
-            self.generation
-                .store(captured_generation.saturating_add(1), Ordering::SeqCst);
+        let current_generation = self.generation.load(Ordering::SeqCst);
+        if captured.is_some_and(|generation| generation != current_generation) {
+            return;
         }
+
+        *state_guard = None;
+        self.generation
+            .store(current_generation.saturating_add(1), Ordering::SeqCst);
     }
 
     /// Opens the TCP connection eagerly.
@@ -185,11 +196,7 @@ impl ModbusTcpConnection {
 
     /// Closes the current TCP session if one is open.
     pub async fn disconnect(&self) {
-        let mut state_guard = self.state.lock().await;
-        *state_guard = None;
-        let current_generation = self.generation.load(Ordering::SeqCst);
-        self.generation
-            .store(current_generation.saturating_add(1), Ordering::SeqCst);
+        self.invalidate(None).await;
     }
 
     /// Returns whether this handle currently owns an open TCP stream.
@@ -275,18 +282,18 @@ impl ModbusTcpConnection {
                 let response_buffer = match timeout(connection.timeouts.read_timeout, rx).await {
                     Ok(Ok(Ok(frame))) => frame,
                     Ok(Ok(Err(error))) => {
-                        connection.tear_down(captured_generation).await;
+                        connection.invalidate(Some(captured_generation)).await;
                         return Err(error);
                     }
                     Ok(Err(_)) => {
-                        connection.tear_down(captured_generation).await;
+                        connection.invalidate(Some(captured_generation)).await;
                         return Err(ModbusError::ReadError(io::Error::new(
                             io::ErrorKind::ConnectionAborted,
                             "reader task terminated",
                         )));
                     }
                     Err(_) => {
-                        connection.tear_down(captured_generation).await;
+                        connection.invalidate(Some(captured_generation)).await;
                         return Err(ModbusError::ReadTimeout);
                     }
                 };
