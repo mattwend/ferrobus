@@ -13,6 +13,7 @@ pub mod adu;
 mod connected_state;
 mod frame;
 mod pending;
+mod retry;
 mod timeouts;
 mod writer;
 pub use adu::build_modbus_tcp_adu;
