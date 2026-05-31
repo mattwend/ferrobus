@@ -279,6 +279,87 @@ impl ModbusTcpConnection {
             .with_total_delay(Some(RETRY_MAX_ELAPSED_TIME))
     }
 
+    async fn send_message_attempt(
+        &self,
+        unit_id: u8,
+        pdu: &ModbusRequest,
+    ) -> Result<ModbusResponse, ModbusError> {
+        let state = self.ensure_connected_state().await?;
+        let captured_generation = state.generation;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let tid = pending::allocate_transaction_id(&self.transaction_id, &state.pending, tx)?;
+        let mut pending_guard = PendingGuard {
+            pending: Arc::clone(&state.pending),
+            tid,
+            armed: true,
+        };
+
+        let adu = build_modbus_tcp_adu(tid, unit_id, pdu)?;
+        debug!(tid, "Modbus TCP Frame: {:02X?}", adu);
+
+        writer::write_adu_cancellation_safe(
+            Arc::clone(&state.writer),
+            adu,
+            self.timeouts.write_timeout,
+            TearDown {
+                connection: self.clone(),
+                generation: captured_generation,
+            },
+        )
+        .await?;
+
+        let response_buffer = match timeout(self.timeouts.read_timeout, rx).await {
+            Ok(Ok(Ok(frame))) => frame,
+            Ok(Ok(Err(error))) => {
+                self.invalidate(Some(captured_generation)).await;
+                return Err(error);
+            }
+            Ok(Err(_)) => {
+                self.invalidate(Some(captured_generation)).await;
+                return Err(ModbusError::ReadError(io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    "reader task terminated",
+                )));
+            }
+            Err(_) => {
+                self.invalidate(Some(captured_generation)).await;
+                return Err(ModbusError::ReadTimeout);
+            }
+        };
+
+        pending_guard.disarm();
+
+        let protocol_id = u16::from_be_bytes([response_buffer[2], response_buffer[3]]);
+        if protocol_id != 0 {
+            return Err(ModbusError::ProtocolIdMismatch {
+                actual: protocol_id,
+            });
+        }
+
+        let received_unit_id = response_buffer[6];
+        if received_unit_id != unit_id {
+            return Err(ModbusError::UnitIdMismatch {
+                expected: unit_id,
+                actual: received_unit_id,
+            });
+        }
+
+        let received_transaction_id = u16::from_be_bytes([response_buffer[0], response_buffer[1]]);
+        if received_transaction_id != tid {
+            return Err(ModbusError::TransactionIdMismatch {
+                expected: tid,
+                actual: received_transaction_id,
+            });
+        }
+
+        let pdu_bytes = &response_buffer[MBAP_HEADER_LEN..];
+        let response = ModbusResponse::try_from(pdu_bytes)?;
+        if let ModbusResponse::Exception { function, code } = response {
+            return Err(ModbusError::ExceptionResponse { function, code });
+        }
+        response.align_to_request(pdu)
+    }
+
     /// Sends one request using this connection's default unit id.
     ///
     /// The connection is opened on demand. Transient connect, read, and write
@@ -335,87 +416,7 @@ impl ModbusTcpConnection {
         (|| {
             let connection = connection.clone();
             let pdu = pdu.clone();
-            async move {
-                let state = connection.ensure_connected_state().await?;
-                let captured_generation = state.generation;
-                let (tx, rx) = tokio::sync::oneshot::channel();
-                let tid = pending::allocate_transaction_id(
-                    &connection.transaction_id,
-                    &state.pending,
-                    tx,
-                )?;
-                let mut pending_guard = PendingGuard {
-                    pending: Arc::clone(&state.pending),
-                    tid,
-                    armed: true,
-                };
-
-                let adu = build_modbus_tcp_adu(tid, unit_id, &pdu)?;
-                debug!(tid, "Modbus TCP Frame: {:02X?}", adu);
-
-                writer::write_adu_cancellation_safe(
-                    Arc::clone(&state.writer),
-                    adu,
-                    connection.timeouts.write_timeout,
-                    TearDown {
-                        connection: connection.clone(),
-                        generation: captured_generation,
-                    },
-                )
-                .await?;
-
-                let response_buffer = match timeout(connection.timeouts.read_timeout, rx).await {
-                    Ok(Ok(Ok(frame))) => frame,
-                    Ok(Ok(Err(error))) => {
-                        connection.invalidate(Some(captured_generation)).await;
-                        return Err(error);
-                    }
-                    Ok(Err(_)) => {
-                        connection.invalidate(Some(captured_generation)).await;
-                        return Err(ModbusError::ReadError(io::Error::new(
-                            io::ErrorKind::ConnectionAborted,
-                            "reader task terminated",
-                        )));
-                    }
-                    Err(_) => {
-                        connection.invalidate(Some(captured_generation)).await;
-                        return Err(ModbusError::ReadTimeout);
-                    }
-                };
-
-                pending_guard.disarm();
-
-                let protocol_id = u16::from_be_bytes([response_buffer[2], response_buffer[3]]);
-                if protocol_id != 0 {
-                    return Err(ModbusError::ProtocolIdMismatch {
-                        actual: protocol_id,
-                    });
-                }
-
-                let received_unit_id = response_buffer[6];
-                if received_unit_id != unit_id {
-                    return Err(ModbusError::UnitIdMismatch {
-                        expected: unit_id,
-                        actual: received_unit_id,
-                    });
-                }
-
-                let received_transaction_id =
-                    u16::from_be_bytes([response_buffer[0], response_buffer[1]]);
-                if received_transaction_id != tid {
-                    return Err(ModbusError::TransactionIdMismatch {
-                        expected: tid,
-                        actual: received_transaction_id,
-                    });
-                }
-
-                let pdu_bytes = &response_buffer[MBAP_HEADER_LEN..];
-                let response = ModbusResponse::try_from(pdu_bytes)?;
-                if let ModbusResponse::Exception { function, code } = response {
-                    return Err(ModbusError::ExceptionResponse { function, code });
-                }
-                response.align_to_request(&pdu)
-            }
+            async move { connection.send_message_attempt(unit_id, &pdu).await }
         })
         .retry(backoff)
         .when(ModbusError::is_transient)
