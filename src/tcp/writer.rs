@@ -83,3 +83,43 @@ pub(crate) async fn write_adu_cancellation_safe(
         }
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::panic, clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use std::net::IpAddr;
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::{TcpListener, TcpStream};
+
+    #[tokio::test]
+    async fn write_adu_reports_error_and_invalidates_on_failed_write() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = TcpStream::connect(addr).await.unwrap();
+        let (_accepted, _) = listener.accept().await.unwrap();
+        let (_read_half, mut write_half) = client.into_split();
+        // Shutting down the write half makes the subsequent write_all fail.
+        write_half.shutdown().await.unwrap();
+        let writer = Arc::new(Mutex::new(write_half));
+
+        let loopback: IpAddr = "127.0.0.1".parse().unwrap();
+        let connection = ModbusTcpConnection::new(loopback, 502, 1, 0);
+        let teardown = TearDown {
+            connection: connection.clone(),
+            generation: 1,
+        };
+
+        let error = write_adu_cancellation_safe(
+            writer,
+            vec![0, 1, 2, 3, 4, 5, 6],
+            Duration::from_secs(1),
+            teardown,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, ModbusError::WriteError(_)));
+        assert!(!connection.is_connected().await);
+    }
+}

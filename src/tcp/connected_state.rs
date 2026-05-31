@@ -165,3 +165,119 @@ impl ConnectedState {
         }
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::panic, clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::Mutex as StdMutex;
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::sync::oneshot;
+
+    /// Establishes a loopback TCP connection and returns the client read/write
+    /// halves alongside the accepted server stream.
+    async fn connected_halves() -> (OwnedReadHalf, OwnedWriteHalf, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = TcpStream::connect(addr).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        let (read_half, write_half) = client.into_split();
+        (read_half, write_half, server)
+    }
+
+    #[tokio::test]
+    async fn debug_reports_generation_and_reader_state() {
+        let (read_half, write_half, _server) = connected_halves().await;
+        let pending = Arc::new(StdMutex::new(HashMap::new()));
+        let reader_task = tokio::spawn(async {});
+        let state = ConnectedState {
+            writer: Arc::new(Mutex::new(write_half)),
+            pending,
+            reader_task,
+            generation: 42,
+        };
+
+        let rendered = format!("{state:?}");
+
+        assert!(rendered.contains("generation: 42"));
+        assert!(rendered.contains("reader_finished"));
+        drop(read_half);
+    }
+
+    #[tokio::test]
+    async fn drain_pending_sends_error_to_waiters() {
+        let pending = StdMutex::new(HashMap::new());
+        let (tx, rx) = oneshot::channel();
+        pending.lock().unwrap().insert(1u16, tx);
+
+        ConnectedState::drain_pending(&pending, io::ErrorKind::ConnectionReset, "boom");
+
+        let error = rx.await.unwrap().unwrap_err();
+        match error {
+            ModbusError::ReadError(io_error) => {
+                assert_eq!(io_error.kind(), io::ErrorKind::ConnectionReset);
+            }
+            other => panic!("expected ReadError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn drain_pending_tolerates_poisoned_map() {
+        let pending: Arc<Pending> = Arc::new(StdMutex::new(HashMap::new()));
+        let (tx, mut rx) = oneshot::channel();
+        pending.lock().unwrap().insert(7u16, tx);
+        let poisoner = Arc::clone(&pending);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.lock().unwrap();
+            panic!("poison the pending map");
+        })
+        .join();
+
+        // Must not panic even though the mutex is poisoned; because the lock
+        // cannot be acquired, the existing waiter remains in the poisoned map.
+        ConnectedState::drain_pending(&pending, io::ErrorKind::InvalidData, "poisoned");
+
+        let lock_error = pending.lock().unwrap_err();
+        assert!(lock_error.into_inner().contains_key(&7));
+        assert!(matches!(
+            rx.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn run_reader_loop_rejects_malformed_header() {
+        let (mut read_half, _write_half, mut server) = connected_halves().await;
+        // MBAP length field of 0 is below the minimum because it omits the
+        // required unit identifier byte.
+        server.write_all(&[0, 1, 0, 0, 0, 0, 1]).await.unwrap();
+
+        let pending = Arc::new(StdMutex::new(HashMap::new()));
+        let error = ConnectedState::run_reader_loop(&mut read_half, pending)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, ModbusError::MalformedResponse(_)));
+    }
+
+    #[tokio::test]
+    async fn reader_loop_drains_pending_on_malformed_header() {
+        let (read_half, _write_half, mut server) = connected_halves().await;
+        let pending = Arc::new(StdMutex::new(HashMap::new()));
+        let (tx, rx) = oneshot::channel();
+        pending.lock().unwrap().insert(7u16, tx);
+
+        server.write_all(&[0, 7, 0, 0, 0, 0, 1]).await.unwrap();
+        ConnectedState::reader_loop(read_half, Arc::clone(&pending)).await;
+
+        let error = rx.await.unwrap().unwrap_err();
+        match error {
+            ModbusError::ReadError(io_error) => {
+                assert_eq!(io_error.kind(), io::ErrorKind::InvalidData);
+            }
+            other => panic!("expected ReadError(InvalidData), got {other:?}"),
+        }
+    }
+}
