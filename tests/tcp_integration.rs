@@ -12,7 +12,8 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
@@ -20,7 +21,7 @@ use tokio::sync::Mutex;
 mod support;
 
 use tiny_mb::ModbusError;
-use tiny_mb::tcp::{ModbusTcpConnection, ModbusTcpTimeouts};
+use tiny_mb::tcp::{ModbusTcpConnection, ModbusTcpRetry, ModbusTcpTimeouts};
 use tiny_mb::{ModbusRequest, ModbusResponse};
 
 use support::{
@@ -49,6 +50,17 @@ fn make_read_coils_response(tid: u16, unit_id: u8, coils: &[bool]) -> Vec<u8> {
         pdu.push(byte);
     }
     build_tcp_response_frame(tid, unit_id, &pdu)
+}
+
+fn fast_retry(max_elapsed: Duration, max_times: Option<usize>) -> ModbusTcpRetry {
+    ModbusTcpRetry {
+        initial_delay: Duration::from_millis(5),
+        max_delay: Some(Duration::from_millis(10)),
+        multiplier: 1.1,
+        max_elapsed,
+        max_times,
+        jitter: false,
+    }
 }
 
 fn make_write_single_register_response(tid: u16, unit_id: u8, address: u16, value: u16) -> Vec<u8> {
@@ -246,7 +258,8 @@ async fn server_disconnects_on_write() {
         }
     });
 
-    let conn = ModbusTcpConnection::new(addr.ip(), addr.port(), 1, 0);
+    let conn = ModbusTcpConnection::new(addr.ip(), addr.port(), 1, 0)
+        .with_retry(Some(fast_retry(Duration::from_millis(500), None)));
     conn.connect().await.unwrap();
 
     let request = ModbusRequest::ReadCoils {
@@ -308,7 +321,8 @@ async fn server_disconnects_on_header_read() {
         }
     });
 
-    let conn = ModbusTcpConnection::new(addr.ip(), addr.port(), 1, 0);
+    let conn = ModbusTcpConnection::new(addr.ip(), addr.port(), 1, 0)
+        .with_retry(Some(fast_retry(Duration::from_millis(500), None)));
     conn.connect().await.unwrap();
 
     let request = ModbusRequest::ReadCoils {
@@ -512,7 +526,8 @@ async fn send_message_returns_read_timeout_from_slow_server() {
             write_timeout: Duration::from_millis(50),
             read_timeout: Duration::from_millis(25),
         },
-    );
+    )
+    .with_retry(None);
     conn.connect().await.unwrap();
 
     let request = ModbusRequest::ReadCoils {
@@ -661,4 +676,148 @@ async fn caller_future_cancellation_does_not_break_following_requests() {
             coils: vec![true, false]
         }
     );
+}
+
+#[tokio::test]
+async fn send_message_with_disabled_retry_does_not_retry() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let accepts = Arc::new(AtomicU8::new(0));
+
+    tokio::spawn({
+        let accepts = Arc::clone(&accepts);
+        async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            accepts.fetch_add(1, Ordering::SeqCst);
+            drop(stream);
+        }
+    });
+
+    let conn = ModbusTcpConnection::new(addr.ip(), addr.port(), 1, 0).with_retry(None);
+    let request = ModbusRequest::ReadCoils {
+        starting_address: 0,
+        quantity: 1,
+    };
+
+    let error = conn.send_message(&request).await.unwrap_err();
+
+    assert!(error.is_transient());
+    assert_eq!(accepts.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn disabled_retry_still_reconnects_on_next_call() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        drop(stream);
+
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let request = read_request_frame(&mut stream).await.unwrap();
+        let response = make_read_coils_response(request.transaction_id, request.unit_id, &[true]);
+        stream.write_all(&response).await.unwrap();
+    });
+
+    let conn = ModbusTcpConnection::new(addr.ip(), addr.port(), 1, 0).with_retry(None);
+    let request = ModbusRequest::ReadCoils {
+        starting_address: 0,
+        quantity: 1,
+    };
+
+    assert!(
+        conn.send_message(&request)
+            .await
+            .unwrap_err()
+            .is_transient()
+    );
+    let response = conn.send_message(&request).await.unwrap();
+
+    assert_eq!(response, ModbusResponse::ReadCoils { coils: vec![true] });
+}
+
+#[tokio::test]
+async fn send_message_with_custom_retry_honors_max_elapsed() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
+            drop(stream);
+        }
+    });
+
+    let conn = ModbusTcpConnection::new(addr.ip(), addr.port(), 1, 0)
+        .with_retry(Some(fast_retry(Duration::from_millis(100), None)));
+    let request = ModbusRequest::ReadCoils {
+        starting_address: 0,
+        quantity: 1,
+    };
+
+    let started = Instant::now();
+    let error = conn.send_message(&request).await.unwrap_err();
+
+    assert!(error.is_transient());
+    assert!(started.elapsed() < Duration::from_millis(250));
+}
+
+#[tokio::test]
+async fn send_message_with_max_times_caps_attempts() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let accepts = Arc::new(AtomicU8::new(0));
+
+    tokio::spawn({
+        let accepts = Arc::clone(&accepts);
+        async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                accepts.fetch_add(1, Ordering::SeqCst);
+                drop(stream);
+            }
+        }
+    });
+
+    let conn = ModbusTcpConnection::new(addr.ip(), addr.port(), 1, 0)
+        .with_retry(Some(fast_retry(Duration::from_secs(5), Some(2))));
+    let request = ModbusRequest::ReadCoils {
+        starting_address: 0,
+        quantity: 1,
+    };
+
+    let started = Instant::now();
+    let error = conn.send_message(&request).await.unwrap_err();
+
+    assert!(error.is_transient());
+    assert_eq!(accepts.load(Ordering::SeqCst), 3);
+    assert!(started.elapsed() < Duration::from_millis(250));
+}
+
+#[tokio::test]
+async fn invalid_retry_policy_surfaces_as_validation_error() {
+    let conn = ModbusTcpConnection::new("127.0.0.1".parse().unwrap(), 502, 1, 0).with_retry(Some(
+        ModbusTcpRetry {
+            initial_delay: Duration::ZERO,
+            ..ModbusTcpRetry::default()
+        },
+    ));
+    let request = ModbusRequest::ReadCoils {
+        starting_address: 0,
+        quantity: 1,
+    };
+
+    let error = conn.send_message(&request).await.unwrap_err();
+
+    match error {
+        ModbusError::ValidationError(message) => {
+            assert_eq!(message, "retry initial_delay must be > 0");
+        }
+        other => panic!("Expected ValidationError, got {other:?}"),
+    }
 }

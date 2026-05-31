@@ -12,7 +12,6 @@ use std::sync::{
 };
 use std::time::Duration;
 
-use backon::{ExponentialBuilder, Retryable};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tokio::time::timeout;
@@ -21,11 +20,11 @@ use tracing::debug;
 use crate::tcp::connected_state::ConnectedState;
 use crate::tcp::frame::MBAP_HEADER_LEN;
 use crate::tcp::pending::{self, PendingGuard};
+use crate::tcp::retry::{ModbusTcpRetry, retry_transient};
 use crate::tcp::timeouts::ModbusTcpTimeouts;
 use crate::tcp::writer::{self, TearDown};
 use crate::{ModbusRequest, ModbusResponse, error::ModbusError, tcp::adu::build_modbus_tcp_adu};
 
-const RETRY_MAX_ELAPSED_TIME: Duration = Duration::from_secs(2);
 type SharedConnectedState = Arc<Mutex<Option<Arc<ConnectedState>>>>;
 
 /// Reusable Modbus TCP client handle.
@@ -36,6 +35,14 @@ type SharedConnectedState = Arc<Mutex<Option<Arc<ConnectedState>>>>;
 /// caller waiting on the matching MBAP transaction identifier. A generation
 /// counter prevents stale read/write failures from tearing down a newer socket
 /// after a reconnect.
+///
+/// # Retries
+///
+/// Transient connect, write, and read failures are retried within a send call
+/// according to [`Self::with_retry`] and [`ModbusTcpRetry`]. Passing `None` to
+/// [`Self::with_retry`] disables same-call retry and returns the first transient
+/// error, but reconnect remains independent: the failed socket is invalidated
+/// and the next call reconnects lazily.
 #[derive(Clone, Debug)]
 pub struct ModbusTcpConnection {
     state: SharedConnectedState,
@@ -44,6 +51,7 @@ pub struct ModbusTcpConnection {
     unit_id: u8,
     transaction_id: Arc<AtomicU16>,
     timeouts: ModbusTcpTimeouts,
+    retry: Option<ModbusTcpRetry>,
     generation: Arc<AtomicU64>,
 }
 
@@ -103,8 +111,44 @@ impl ModbusTcpConnection {
             unit_id,
             transaction_id: Arc::new(AtomicU16::new(transaction_id)),
             timeouts,
+            retry: Some(ModbusTcpRetry::default()),
             generation: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Configures the retry policy used for future send operations on this handle.
+    ///
+    /// Retry configuration is stored on the handle, while the underlying socket is
+    /// shared between clones. Calling this method does not mutate existing clones;
+    /// clone or derive `with_unit_id` handles after setting the policy when they
+    /// should use the same retry behavior.
+    ///
+    /// The policy is validated when a send operation starts. Use
+    /// [`ModbusTcpRetry::validate`] if you need to reject invalid configuration
+    /// before storing it on the connection.
+    ///
+    /// # Arguments
+    ///
+    /// * `retry` - Retry policy to use. Pass `None` to disable same-call retry.
+    ///
+    /// # Returns
+    ///
+    /// Returns this handle with the updated retry policy.
+    #[must_use]
+    pub fn with_retry(mut self, retry: Option<ModbusTcpRetry>) -> Self {
+        self.retry = retry;
+        self
+    }
+
+    /// Returns the retry policy used for future send operations.
+    ///
+    /// # Returns
+    ///
+    /// Returns `Some(policy)` when same-call retry is enabled, or `None` when a
+    /// transient failure is returned after the first attempt without retrying.
+    #[must_use]
+    pub fn retry(&self) -> Option<ModbusTcpRetry> {
+        self.retry
     }
 
     /// Returns the timeout configuration used for future operations.
@@ -137,7 +181,7 @@ impl ModbusTcpConnection {
     /// # Returns
     ///
     /// Returns a clone-like handle with the same socket, transaction-id counter,
-    /// timeout configuration, and generation state as `self`.
+    /// timeout configuration, retry policy, and generation state as `self`.
     #[must_use]
     pub fn with_unit_id(&self, unit_id: u8) -> Self {
         Self {
@@ -147,6 +191,7 @@ impl ModbusTcpConnection {
             unit_id,
             transaction_id: Arc::clone(&self.transaction_id),
             timeouts: self.timeouts,
+            retry: self.retry,
             generation: Arc::clone(&self.generation),
         }
     }
@@ -268,23 +313,94 @@ impl ModbusTcpConnection {
             .is_some_and(|state| !state.reader_task.is_finished())
     }
 
-    /// Returns the exponential backoff policy used to retry transient I/O failures.
-    ///
-    /// The total time spent retrying is capped by [`RETRY_MAX_ELAPSED_TIME`].
-    fn retry_backoff() -> ExponentialBuilder {
-        ExponentialBuilder::default()
-            .with_min_delay(Duration::from_millis(500))
-            .with_factor(1.5)
-            .with_jitter()
-            .with_total_delay(Some(RETRY_MAX_ELAPSED_TIME))
+    async fn send_message_attempt(
+        &self,
+        unit_id: u8,
+        pdu: &ModbusRequest,
+    ) -> Result<ModbusResponse, ModbusError> {
+        let state = self.ensure_connected_state().await?;
+        let captured_generation = state.generation;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let tid = pending::allocate_transaction_id(&self.transaction_id, &state.pending, tx)?;
+        let mut pending_guard = PendingGuard {
+            pending: Arc::clone(&state.pending),
+            tid,
+            armed: true,
+        };
+
+        let adu = build_modbus_tcp_adu(tid, unit_id, pdu)?;
+        debug!(tid, "Modbus TCP Frame: {:02X?}", adu);
+
+        writer::write_adu_cancellation_safe(
+            Arc::clone(&state.writer),
+            adu,
+            self.timeouts.write_timeout,
+            TearDown {
+                connection: self.clone(),
+                generation: captured_generation,
+            },
+        )
+        .await?;
+
+        let response_buffer = match timeout(self.timeouts.read_timeout, rx).await {
+            Ok(Ok(Ok(frame))) => frame,
+            Ok(Ok(Err(error))) => {
+                self.invalidate(Some(captured_generation)).await;
+                return Err(error);
+            }
+            Ok(Err(_)) => {
+                self.invalidate(Some(captured_generation)).await;
+                return Err(ModbusError::ReadError(io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    "reader task terminated",
+                )));
+            }
+            Err(_) => {
+                self.invalidate(Some(captured_generation)).await;
+                return Err(ModbusError::ReadTimeout);
+            }
+        };
+
+        pending_guard.disarm();
+
+        let protocol_id = u16::from_be_bytes([response_buffer[2], response_buffer[3]]);
+        if protocol_id != 0 {
+            return Err(ModbusError::ProtocolIdMismatch {
+                actual: protocol_id,
+            });
+        }
+
+        let received_unit_id = response_buffer[6];
+        if received_unit_id != unit_id {
+            return Err(ModbusError::UnitIdMismatch {
+                expected: unit_id,
+                actual: received_unit_id,
+            });
+        }
+
+        let received_transaction_id = u16::from_be_bytes([response_buffer[0], response_buffer[1]]);
+        if received_transaction_id != tid {
+            return Err(ModbusError::TransactionIdMismatch {
+                expected: tid,
+                actual: received_transaction_id,
+            });
+        }
+
+        let pdu_bytes = &response_buffer[MBAP_HEADER_LEN..];
+        let response = ModbusResponse::try_from(pdu_bytes)?;
+        if let ModbusResponse::Exception { function, code } = response {
+            return Err(ModbusError::ExceptionResponse { function, code });
+        }
+        response.align_to_request(pdu)
     }
 
     /// Sends one request using this connection's default unit id.
     ///
     /// The connection is opened on demand. Transient connect, read, and write
-    /// failures invalidate the current socket and are retried with a short
-    /// exponential backoff. Protocol, validation, and request/response mismatch
-    /// failures are returned without retrying.
+    /// failures invalidate the current socket and are retried according to this
+    /// handle's [`ModbusTcpRetry`] policy. Protocol, validation, Modbus
+    /// exception, and request/response mismatch failures are returned without
+    /// retrying.
     ///
     /// # Arguments
     ///
@@ -308,6 +424,7 @@ impl ModbusTcpConnection {
     /// This is useful when one TCP gateway fronts multiple logical Modbus devices.
     /// The socket and transaction-id counter are shared with the default-unit-id
     /// path, so calls for different unit ids may be in flight concurrently.
+    /// Retry and reconnect semantics match [`Self::send_message`].
     ///
     /// # Arguments
     ///
@@ -328,98 +445,23 @@ impl ModbusTcpConnection {
         unit_id: u8,
         pdu: &ModbusRequest,
     ) -> Result<ModbusResponse, ModbusError> {
-        let backoff = Self::retry_backoff();
-        let connection = self.clone();
-        let pdu = pdu.clone();
+        match self.retry {
+            None => self.send_message_attempt(unit_id, pdu).await,
+            Some(retry) => {
+                let connection = self.clone();
+                let pdu = pdu.clone();
 
-        (|| {
-            let connection = connection.clone();
-            let pdu = pdu.clone();
-            async move {
-                let state = connection.ensure_connected_state().await?;
-                let captured_generation = state.generation;
-                let (tx, rx) = tokio::sync::oneshot::channel();
-                let tid = pending::allocate_transaction_id(
-                    &connection.transaction_id,
-                    &state.pending,
-                    tx,
-                )?;
-                let mut pending_guard = PendingGuard {
-                    pending: Arc::clone(&state.pending),
-                    tid,
-                    armed: true,
-                };
-
-                let adu = build_modbus_tcp_adu(tid, unit_id, &pdu)?;
-                debug!(tid, "Modbus TCP Frame: {:02X?}", adu);
-
-                writer::write_adu_cancellation_safe(
-                    Arc::clone(&state.writer),
-                    adu,
-                    connection.timeouts.write_timeout,
-                    TearDown {
-                        connection: connection.clone(),
-                        generation: captured_generation,
+                retry_transient(
+                    || {
+                        let connection = connection.clone();
+                        let pdu = pdu.clone();
+                        async move { connection.send_message_attempt(unit_id, &pdu).await }
                     },
+                    retry,
                 )
-                .await?;
-
-                let response_buffer = match timeout(connection.timeouts.read_timeout, rx).await {
-                    Ok(Ok(Ok(frame))) => frame,
-                    Ok(Ok(Err(error))) => {
-                        connection.invalidate(Some(captured_generation)).await;
-                        return Err(error);
-                    }
-                    Ok(Err(_)) => {
-                        connection.invalidate(Some(captured_generation)).await;
-                        return Err(ModbusError::ReadError(io::Error::new(
-                            io::ErrorKind::ConnectionAborted,
-                            "reader task terminated",
-                        )));
-                    }
-                    Err(_) => {
-                        connection.invalidate(Some(captured_generation)).await;
-                        return Err(ModbusError::ReadTimeout);
-                    }
-                };
-
-                pending_guard.disarm();
-
-                let protocol_id = u16::from_be_bytes([response_buffer[2], response_buffer[3]]);
-                if protocol_id != 0 {
-                    return Err(ModbusError::ProtocolIdMismatch {
-                        actual: protocol_id,
-                    });
-                }
-
-                let received_unit_id = response_buffer[6];
-                if received_unit_id != unit_id {
-                    return Err(ModbusError::UnitIdMismatch {
-                        expected: unit_id,
-                        actual: received_unit_id,
-                    });
-                }
-
-                let received_transaction_id =
-                    u16::from_be_bytes([response_buffer[0], response_buffer[1]]);
-                if received_transaction_id != tid {
-                    return Err(ModbusError::TransactionIdMismatch {
-                        expected: tid,
-                        actual: received_transaction_id,
-                    });
-                }
-
-                let pdu_bytes = &response_buffer[MBAP_HEADER_LEN..];
-                let response = ModbusResponse::try_from(pdu_bytes)?;
-                if let ModbusResponse::Exception { function, code } = response {
-                    return Err(ModbusError::ExceptionResponse { function, code });
-                }
-                response.align_to_request(&pdu)
+                .await
             }
-        })
-        .retry(backoff)
-        .when(ModbusError::is_transient)
-        .await
+        }
     }
 }
 
@@ -442,20 +484,31 @@ mod tests {
     }
 
     #[test]
-    fn retry_backoff_builds_without_panicking() {
-        let _ = ModbusTcpConnection::retry_backoff();
-    }
-
-    #[test]
-    fn retry_max_elapsed_time_is_two_seconds() {
-        assert_eq!(RETRY_MAX_ELAPSED_TIME, Duration::from_secs(2));
-    }
-
-    #[test]
     fn new_connection_uses_default_timeouts() {
         let connection = ModbusTcpConnection::new("127.0.0.1".parse().unwrap(), 502, 1, 0);
 
         assert_eq!(connection.timeouts(), ModbusTcpTimeouts::default());
+    }
+
+    #[test]
+    fn connection_with_retry_none_disables_retry() {
+        let connection =
+            ModbusTcpConnection::new("127.0.0.1".parse().unwrap(), 502, 1, 0).with_retry(None);
+
+        assert_eq!(connection.retry(), None);
+    }
+
+    #[test]
+    fn with_timeouts_preserves_default_retry() {
+        let connection = ModbusTcpConnection::with_timeouts(
+            "127.0.0.1".parse().unwrap(),
+            502,
+            1,
+            0,
+            ModbusTcpTimeouts::default(),
+        );
+
+        assert_eq!(connection.retry(), Some(ModbusTcpRetry::default()));
     }
 
     #[test]
@@ -486,6 +539,20 @@ mod tests {
             &connection.transaction_id,
             &child.transaction_id,
         ));
+    }
+
+    #[test]
+    fn with_unit_id_propagates_retry_config() {
+        let retry = ModbusTcpRetry {
+            initial_delay: Duration::from_millis(10),
+            ..ModbusTcpRetry::default()
+        };
+        let connection = ModbusTcpConnection::new("127.0.0.1".parse().unwrap(), 502, 1, 7)
+            .with_retry(Some(retry));
+
+        let child = connection.with_unit_id(42);
+
+        assert_eq!(child.retry(), Some(retry));
     }
 
     #[tokio::test]
