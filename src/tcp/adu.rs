@@ -26,7 +26,7 @@ const MBAP_HEADER_LEN: usize = 7;
 /// # Errors
 /// Returns a [`ModbusError`] if the request cannot be serialized or the
 /// resulting frame would exceed the Modbus TCP length field.
-pub fn build_modbus_tcp_adu(
+pub(crate) fn build_modbus_tcp_adu(
     transaction_id: u16,
     unit_id: u8,
     pdu: &ModbusRequest,
