@@ -16,11 +16,11 @@ pub mod error;
 pub use error::ModbusError;
 
 /// Typed Modbus request PDUs and serialization.
-pub mod request;
+mod request;
 pub use request::ModbusRequest;
 
 /// Typed Modbus response PDUs and deserialization.
-pub mod response;
+mod response;
 pub use response::ModbusResponse;
 
 pub mod tcp;

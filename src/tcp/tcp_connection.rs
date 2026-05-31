@@ -140,37 +140,6 @@ impl ModbusTcpConnection {
         self
     }
 
-    /// Returns the retry policy used for future send operations.
-    ///
-    /// # Returns
-    ///
-    /// Returns `Some(policy)` when same-call retry is enabled, or `None` when a
-    /// transient failure is returned after the first attempt without retrying.
-    #[must_use]
-    pub fn retry(&self) -> Option<ModbusTcpRetry> {
-        self.retry
-    }
-
-    /// Returns the timeout configuration used for future operations.
-    ///
-    /// # Returns
-    ///
-    /// Returns the connect, write, and read timeouts stored on this handle.
-    #[must_use]
-    pub fn timeouts(&self) -> ModbusTcpTimeouts {
-        self.timeouts
-    }
-
-    /// Returns the default unit identifier used by [`Self::send_message`].
-    ///
-    /// # Returns
-    ///
-    /// Returns the unit id configured for this handle.
-    #[must_use]
-    pub fn unit_id(&self) -> u8 {
-        self.unit_id
-    }
-
     /// Returns a new handle that shares the same transport but overrides the default unit id.
     ///
     /// # Arguments
@@ -487,7 +456,7 @@ mod tests {
     fn new_connection_uses_default_timeouts() {
         let connection = ModbusTcpConnection::new("127.0.0.1".parse().unwrap(), 502, 1, 0);
 
-        assert_eq!(connection.timeouts(), ModbusTcpTimeouts::default());
+        assert_eq!(connection.timeouts, ModbusTcpTimeouts::default());
     }
 
     #[test]
@@ -495,7 +464,7 @@ mod tests {
         let connection =
             ModbusTcpConnection::new("127.0.0.1".parse().unwrap(), 502, 1, 0).with_retry(None);
 
-        assert_eq!(connection.retry(), None);
+        assert_eq!(connection.retry, None);
     }
 
     #[test]
@@ -508,7 +477,7 @@ mod tests {
             ModbusTcpTimeouts::default(),
         );
 
-        assert_eq!(connection.retry(), Some(ModbusTcpRetry::default()));
+        assert_eq!(connection.retry, Some(ModbusTcpRetry::default()));
     }
 
     #[test]
@@ -522,7 +491,7 @@ mod tests {
         let connection =
             ModbusTcpConnection::with_timeouts("127.0.0.1".parse().unwrap(), 502, 1, 0, timeouts);
 
-        assert_eq!(connection.timeouts(), timeouts);
+        assert_eq!(connection.timeouts, timeouts);
     }
 
     #[test]
@@ -531,9 +500,9 @@ mod tests {
 
         let child = connection.with_unit_id(42);
 
-        assert_eq!(connection.unit_id(), 1);
-        assert_eq!(child.unit_id(), 42);
-        assert_eq!(child.timeouts(), connection.timeouts());
+        assert_eq!(connection.unit_id, 1);
+        assert_eq!(child.unit_id, 42);
+        assert_eq!(child.timeouts, connection.timeouts);
         assert!(Arc::ptr_eq(&connection.state, &child.state));
         assert!(Arc::ptr_eq(
             &connection.transaction_id,
@@ -552,7 +521,7 @@ mod tests {
 
         let child = connection.with_unit_id(42);
 
-        assert_eq!(child.retry(), Some(retry));
+        assert_eq!(child.retry, Some(retry));
     }
 
     #[tokio::test]
