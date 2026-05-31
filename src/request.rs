@@ -144,7 +144,7 @@ impl ModbusRequest {
     /// # Errors
     ///
     /// Returns [`ModbusError::ValidationError`] when the request violates Modbus limits.
-    pub fn serialize(&self) -> Result<Vec<u8>, ModbusError> {
+    pub(crate) fn serialize(&self) -> Result<Vec<u8>, ModbusError> {
         self.validate()?;
         serialize_modbus_request(self)
     }
