@@ -82,7 +82,7 @@ serialized and a cancellation in one caller cannot interrupt a partially written
 Use `send_message_with_unit_id` or `with_unit_id(...)` when talking to multiple devices behind one
 Modbus TCP gateway.
 
-## Timeouts
+## Timeouts and retries
 
 `ModbusTcpConnection::new(...)` uses sensible defaults for connect, write, and read timeouts.
 The write timeout covers both sending the frame and flushing the socket. If you need custom limits,
@@ -92,7 +92,7 @@ construct the connection with `with_timeouts(...)`.
 use std::net::{IpAddr, Ipv4Addr};
 use std::time::Duration;
 
-use tiny_mb::tcp::{ModbusTcpConnection, ModbusTcpTimeouts};
+use tiny_mb::tcp::{ModbusTcpConnection, ModbusTcpRetry, ModbusTcpTimeouts};
 
 let connection = ModbusTcpConnection::with_timeouts(
     IpAddr::V4(Ipv4Addr::LOCALHOST),
@@ -104,8 +104,19 @@ let connection = ModbusTcpConnection::with_timeouts(
         write_timeout: Duration::from_secs(2),
         read_timeout: Duration::from_secs(2),
     },
-);
+)
+.with_retry(Some(ModbusTcpRetry {
+    initial_delay: Duration::from_millis(100),
+    max_elapsed: Duration::from_secs(1),
+    ..ModbusTcpRetry::default()
+}));
 ```
+
+By default, transient TCP connect/write/read failures are retried with exponential backoff starting
+at 500 ms, multiplied by 1.5, with jitter, and bounded only by `max_elapsed` (2 s). Set
+`max_times` to cap the number of retries as well. To disable same-call retry, pass
+`with_retry(None)`; the first transient error is returned to the caller for that call, but the
+connection state is still invalidated and the next call reconnects lazily.
 
 ## Error handling
 
@@ -117,6 +128,7 @@ Transport and protocol failures are reported with `ModbusError`, including:
 - transaction ID, protocol ID, and unit ID mismatches
 - request/response mismatches
 - request validation errors
+- invalid retry configuration as `ValidationError` (not retried)
 
 ## CLI example
 

@@ -20,6 +20,6 @@ pub use adu::build_modbus_tcp_adu;
 
 /// Reusable Modbus TCP connection type.
 pub mod tcp_connection;
+pub use retry::ModbusTcpRetry;
 pub use tcp_connection::ModbusTcpConnection;
 pub use timeouts::ModbusTcpTimeouts;
-pub use retry::ModbusTcpRetry;

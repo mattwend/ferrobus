@@ -3,9 +3,10 @@
 
 //! Retry configuration for Modbus TCP send operations.
 
+use std::future::Future;
 use std::time::Duration;
 
-use backon::ExponentialBuilder;
+use backon::{ExponentialBuilder, Retryable};
 
 use crate::error::ModbusError;
 
@@ -118,6 +119,20 @@ impl ModbusTcpRetry {
     }
 }
 
+pub(crate) async fn retry_transient<Operation, Fut, T>(
+    operation: Operation,
+    retry: ModbusTcpRetry,
+) -> Result<T, ModbusError>
+where
+    Operation: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, ModbusError>>,
+{
+    operation
+        .retry(retry.to_backoff()?)
+        .when(ModbusError::is_transient)
+        .await
+}
+
 impl Default for ModbusTcpRetry {
     fn default() -> Self {
         Self {
@@ -132,6 +147,7 @@ impl Default for ModbusTcpRetry {
 }
 
 #[cfg(test)]
+#[allow(clippy::float_cmp, clippy::panic, clippy::unwrap_used)]
 mod tests {
     use super::*;
 
