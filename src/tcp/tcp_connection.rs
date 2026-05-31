@@ -116,7 +116,16 @@ impl ModbusTcpConnection {
         }
     }
 
-    /// Configures the retry policy used for future send operations.
+    /// Configures the retry policy used for future send operations on this handle.
+    ///
+    /// Retry configuration is stored on the handle, while the underlying socket is
+    /// shared between clones. Calling this method does not mutate existing clones;
+    /// clone or derive `with_unit_id` handles after setting the policy when they
+    /// should use the same retry behavior.
+    ///
+    /// The policy is validated when a send operation starts. Use
+    /// [`ModbusTcpRetry::validate`] if you need to reject invalid configuration
+    /// before storing it on the connection.
     ///
     /// # Arguments
     ///
@@ -136,7 +145,7 @@ impl ModbusTcpConnection {
     /// # Returns
     ///
     /// Returns `Some(policy)` when same-call retry is enabled, or `None` when a
-    /// transient failure is returned after the first attempt.
+    /// transient failure is returned after the first attempt without retrying.
     #[must_use]
     pub fn retry(&self) -> Option<ModbusTcpRetry> {
         self.retry
@@ -172,7 +181,7 @@ impl ModbusTcpConnection {
     /// # Returns
     ///
     /// Returns a clone-like handle with the same socket, transaction-id counter,
-    /// timeout configuration, and generation state as `self`.
+    /// timeout configuration, retry policy, and generation state as `self`.
     #[must_use]
     pub fn with_unit_id(&self, unit_id: u8) -> Self {
         Self {
@@ -388,9 +397,10 @@ impl ModbusTcpConnection {
     /// Sends one request using this connection's default unit id.
     ///
     /// The connection is opened on demand. Transient connect, read, and write
-    /// failures invalidate the current socket and are retried with a short
-    /// exponential backoff. Protocol, validation, and request/response mismatch
-    /// failures are returned without retrying.
+    /// failures invalidate the current socket and are retried according to this
+    /// handle's [`ModbusTcpRetry`] policy. Protocol, validation, Modbus
+    /// exception, and request/response mismatch failures are returned without
+    /// retrying.
     ///
     /// # Arguments
     ///
@@ -414,6 +424,7 @@ impl ModbusTcpConnection {
     /// This is useful when one TCP gateway fronts multiple logical Modbus devices.
     /// The socket and transaction-id counter are shared with the default-unit-id
     /// path, so calls for different unit ids may be in flight concurrently.
+    /// Retry and reconnect semantics match [`Self::send_message`].
     ///
     /// # Arguments
     ///

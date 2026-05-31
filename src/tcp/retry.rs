@@ -12,8 +12,28 @@ use crate::error::ModbusError;
 
 /// Exponential retry policy used by [`crate::tcp::ModbusTcpConnection`].
 ///
+/// The policy applies to one `send_message` or `send_message_with_unit_id` call.
+/// Each retry performs a fresh connect/write/read attempt after the connection
+/// has been invalidated by the transient failure that triggered the retry.
+///
 /// The [`Default::default`] policy starts at 500 ms, multiplies delays by
 /// 1.5, adds jitter, and retries until 2 s of total retry delay has elapsed.
+/// Set [`Self::max_times`] when you also need to cap the number of retry
+/// attempts. Pass `None` to [`crate::tcp::ModbusTcpConnection::with_retry`] to
+/// disable same-call retry entirely.
+///
+/// # Retried errors
+///
+/// Only errors classified as transient by [`ModbusError::is_transient`] are
+/// retried. Invalid retry configuration, request validation failures, protocol
+/// mismatches, Modbus exception responses, and request/response mismatches are
+/// returned immediately.
+///
+/// # Validation
+///
+/// A policy is validated when converted to the internal backoff builder, which
+/// happens before the send operation starts. Call [`Self::validate`] earlier if
+/// you want to fail fast while building configuration.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ModbusTcpRetry {
     /// Initial delay before the first retry attempt, in wall-clock time.
