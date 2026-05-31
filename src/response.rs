@@ -6,11 +6,7 @@ use std::convert::TryFrom;
 use crate::ModbusRequest;
 use crate::error::ModbusError;
 
-fn unpack_bits(
-    response: &[u8],
-    min_len: usize,
-    exact_count: Option<usize>,
-) -> Result<(usize, Vec<bool>), ModbusError> {
+fn unpack_bits(response: &[u8], min_len: usize) -> Result<Vec<bool>, ModbusError> {
     if response.len() < min_len {
         return Err(ModbusError::DeserializationError(format!(
             "Invalid response: expected at least {} bytes, got {}",
@@ -33,10 +29,7 @@ fn unpack_bits(
             result.push((byte >> bit) & 1 == 1);
         }
     }
-    if let Some(count) = exact_count {
-        result.truncate(count);
-    }
-    Ok((byte_count, result))
+    Ok(result)
 }
 
 fn parse_registers(response: &[u8], min_len: usize) -> Result<Vec<u16>, ModbusError> {
@@ -130,27 +123,6 @@ pub enum ModbusResponse {
 }
 
 impl ModbusResponse {
-    /// Deserializes a Modbus response PDU.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ModbusError::DeserializationError`] when the bytes are not a supported response.
-    pub fn deserialize(response: &[u8]) -> Result<ModbusResponse, ModbusError> {
-        deserialize_modbus_response(response, None)
-    }
-
-    /// Deserializes a Modbus response PDU and truncates bit-packed reads to `count` values.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ModbusError::DeserializationError`] when the bytes are not a supported response.
-    pub fn deserialize_with_count(
-        response: &[u8],
-        count: usize,
-    ) -> Result<ModbusResponse, ModbusError> {
-        deserialize_modbus_response(response, Some(count))
-    }
-
     /// Aligns this response with the request that produced it.
     ///
     /// # Arguments
@@ -315,10 +287,7 @@ impl ModbusResponse {
     }
 }
 
-fn deserialize_modbus_response(
-    response: &[u8],
-    bit_count: Option<usize>,
-) -> Result<ModbusResponse, ModbusError> {
+fn deserialize_modbus_response(response: &[u8]) -> Result<ModbusResponse, ModbusError> {
     if response.is_empty() {
         return Err(ModbusError::DeserializationError(
             "Empty response".to_string(),
@@ -328,11 +297,11 @@ fn deserialize_modbus_response(
     let function_code = response[0];
     match function_code {
         1 => {
-            let (_, coils) = unpack_bits(response, 2, bit_count)?;
+            let coils = unpack_bits(response, 2)?;
             Ok(ModbusResponse::ReadCoils { coils })
         }
         2 => {
-            let (_, inputs) = unpack_bits(response, 2, bit_count)?;
+            let inputs = unpack_bits(response, 2)?;
             Ok(ModbusResponse::ReadDiscreteInputs { inputs })
         }
         3 => {
@@ -424,7 +393,7 @@ impl TryFrom<&[u8]> for ModbusResponse {
     type Error = ModbusError;
 
     fn try_from(bytes: &[u8]) -> Result<Self, Self::Error> {
-        ModbusResponse::deserialize(bytes)
+        deserialize_modbus_response(bytes)
     }
 }
 
@@ -445,7 +414,7 @@ mod tests {
     fn test_deserialize_read_coils() {
         let response = vec![1u8, 1u8, 0x25];
         let expected_coils = vec![true, false, true, false, false, true, false, false];
-        let result = ModbusResponse::deserialize(&response).unwrap();
+        let result = ModbusResponse::try_from(response.as_slice()).unwrap();
         assert_eq!(
             result,
             ModbusResponse::ReadCoils {
@@ -458,7 +427,7 @@ mod tests {
     fn test_deserialize_read_discrete_inputs() {
         let response = vec![2u8, 1u8, 0xAA];
         let expected_inputs = vec![false, true, false, true, false, true, false, true];
-        let result = ModbusResponse::deserialize(&response).unwrap();
+        let result = ModbusResponse::try_from(response.as_slice()).unwrap();
         assert_eq!(
             result,
             ModbusResponse::ReadDiscreteInputs {
@@ -471,7 +440,7 @@ mod tests {
     fn test_deserialize_read_holding_registers() {
         let response = vec![3u8, 4u8, 0x01, 0x02, 0x03, 0x04];
         let expected_registers = vec![0x0102, 0x0304];
-        let result = ModbusResponse::deserialize(&response).unwrap();
+        let result = ModbusResponse::try_from(response.as_slice()).unwrap();
         assert_eq!(
             result,
             ModbusResponse::ReadHoldingRegisters {
@@ -484,7 +453,7 @@ mod tests {
     fn test_deserialize_read_input_registers() {
         let response = vec![4u8, 2u8, 0xAB, 0xCD];
         let expected_registers = vec![0xABCD];
-        let result = ModbusResponse::deserialize(&response).unwrap();
+        let result = ModbusResponse::try_from(response.as_slice()).unwrap();
         assert_eq!(
             result,
             ModbusResponse::ReadInputRegisters {
@@ -496,7 +465,7 @@ mod tests {
     #[test]
     fn test_deserialize_write_single_coil_true() {
         let response = vec![5u8, 0x00, 0x10, 0xFF, 0x00];
-        let result = ModbusResponse::deserialize(&response).unwrap();
+        let result = ModbusResponse::try_from(response.as_slice()).unwrap();
         assert_eq!(
             result,
             ModbusResponse::WriteSingleCoil {
@@ -509,7 +478,7 @@ mod tests {
     #[test]
     fn test_deserialize_write_single_coil_false() {
         let response = vec![5u8, 0x00, 0x10, 0x00, 0x00];
-        let result = ModbusResponse::deserialize(&response).unwrap();
+        let result = ModbusResponse::try_from(response.as_slice()).unwrap();
         assert_eq!(
             result,
             ModbusResponse::WriteSingleCoil {
@@ -522,7 +491,7 @@ mod tests {
     #[test]
     fn test_deserialize_write_single_register() {
         let response = vec![6u8, 0x00, 0x10, 0x12, 0x34];
-        let result = ModbusResponse::deserialize(&response).unwrap();
+        let result = ModbusResponse::try_from(response.as_slice()).unwrap();
         assert_eq!(
             result,
             ModbusResponse::WriteSingleRegister {
@@ -535,7 +504,7 @@ mod tests {
     #[test]
     fn test_deserialize_write_multiple_coils() {
         let response = vec![15u8, 0x00, 0x01, 0x00, 0x06];
-        let result = ModbusResponse::deserialize(&response).unwrap();
+        let result = ModbusResponse::try_from(response.as_slice()).unwrap();
         assert_eq!(
             result,
             ModbusResponse::WriteMultipleCoils {
@@ -548,7 +517,7 @@ mod tests {
     #[test]
     fn test_deserialize_write_multiple_registers() {
         let response = vec![16u8, 0x00, 0x01, 0x00, 0x02];
-        let result = ModbusResponse::deserialize(&response).unwrap();
+        let result = ModbusResponse::try_from(response.as_slice()).unwrap();
         assert_eq!(
             result,
             ModbusResponse::WriteMultipleRegisters {
@@ -561,7 +530,7 @@ mod tests {
     #[test]
     fn test_deserialize_exception() {
         let response = vec![0x81u8, 0x02];
-        let result = ModbusResponse::deserialize(&response).unwrap();
+        let result = ModbusResponse::try_from(response.as_slice()).unwrap();
         assert_eq!(
             result,
             ModbusResponse::Exception {
@@ -574,14 +543,14 @@ mod tests {
     #[test]
     fn test_invalid_response_empty() {
         let response = vec![];
-        let result = ModbusResponse::deserialize(&response);
+        let result = ModbusResponse::try_from(response.as_slice());
         assert!(result.is_err());
     }
 
     #[test]
     fn test_invalid_response_too_short_for_registers() {
         let response = vec![3u8, 1u8];
-        let result = ModbusResponse::deserialize(&response);
+        let result = ModbusResponse::try_from(response.as_slice());
         assert!(result.is_err());
     }
 
@@ -804,7 +773,7 @@ mod tests {
     #[test]
     fn test_deserialize_unsupported_function_code() {
         let response = vec![7u8];
-        let result = ModbusResponse::deserialize(&response);
+        let result = ModbusResponse::try_from(response.as_slice());
         assert!(result.is_err());
         match result.unwrap_err() {
             ModbusError::DeserializationError(msg) => {
@@ -817,7 +786,7 @@ mod tests {
     #[test]
     fn test_deserialize_write_single_coil_invalid_value() {
         let response = vec![5u8, 0x00, 0x10, 0x01, 0x00];
-        let result = ModbusResponse::deserialize(&response);
+        let result = ModbusResponse::try_from(response.as_slice());
         assert!(result.is_err());
         match result.unwrap_err() {
             ModbusError::DeserializationError(msg) => {
@@ -830,7 +799,7 @@ mod tests {
     #[test]
     fn test_deserialize_read_holding_registers_odd_byte_count() {
         let response = vec![3u8, 3u8, 0x01, 0x02, 0x03];
-        let result = ModbusResponse::deserialize(&response);
+        let result = ModbusResponse::try_from(response.as_slice());
         assert!(result.is_err());
         match result.unwrap_err() {
             ModbusError::DeserializationError(msg) => {
@@ -843,7 +812,7 @@ mod tests {
     #[test]
     fn test_deserialize_read_coils_response_too_short_for_byte_count() {
         let response = vec![1u8, 5u8, 0x01, 0x02];
-        let result = ModbusResponse::deserialize(&response);
+        let result = ModbusResponse::try_from(response.as_slice());
         assert!(result.is_err());
         match result.unwrap_err() {
             ModbusError::DeserializationError(msg) => {
@@ -856,7 +825,7 @@ mod tests {
     #[test]
     fn test_deserialize_read_holding_registers_response_too_short_for_byte_count() {
         let response = vec![3u8, 4u8, 0x01, 0x02];
-        let result = ModbusResponse::deserialize(&response);
+        let result = ModbusResponse::try_from(response.as_slice());
         assert!(result.is_err());
         match result.unwrap_err() {
             ModbusError::DeserializationError(msg) => {
@@ -869,35 +838,35 @@ mod tests {
     #[test]
     fn test_deserialize_write_single_coil_too_short() {
         let response = vec![5u8, 0x00, 0x10, 0xFF];
-        let result = ModbusResponse::deserialize(&response);
+        let result = ModbusResponse::try_from(response.as_slice());
         assert!(result.is_err());
     }
 
     #[test]
     fn test_deserialize_write_single_register_too_short() {
         let response = vec![6u8, 0x00, 0x10, 0x12];
-        let result = ModbusResponse::deserialize(&response);
+        let result = ModbusResponse::try_from(response.as_slice());
         assert!(result.is_err());
     }
 
     #[test]
     fn test_deserialize_write_multiple_coils_too_short() {
         let response = vec![15u8, 0x00, 0x01, 0x00];
-        let result = ModbusResponse::deserialize(&response);
+        let result = ModbusResponse::try_from(response.as_slice());
         assert!(result.is_err());
     }
 
     #[test]
     fn test_deserialize_write_multiple_registers_too_short() {
         let response = vec![16u8, 0x00, 0x01, 0x00];
-        let result = ModbusResponse::deserialize(&response);
+        let result = ModbusResponse::try_from(response.as_slice());
         assert!(result.is_err());
     }
 
     #[test]
     fn test_deserialize_exception_too_short() {
         let response = vec![0x81u8];
-        let result = ModbusResponse::deserialize(&response);
+        let result = ModbusResponse::try_from(response.as_slice());
         assert!(result.is_err());
     }
 
