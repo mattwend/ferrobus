@@ -258,7 +258,8 @@ async fn server_disconnects_on_write() {
         }
     });
 
-    let conn = ModbusTcpConnection::new(addr.ip(), addr.port(), 1, 0);
+    let conn = ModbusTcpConnection::new(addr.ip(), addr.port(), 1, 0)
+        .with_retry(Some(fast_retry(Duration::from_millis(500), None)));
     conn.connect().await.unwrap();
 
     let request = ModbusRequest::ReadCoils {
@@ -320,7 +321,8 @@ async fn server_disconnects_on_header_read() {
         }
     });
 
-    let conn = ModbusTcpConnection::new(addr.ip(), addr.port(), 1, 0);
+    let conn = ModbusTcpConnection::new(addr.ip(), addr.port(), 1, 0)
+        .with_retry(Some(fast_retry(Duration::from_millis(500), None)));
     conn.connect().await.unwrap();
 
     let request = ModbusRequest::ReadCoils {
@@ -524,7 +526,8 @@ async fn send_message_returns_read_timeout_from_slow_server() {
             write_timeout: Duration::from_millis(50),
             read_timeout: Duration::from_millis(25),
         },
-    );
+    )
+    .with_retry(None);
     conn.connect().await.unwrap();
 
     let request = ModbusRequest::ReadCoils {
