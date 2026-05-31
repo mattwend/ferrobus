@@ -12,7 +12,6 @@ use std::sync::{
 };
 use std::time::Duration;
 
-use backon::Retryable;
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tokio::time::timeout;
@@ -21,7 +20,7 @@ use tracing::debug;
 use crate::tcp::connected_state::ConnectedState;
 use crate::tcp::frame::MBAP_HEADER_LEN;
 use crate::tcp::pending::{self, PendingGuard};
-use crate::tcp::retry::ModbusTcpRetry;
+use crate::tcp::retry::{ModbusTcpRetry, retry_transient};
 use crate::tcp::timeouts::ModbusTcpTimeouts;
 use crate::tcp::writer::{self, TearDown};
 use crate::{ModbusRequest, ModbusResponse, error::ModbusError, tcp::adu::build_modbus_tcp_adu};
@@ -36,6 +35,14 @@ type SharedConnectedState = Arc<Mutex<Option<Arc<ConnectedState>>>>;
 /// caller waiting on the matching MBAP transaction identifier. A generation
 /// counter prevents stale read/write failures from tearing down a newer socket
 /// after a reconnect.
+///
+/// # Retries
+///
+/// Transient connect, write, and read failures are retried within a send call
+/// according to [`Self::with_retry`] and [`ModbusTcpRetry`]. Passing `None` to
+/// [`Self::with_retry`] disables same-call retry and returns the first transient
+/// error, but reconnect remains independent: the failed socket is invalidated
+/// and the next call reconnects lazily.
 #[derive(Clone, Debug)]
 pub struct ModbusTcpConnection {
     state: SharedConnectedState,
@@ -430,17 +437,17 @@ impl ModbusTcpConnection {
         match self.retry {
             None => self.send_message_attempt(unit_id, pdu).await,
             Some(retry) => {
-                let backoff = retry.to_backoff()?;
                 let connection = self.clone();
                 let pdu = pdu.clone();
 
-                (|| {
-                    let connection = connection.clone();
-                    let pdu = pdu.clone();
-                    async move { connection.send_message_attempt(unit_id, &pdu).await }
-                })
-                .retry(backoff)
-                .when(ModbusError::is_transient)
+                retry_transient(
+                    || {
+                        let connection = connection.clone();
+                        let pdu = pdu.clone();
+                        async move { connection.send_message_attempt(unit_id, &pdu).await }
+                    },
+                    retry,
+                )
                 .await
             }
         }
