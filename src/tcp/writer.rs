@@ -33,7 +33,7 @@ pub(crate) struct TearDown {
 /// * `writer` - Shared TCP write half for the connected state.
 /// * `adu` - Complete Modbus TCP ADU bytes to send.
 /// * `write_timeout` - Maximum duration for the write and flush operation.
-/// * `teardown` - Connection state and generation used to tear down stale state on failure.
+/// * `teardown` - Connection state and generation used to invalidate stale state on failure.
 ///
 /// # Errors
 ///
@@ -63,7 +63,7 @@ pub(crate) async fn write_adu_cancellation_safe(
         if result.is_err() {
             writer_teardown
                 .connection
-                .tear_down(writer_teardown.generation)
+                .invalidate(Some(writer_teardown.generation))
                 .await;
         }
 
@@ -73,7 +73,10 @@ pub(crate) async fn write_adu_cancellation_safe(
     match writer_task.await {
         Ok(result) => result,
         Err(error) => {
-            teardown.connection.tear_down(teardown.generation).await;
+            teardown
+                .connection
+                .invalidate(Some(teardown.generation))
+                .await;
             Err(ModbusError::WriteError(io::Error::other(format!(
                 "writer task failed: {error}"
             ))))
