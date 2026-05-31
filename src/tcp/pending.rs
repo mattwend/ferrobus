@@ -157,4 +157,34 @@ mod tests {
 
         assert!(pending.lock().unwrap().is_empty());
     }
+
+    #[test]
+    fn pending_guard_tolerates_poisoned_map_on_drop() {
+        let pending: Arc<Pending> = Arc::new(StdMutex::new(HashMap::new()));
+        let (tx, mut rx) = oneshot::channel();
+        pending.lock().unwrap().insert(7u16, tx);
+        let poisoner = Arc::clone(&pending);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.lock().unwrap();
+            panic!("poison the pending map");
+        })
+        .join();
+
+        let guard = PendingGuard {
+            pending: Arc::clone(&pending),
+            tid: 7,
+            armed: true,
+        };
+
+        // Dropping an armed guard against a poisoned map must not panic; because
+        // the lock cannot be acquired, the pending entry remains untouched.
+        drop(guard);
+
+        let lock_error = pending.lock().unwrap_err();
+        assert!(lock_error.into_inner().contains_key(&7));
+        assert!(matches!(
+            rx.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+    }
 }
