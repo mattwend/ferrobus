@@ -17,6 +17,9 @@ tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-threa
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
 futures = "0.3"
+tokio-util = { version = "0.7.18", features = ["codec"] }
+futures-util = { version = "0.3.32", features = ["sink"] }
+bytes = "1.11.1"
 
 [lints.rust]
 missing_docs = "warn"

@@ -8,7 +8,9 @@
 //! connected-state reader lifecycle, pending request tracking, and
 //! cancellation-safe writes separated by concern.
 
+mod actor;
 mod adu;
+mod codec;
 mod connected_state;
 mod frame;
 mod pending;
