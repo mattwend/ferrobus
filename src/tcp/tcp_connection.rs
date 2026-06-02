@@ -101,11 +101,6 @@ impl ModbusTcpConnection {
         Ok(stream)
     }
 
-    /// Invalidates the active actor-owned socket.
-    pub(crate) async fn invalidate(&self, _captured: Option<u64>) {
-        self.disconnect().await;
-    }
-
     /// Opens the TCP connection eagerly.
     pub async fn connect(&self) -> Result<(), ModbusError> {
         let (ack, reply) = oneshot::channel();
