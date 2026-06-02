@@ -102,6 +102,10 @@ impl ModbusTcpConnection {
     }
 
     /// Opens the TCP connection eagerly.
+    ///
+    /// # Errors
+    ///
+    /// Returns connect or transport errors reported by the actor.
     pub async fn connect(&self) -> Result<(), ModbusError> {
         let (ack, reply) = oneshot::channel();
         self.tx
@@ -124,6 +128,7 @@ impl ModbusTcpConnection {
     }
 
     /// Returns whether this handle currently owns an open TCP stream.
+    #[allow(clippy::unused_async)]
     pub async fn is_connected(&self) -> bool {
         *self.connected.borrow()
     }
@@ -174,11 +179,21 @@ impl ModbusTcpConnection {
     }
 
     /// Sends one request using this connection's default unit id.
+    ///
+    /// # Errors
+    ///
+    /// Returns transport, protocol, validation, exception-response, or
+    /// request/response mismatch errors.
     pub async fn send_message(&self, pdu: &ModbusRequest) -> Result<ModbusResponse, ModbusError> {
         self.send_message_with_unit_id(self.unit_id, pdu).await
     }
 
     /// Sends one request using an explicit unit id.
+    ///
+    /// # Errors
+    ///
+    /// Returns transport, protocol, validation, exception-response, or
+    /// request/response mismatch errors.
     pub async fn send_message_with_unit_id(
         &self,
         unit_id: u8,
@@ -288,7 +303,7 @@ mod tests {
             .with_retry(None);
         assert!(matches!(
             connection.connect().await,
-            Err(ModbusError::ConnectError(_)) | Err(ModbusError::ConnectTimeout)
+            Err(ModbusError::ConnectError(_) | ModbusError::ConnectTimeout)
         ));
     }
 }

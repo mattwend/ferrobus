@@ -3,8 +3,6 @@
 
 //! Single-owner Modbus TCP connection actor.
 
-#![allow(dead_code)]
-
 use std::collections::HashMap;
 use std::io;
 use std::net::IpAddr;
