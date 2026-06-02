@@ -19,7 +19,7 @@ Small Rust Modbus library with typed request/response PDUs and a reusable Modbus
   - write multiple registers
 - Modbus TCP transport with:
   - lazy connect or explicit `connect()`
-  - reusable connections
+  - reusable actor-owned connections with bounded command-channel backpressure
   - concurrent in-flight requests across cloned handles on one socket
   - retry of transient I/O failures
   - per-phase timeouts for connect, write, and read
@@ -75,9 +75,11 @@ async fn main() -> Result<(), tiny_mb::ModbusError> {
 ```
 
 The TCP client opens connections lazily, retries short-lived I/O failures, and can reuse the
-same socket across multiple requests. Cloned handles, including those returned by `with_unit_id`,
-may issue requests concurrently; responses are matched by MBAP transaction ID. Writes are
-serialized and a cancellation in one caller cannot interrupt a partially written Modbus TCP frame.
+same socket across multiple requests. Internally, cloned handles send commands over a bounded
+channel to one actor task that owns the socket and MBAP codec; this provides backpressure under
+burst load. Cloned handles, including those returned by `with_unit_id`, may issue requests
+concurrently; responses are matched by MBAP transaction ID. Writes are serialized by the actor and
+a cancellation in one caller cannot interrupt a partially written Modbus TCP frame.
 
 Use `send_message_with_unit_id` or `with_unit_id(...)` when talking to multiple devices behind one
 Modbus TCP gateway.

@@ -3,8 +3,6 @@
 
 //! Modbus TCP MBAP codec used by the connection actor.
 
-#![allow(dead_code)]
-
 use std::io;
 
 use bytes::BytesMut;
