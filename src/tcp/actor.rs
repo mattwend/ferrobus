@@ -44,7 +44,10 @@ pub(crate) enum Command {
         ack: oneshot::Sender<Result<(), ModbusError>>,
     },
     /// Drop the current socket and fail pending waiters.
-    Disconnect,
+    Disconnect {
+        /// Acknowledgement channel completed after teardown is processed.
+        ack: oneshot::Sender<()>,
+    },
 }
 
 #[derive(Debug)]
@@ -94,7 +97,10 @@ impl Actor {
             if self.framed.is_none() {
                 match self.rx.recv().await {
                     None => return,
-                    Some(Command::Disconnect) => self.teardown(None),
+                    Some(Command::Disconnect { ack }) => {
+                        self.teardown(None);
+                        let _ = ack.send(());
+                    }
                     Some(Command::Connect { ack }) => {
                         let _ = ack.send(self.ensure_connected().await);
                     }
@@ -111,7 +117,10 @@ impl Actor {
                 tokio::select! {
                     maybe_cmd = self.rx.recv() => match maybe_cmd {
                         None => return,
-                        Some(Command::Disconnect) => self.teardown(None),
+                        Some(Command::Disconnect { ack }) => {
+                            self.teardown(None);
+                            let _ = ack.send(());
+                        }
                         Some(Command::Connect { ack }) => { let _ = ack.send(Ok(())); }
                         Some(Command::Request { unit_id, pdu, reply }) => self.handle_request(unit_id, pdu, reply).await,
                     },
