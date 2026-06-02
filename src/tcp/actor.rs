@@ -54,7 +54,11 @@ pub(crate) enum Command {
 struct PendingEntry {
     /// Response channel waiting for this transaction's frame or terminal error.
     reply: oneshot::Sender<Result<Vec<u8>, ModbusError>>,
-    /// Absolute time after which the response waiter receives a read timeout.
+    /// Absolute post-write deadline used to clean up actor-owned pending state.
+    ///
+    /// Handles also wrap their response channel in the same read timeout from
+    /// the time the command is submitted, so caller-visible timeouts may include
+    /// channel backpressure and write time before this actor deadline starts.
     deadline: Instant,
 }
 
@@ -250,6 +254,7 @@ impl Actor {
         };
         debug!(tid, "Modbus TCP Frame: {:02X?}", adu);
         let Some(framed) = self.framed.as_mut() else {
+            warn!(tid, "request reached actor without an open connection");
             let _ = reply.send(Err(ModbusError::ReadError(io::Error::new(
                 io::ErrorKind::NotConnected,
                 "connection not open",

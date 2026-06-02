@@ -23,7 +23,11 @@ use crate::{ModbusRequest, ModbusResponse, error::ModbusError};
 /// Clones are lightweight command senders to a single background actor that owns
 /// the TCP socket, pending response map, and transaction-id counter. The actor
 /// connects lazily on the first warm-up or request, reconnects after transport
-/// teardown, and applies bounded channel backpressure under burst load.
+/// teardown, and applies bounded channel backpressure under burst load. The
+/// caller-facing read timeout starts before the request enters the actor, so it
+/// bounds queue wait, write, and response wait time together; the actor also
+/// keeps per-request response deadlines after successful writes so timed-out
+/// pending requests are cleaned up and the socket is torn down.
 #[derive(Clone, Debug)]
 pub struct ModbusTcpConnection {
     tx: mpsc::Sender<Command>,
@@ -116,6 +120,10 @@ impl ModbusTcpConnection {
     }
 
     /// Closes the current TCP session if one is open.
+    ///
+    /// The method waits until the actor has processed the disconnect command,
+    /// making subsequent `is_connected` reads observe the cleared state unless
+    /// another handle reconnects afterward.
     pub async fn disconnect(&self) {
         let (ack, processed) = oneshot::channel();
         if let Err(error) = self.tx.send(Command::Disconnect { ack }).await {
@@ -276,7 +284,6 @@ mod tests {
         connection.connect().await.unwrap();
         connection.disconnect().await;
         connection.disconnect().await;
-        tokio::task::yield_now().await;
         assert!(!connection.is_connected().await);
     }
 
