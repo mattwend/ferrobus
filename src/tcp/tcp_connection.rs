@@ -165,7 +165,7 @@ impl ModbusTcpConnection {
         }
     }
 
-    async fn connect_stream(
+    pub(crate) async fn connect_stream(
         address: IpAddr,
         port: u16,
         connect_timeout: Duration,

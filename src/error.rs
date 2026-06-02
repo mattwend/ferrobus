@@ -90,9 +90,9 @@ pub enum ModbusError {
 
 impl ModbusError {
     /// Returns `true` if this error represents a transient transport failure
-    /// that callers may safely retry (connect, read, or write I/O failures and
-    /// their associated timeouts). Protocol-level and validation errors are
-    /// considered permanent.
+    /// that callers may safely retry (connect, read, or write I/O failures,
+    /// malformed TCP response frames, and their associated timeouts).
+    /// Protocol-level and validation errors are considered permanent.
     #[must_use]
     pub fn is_transient(&self) -> bool {
         matches!(
@@ -103,6 +103,7 @@ impl ModbusError {
                 | Self::WriteTimeout
                 | Self::ReadError(_)
                 | Self::ReadTimeout
+                | Self::MalformedResponse(_)
         )
     }
 }
