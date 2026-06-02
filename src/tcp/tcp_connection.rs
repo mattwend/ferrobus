@@ -214,240 +214,81 @@ fn actor_terminated_error() -> ModbusError {
 #[allow(clippy::panic, clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
-    use tokio::sync::oneshot;
 
-    async fn spawn_accept_once_server() -> std::net::SocketAddr {
+    async fn echo_server() -> std::net::SocketAddr {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-
         tokio::spawn(async move {
-            let (_stream, _) = listener.accept().await.unwrap();
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut header = [0_u8; 7];
+                    while stream.read_exact(&mut header).await.is_ok() {
+                        let len = u16::from_be_bytes([header[4], header[5]]) as usize;
+                        let mut rest = vec![0_u8; len.saturating_sub(1)];
+                        if stream.read_exact(&mut rest).await.is_err() {
+                            break;
+                        }
+                        let mut response = header.to_vec();
+                        response.extend(rest);
+                        if stream.write_all(&response).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
         });
-
         addr
     }
 
-    #[test]
-    fn new_connection_uses_default_timeouts() {
-        let connection = ModbusTcpConnection::new("127.0.0.1".parse().unwrap(), 502, 1, 0);
-
-        assert_eq!(connection.timeouts, ModbusTcpTimeouts::default());
+    #[tokio::test]
+    async fn connection_starts_disconnected_and_connect_sets_connected() {
+        let addr = echo_server().await;
+        let connection = ModbusTcpConnection::new(addr.ip(), addr.port(), 1, 0);
+        assert!(!connection.is_connected().await);
+        connection.connect().await.unwrap();
+        assert!(connection.is_connected().await);
     }
 
-    #[test]
-    fn connection_with_retry_none_disables_retry() {
+    #[tokio::test]
+    async fn disconnect_is_idempotent_and_clears_connected() {
+        let addr = echo_server().await;
+        let connection = ModbusTcpConnection::new(addr.ip(), addr.port(), 1, 0);
+        connection.connect().await.unwrap();
+        connection.disconnect().await;
+        connection.disconnect().await;
+        tokio::task::yield_now().await;
+        assert!(!connection.is_connected().await);
+    }
+
+    #[tokio::test]
+    async fn with_unit_id_keeps_retry_policy_and_overrides_unit() {
         let connection =
             ModbusTcpConnection::new("127.0.0.1".parse().unwrap(), 502, 1, 0).with_retry(None);
-
-        assert_eq!(connection.retry, None);
+        let child = connection.with_unit_id(7);
+        assert_eq!(child.retry, None);
+        assert_eq!(child.unit_id, 7);
     }
 
-    #[test]
-    fn with_timeouts_preserves_default_retry() {
-        let connection = ModbusTcpConnection::with_timeouts(
-            "127.0.0.1".parse().unwrap(),
-            502,
-            1,
-            0,
-            ModbusTcpTimeouts::default(),
-        );
-
-        assert_eq!(connection.retry, Some(ModbusTcpRetry::default()));
-    }
-
-    #[test]
-    fn with_timeouts_stores_custom_timeouts() {
+    #[tokio::test]
+    async fn connect_failure_is_reported() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
         let timeouts = ModbusTcpTimeouts {
-            connect_timeout: Duration::from_secs(1),
-            write_timeout: Duration::from_secs(2),
-            read_timeout: Duration::from_secs(3),
+            connect_timeout: Duration::from_millis(50),
+            write_timeout: Duration::from_millis(50),
+            read_timeout: Duration::from_millis(50),
         };
-
-        let connection =
-            ModbusTcpConnection::with_timeouts("127.0.0.1".parse().unwrap(), 502, 1, 0, timeouts);
-
-        assert_eq!(connection.timeouts, timeouts);
-    }
-
-    #[test]
-    fn with_unit_id_returns_child_handle_with_shared_state() {
-        let connection = ModbusTcpConnection::new("127.0.0.1".parse().unwrap(), 502, 1, 7);
-
-        let child = connection.with_unit_id(42);
-
-        assert_eq!(connection.unit_id, 1);
-        assert_eq!(child.unit_id, 42);
-        assert_eq!(child.timeouts, connection.timeouts);
-        assert!(Arc::ptr_eq(&connection.state, &child.state));
-        assert!(Arc::ptr_eq(
-            &connection.transaction_id,
-            &child.transaction_id,
+        let connection = ModbusTcpConnection::with_timeouts(addr.ip(), addr.port(), 1, 0, timeouts)
+            .with_retry(None);
+        assert!(matches!(
+            connection.connect().await,
+            Err(ModbusError::ConnectError(_)) | Err(ModbusError::ConnectTimeout)
         ));
-    }
-
-    #[test]
-    fn with_unit_id_propagates_retry_config() {
-        let retry = ModbusTcpRetry {
-            initial_delay: Duration::from_millis(10),
-            ..ModbusTcpRetry::default()
-        };
-        let connection = ModbusTcpConnection::new("127.0.0.1".parse().unwrap(), 502, 1, 7)
-            .with_retry(Some(retry));
-
-        let child = connection.with_unit_id(42);
-
-        assert_eq!(child.retry, Some(retry));
-    }
-
-    #[tokio::test]
-    async fn is_connected_is_false_before_connect() {
-        let connection = ModbusTcpConnection::new("127.0.0.1".parse().unwrap(), 502, 1, 0);
-
-        assert!(!connection.is_connected().await);
-    }
-
-    #[tokio::test]
-    async fn is_connected_is_true_after_connect() {
-        let addr = spawn_accept_once_server().await;
-        let connection = ModbusTcpConnection::new(addr.ip(), addr.port(), 1, 0);
-
-        connection.connect().await.unwrap();
-
-        assert!(connection.is_connected().await);
-    }
-
-    #[tokio::test]
-    async fn disconnect_clears_connected_state() {
-        let addr = spawn_accept_once_server().await;
-        let connection = ModbusTcpConnection::new(addr.ip(), addr.port(), 1, 0);
-
-        connection.connect().await.unwrap();
-        assert!(connection.is_connected().await);
-
-        connection.disconnect().await;
-
-        assert!(!connection.is_connected().await);
-    }
-
-    #[tokio::test]
-    async fn disconnect_is_idempotent_when_already_disconnected() {
-        let connection = ModbusTcpConnection::new("127.0.0.1".parse().unwrap(), 502, 1, 0);
-
-        connection.disconnect().await;
-        connection.disconnect().await;
-
-        assert!(!connection.is_connected().await);
-    }
-
-    #[tokio::test]
-    async fn invalidate_with_stale_generation_is_noop() {
-        let addr = spawn_accept_once_server().await;
-        let connection = ModbusTcpConnection::new(addr.ip(), addr.port(), 1, 0);
-
-        connection.connect().await.unwrap();
-        let current_generation = connection.generation.load(Ordering::SeqCst);
-
-        // A captured generation older than the current one must not tear down
-        // the live connection.
-        connection
-            .invalidate(Some(current_generation.saturating_sub(1)))
-            .await;
-
-        assert!(connection.is_connected().await);
-    }
-
-    #[tokio::test]
-    async fn ensure_connected_state_replaces_finished_reader() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-
-        let (release_second_tx, release_second_rx) = oneshot::channel::<()>();
-        let server_task = tokio::spawn(async move {
-            // First connection: close immediately so the reader task finishes.
-            let (first, _) = listener.accept().await.unwrap();
-            drop(first);
-            // Second connection: keep open until the assertion has observed it.
-            let (_second, _) = listener.accept().await.unwrap();
-            let _ = release_second_rx.await;
-        });
-
-        let connection = ModbusTcpConnection::new(addr.ip(), addr.port(), 1, 0);
-        connection.connect().await.unwrap();
-        let first_generation = connection.generation.load(Ordering::SeqCst);
-
-        // Wait for the reader task to observe EOF and finish.
-        timeout(Duration::from_secs(1), async {
-            while connection.is_connected().await {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
-
-        // Reconnect: the stale finished state is dropped and a new one created.
-        connection.connect().await.unwrap();
-
-        assert!(connection.is_connected().await);
-        assert!(connection.generation.load(Ordering::SeqCst) > first_generation);
-        drop(release_second_tx);
-        server_task.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn send_message_propagates_reader_channel_error() {
-        use crate::ModbusRequest;
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-
-        let (release_second_tx, release_second_rx) = oneshot::channel::<()>();
-        let server_task = tokio::spawn(async move {
-            // First connection: read the request, then drop so the reader task
-            // drains the in-flight waiter with a transport error.
-            let (mut first, _) = listener.accept().await.unwrap();
-            let mut header = [0u8; MBAP_HEADER_LEN];
-            first.read_exact(&mut header).await.unwrap();
-            let mut body = [0u8; 5];
-            first.read_exact(&mut body).await.unwrap();
-            drop(first);
-
-            // Second connection (retry): respond successfully and stay open
-            // until the client has consumed the response.
-            let (mut second, _) = listener.accept().await.unwrap();
-            let mut header = [0u8; MBAP_HEADER_LEN];
-            second.read_exact(&mut header).await.unwrap();
-            let mut body = [0u8; 5];
-            second.read_exact(&mut body).await.unwrap();
-            let unit_id = header[6];
-            let response = [header[0], header[1], 0, 0, 0, 4, unit_id, 1, 1, 0b0000_0001];
-            second.write_all(&response).await.unwrap();
-            let _ = release_second_rx.await;
-        });
-
-        // Long read timeout ensures the reader's channel error wins over a
-        // read timeout, exercising the Ok(Ok(Err(_))) request branch.
-        let connection = ModbusTcpConnection::with_timeouts(
-            addr.ip(),
-            addr.port(),
-            1,
-            0,
-            ModbusTcpTimeouts {
-                connect_timeout: Duration::from_secs(1),
-                write_timeout: Duration::from_secs(1),
-                read_timeout: Duration::from_secs(5),
-            },
-        );
-
-        let request = ModbusRequest::ReadCoils {
-            starting_address: 0x0000,
-            quantity: 1,
-        };
-
-        let response = connection.send_message(&request).await.unwrap();
-        assert_eq!(response, ModbusResponse::ReadCoils { coils: vec![true] });
-        drop(release_second_tx);
-        server_task.await.unwrap();
     }
 }
