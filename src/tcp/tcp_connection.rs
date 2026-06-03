@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, watch};
-use tokio::time::timeout;
+use tokio::time::{Instant, timeout};
 use tracing::debug;
 
 use crate::tcp::actor::{Actor, COMMAND_CHANNEL_CAPACITY, Command};
@@ -24,10 +24,9 @@ use crate::{ModbusRequest, ModbusResponse, error::ModbusError};
 /// the TCP socket, pending response map, and transaction-id counter. The actor
 /// connects lazily on the first warm-up or request, reconnects after transport
 /// teardown, and applies bounded channel backpressure under burst load. The
-/// caller-facing read timeout starts before the request enters the actor, so it
-/// bounds queue wait, write, and response wait time together; the actor also
-/// keeps per-request response deadlines after successful writes so timed-out
-/// pending requests are cleaned up and the socket is torn down.
+/// caller-facing read timeout deadline starts before the request enters the
+/// actor, so it bounds queue wait, write, and response wait time together while
+/// the actor remains the single owner of timeout enforcement and socket teardown.
 #[derive(Clone, Debug)]
 pub struct ModbusTcpConnection {
     tx: mpsc::Sender<Command>,
@@ -152,15 +151,15 @@ impl ModbusTcpConnection {
                 unit_id,
                 pdu: pdu.clone(),
                 reply,
+                deadline: Instant::now() + self.read_timeout,
             })
             .await
             .map_err(|_| actor_terminated_error())?;
 
-        let response_buffer = match timeout(self.read_timeout, response).await {
-            Ok(Ok(Ok(frame))) => frame,
-            Ok(Ok(Err(error))) => return Err(error),
-            Ok(Err(_)) => return Err(actor_terminated_error()),
-            Err(_) => return Err(ModbusError::ReadTimeout),
+        let response_buffer = match response.await {
+            Ok(Ok(frame)) => frame,
+            Ok(Err(error)) => return Err(error),
+            Err(_) => return Err(actor_terminated_error()),
         };
 
         let protocol_id = u16::from_be_bytes([response_buffer[2], response_buffer[3]]);

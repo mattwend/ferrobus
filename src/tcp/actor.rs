@@ -36,6 +36,8 @@ pub(crate) enum Command {
         pdu: ModbusRequest,
         /// Response channel receiving a raw ADU frame or transport error.
         reply: oneshot::Sender<Result<Vec<u8>, ModbusError>>,
+        /// Absolute request deadline anchored when the handle submits the command.
+        deadline: Instant,
     },
     /// Eagerly connect and acknowledge the result.
     Connect {
@@ -54,11 +56,7 @@ pub(crate) enum Command {
 struct PendingEntry {
     /// Response channel waiting for this transaction's frame or terminal error.
     reply: oneshot::Sender<Result<Vec<u8>, ModbusError>>,
-    /// Absolute post-write deadline used to clean up actor-owned pending state.
-    ///
-    /// Handles also wrap their response channel in the same read timeout from
-    /// the time the command is submitted, so caller-visible timeouts may include
-    /// channel backpressure and write time before this actor deadline starts.
+    /// Absolute request deadline anchored when the handle submits the command.
     deadline: Instant,
 }
 
@@ -138,8 +136,10 @@ impl Actor {
                         unit_id,
                         pdu,
                         reply,
+                        deadline,
                     }) => {
-                        self.connect_then_request(unit_id, pdu, reply).await;
+                        self.connect_then_request(unit_id, pdu, reply, deadline)
+                            .await;
                     }
                 }
             } else {
@@ -152,7 +152,7 @@ impl Actor {
                             let _ = ack.send(());
                         }
                         Some(Command::Connect { ack }) => { let _ = ack.send(Ok(())); }
-                        Some(Command::Request { unit_id, pdu, reply }) => self.handle_request(unit_id, pdu, reply).await,
+                        Some(Command::Request { unit_id, pdu, reply, deadline }) => self.handle_request(unit_id, pdu, reply, deadline).await,
                     },
                     item = Self::next_frame(self.framed.as_mut()) => match item {
                         Some(Ok(frame)) => self.route_frame(frame),
@@ -212,17 +212,23 @@ impl Actor {
     /// * `unit_id` - Unit identifier to encode in the MBAP header.
     /// * `pdu` - Request PDU to serialize and send.
     /// * `reply` - Response channel completed with a frame or transport error.
+    /// * `deadline` - Absolute request deadline anchored at command submission.
     async fn connect_then_request(
         &mut self,
         unit_id: u8,
         pdu: ModbusRequest,
         reply: oneshot::Sender<Result<Vec<u8>, ModbusError>>,
+        deadline: Instant,
     ) {
+        if deadline <= Instant::now() {
+            let _ = reply.send(Err(ModbusError::ReadTimeout));
+            return;
+        }
         if let Err(error) = self.ensure_connected().await {
             let _ = reply.send(Err(error));
             return;
         }
-        self.handle_request(unit_id, pdu, reply).await;
+        self.handle_request(unit_id, pdu, reply, deadline).await;
     }
 
     /// Serializes, writes, and tracks a request on the current connection.
@@ -232,12 +238,18 @@ impl Actor {
     /// * `unit_id` - Unit identifier to encode in the MBAP header.
     /// * `pdu` - Request PDU to serialize and send.
     /// * `reply` - Response channel stored until the matching response arrives or times out.
+    /// * `deadline` - Absolute request deadline anchored at command submission.
     async fn handle_request(
         &mut self,
         unit_id: u8,
         pdu: ModbusRequest,
         reply: oneshot::Sender<Result<Vec<u8>, ModbusError>>,
+        deadline: Instant,
     ) {
+        if deadline <= Instant::now() {
+            let _ = reply.send(Err(ModbusError::ReadTimeout));
+            return;
+        }
         let tid = match self.allocate_tid() {
             Ok(tid) => tid,
             Err(error) => {
@@ -263,13 +275,7 @@ impl Actor {
         };
         match timeout(self.timeouts.write_timeout, framed.send(adu)).await {
             Ok(Ok(())) => {
-                self.pending.insert(
-                    tid,
-                    PendingEntry {
-                        reply,
-                        deadline: Instant::now() + self.timeouts.read_timeout,
-                    },
-                );
+                self.pending.insert(tid, PendingEntry { reply, deadline });
             }
             Ok(Err(error)) => {
                 let _ = reply.send(Err(write_error_from_sink(error)));
