@@ -114,11 +114,10 @@ let connection = ModbusTcpConnection::with_timeouts(
 }));
 ```
 
-Read timeout enforcement is cooperative: each handle wraps its response wait in `read_timeout`
-starting when the request command is submitted, while the actor starts a matching per-request
-cleanup deadline after the frame is written. This means caller-visible read timeouts also include
-bounded channel backpressure and write time; the actor deadline cleans up pending state and tears
-down the socket if the response does not arrive after the write.
+Read timeout enforcement is actor-owned: each handle attaches an absolute `read_timeout`
+deadline when the request command is submitted. The deadline therefore bounds actor queue wait,
+write time, and response wait time; when it expires, the actor completes the waiter
+with `ReadTimeout` and tears down the socket in the same step.
 
 By default, transient TCP connect/write/read failures are retried with exponential backoff starting
 at 500 ms, multiplied by 1.5, with jitter, and bounded only by `max_elapsed` (2 s). Set
