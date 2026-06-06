@@ -92,7 +92,11 @@ impl ModbusError {
     /// Returns `true` if this error represents a transient transport failure
     /// that callers may safely retry (connect, read, or write I/O failures,
     /// malformed TCP response frames, and their associated timeouts).
-    /// Protocol-level and validation errors are considered permanent.
+    ///
+    /// Malformed TCP response frames are treated as transient because a corrupt or
+    /// desynchronized stream can often be recovered by reconnecting and retrying
+    /// on a fresh socket. Protocol-level and validation errors are considered
+    /// permanent.
     #[must_use]
     pub fn is_transient(&self) -> bool {
         matches!(

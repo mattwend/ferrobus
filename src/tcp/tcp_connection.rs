@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, watch};
-use tokio::time::{Instant, timeout};
+use tokio::time::{Instant, timeout, timeout_at};
 use tracing::debug;
 
 use crate::tcp::actor::{Actor, COMMAND_CHANNEL_CAPACITY, Command};
@@ -145,16 +145,19 @@ impl ModbusTcpConnection {
         unit_id: u8,
         pdu: &ModbusRequest,
     ) -> Result<ModbusResponse, ModbusError> {
+        let deadline = Instant::now() + self.read_timeout;
         let (reply, response) = oneshot::channel();
-        self.tx
-            .send(Command::Request {
-                unit_id,
-                pdu: pdu.clone(),
-                reply,
-                deadline: Instant::now() + self.read_timeout,
-            })
-            .await
-            .map_err(|_| actor_terminated_error())?;
+        let command = Command::Request {
+            unit_id,
+            pdu: pdu.clone(),
+            reply,
+            deadline,
+        };
+        match timeout_at(deadline, self.tx.send(command)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => return Err(actor_terminated_error()),
+            Err(_) => return Err(ModbusError::ReadTimeout),
+        }
 
         let response_buffer = match response.await {
             Ok(Ok(frame)) => frame,
@@ -162,6 +165,7 @@ impl ModbusTcpConnection {
             Err(_) => return Err(actor_terminated_error()),
         };
 
+        // The MBAP codec only yields complete frames with a full header and at least one PDU byte.
         let protocol_id = u16::from_be_bytes([response_buffer[2], response_buffer[3]]);
         if protocol_id != 0 {
             return Err(ModbusError::ProtocolIdMismatch {
@@ -293,6 +297,34 @@ mod tests {
         let child = connection.with_unit_id(7);
         assert_eq!(child.retry, None);
         assert_eq!(child.unit_id, 7);
+    }
+
+    #[tokio::test]
+    async fn send_once_bounds_wait_for_full_command_channel() {
+        let (tx, _rx) = mpsc::channel(1);
+        let (connected_tx, connected) = watch::channel(false);
+        let (ack, _processed) = oneshot::channel();
+        tx.try_send(Command::Disconnect { ack }).unwrap();
+        drop(connected_tx);
+        let connection = ModbusTcpConnection {
+            tx,
+            unit_id: 1,
+            connected,
+            read_timeout: Duration::from_millis(10),
+            retry: None,
+        };
+
+        let result = connection
+            .send_once(
+                1,
+                &ModbusRequest::ReadHoldingRegisters {
+                    starting_address: 0,
+                    quantity: 1,
+                },
+            )
+            .await;
+
+        assert!(matches!(result, Err(ModbusError::ReadTimeout)));
     }
 
     #[tokio::test]

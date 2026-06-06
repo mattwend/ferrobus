@@ -117,7 +117,10 @@ let connection = ModbusTcpConnection::with_timeouts(
 Read timeout enforcement is actor-owned: each handle attaches an absolute `read_timeout`
 deadline when the request command is submitted. The deadline therefore bounds actor queue wait,
 write time, and response wait time; when it expires, the actor completes the waiter
-with `ReadTimeout` and tears down the socket in the same step.
+with `ReadTimeout` and tears down the socket in the same step. Because a timed-out request may
+leave an unread response on the stream, that teardown is connection-wide: other in-flight requests
+on the same socket can observe a transient connection-aborted read error and retry on a fresh
+connection.
 
 By default, transient TCP connect/write/read failures are retried with exponential backoff starting
 at 500 ms, multiplied by 1.5, with jitter, and bounded only by `max_elapsed` (2 s). Set

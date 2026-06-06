@@ -13,6 +13,9 @@ use crate::error::ModbusError;
 use crate::tcp::frame::{MBAP_HEADER_LEN, response_body_len_from_header};
 
 /// Error emitted by the MBAP codec.
+///
+/// Keeping codec failures in this dedicated type preserves phase information for the actor:
+/// sink-side I/O errors are reclassified as writes, while stream-side I/O errors are reads.
 #[derive(Debug, Error)]
 pub(crate) enum MbapCodecError {
     /// The framed socket returned an I/O error.
