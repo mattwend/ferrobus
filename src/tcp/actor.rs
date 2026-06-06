@@ -12,7 +12,7 @@ use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::{Instant, sleep_until, timeout};
 use tokio_util::codec::Framed;
-use tracing::{debug, warn};
+use tracing::{debug, trace, warn};
 
 use crate::tcp::adu::build_modbus_tcp_adu;
 use crate::tcp::codec::{MbapCodec, MbapCodecError};
@@ -127,10 +127,10 @@ impl Actor {
                     None => return,
                     Some(Command::Disconnect { ack }) => {
                         self.teardown(None);
-                        let _ = ack.send(());
+                        notify_waiter(ack, ());
                     }
                     Some(Command::Connect { ack }) => {
-                        let _ = ack.send(self.ensure_connected().await);
+                        notify_waiter(ack, self.ensure_connected().await);
                     }
                     Some(Command::Request {
                         unit_id,
@@ -149,9 +149,9 @@ impl Actor {
                         None => return,
                         Some(Command::Disconnect { ack }) => {
                             self.teardown(None);
-                            let _ = ack.send(());
+                            notify_waiter(ack, ());
                         }
-                        Some(Command::Connect { ack }) => { let _ = ack.send(Ok(())); }
+                        Some(Command::Connect { ack }) => { notify_waiter(ack, Ok(())); }
                         Some(Command::Request { unit_id, pdu, reply, deadline }) => self.handle_request(unit_id, pdu, reply, deadline).await,
                     },
                     item = Self::next_frame(self.framed.as_mut()) => match item {
@@ -192,6 +192,7 @@ impl Actor {
     /// `Ok(())` when a socket is available, otherwise the connect error or timeout.
     async fn ensure_connected(&mut self) -> Result<(), ModbusError> {
         if self.framed.is_some() {
+            // defensive: connected-state callers short-circuit before reaching this path.
             return Ok(());
         }
         let stream = ModbusTcpConnection::connect_stream(
@@ -201,7 +202,9 @@ impl Actor {
         )
         .await?;
         self.framed = Some(Framed::new(stream, MbapCodec));
-        let _ = self.connected_tx.send(true);
+        if self.connected_tx.send(true).is_err() {
+            trace!("no connection-state subscribers to notify of connect");
+        }
         Ok(())
     }
 
@@ -221,11 +224,11 @@ impl Actor {
         deadline: Instant,
     ) {
         if deadline <= Instant::now() {
-            let _ = reply.send(Err(ModbusError::ReadTimeout));
+            notify_waiter(reply, Err(ModbusError::ReadTimeout));
             return;
         }
         if let Err(error) = self.ensure_connected().await {
-            let _ = reply.send(Err(error));
+            notify_waiter(reply, Err(error));
             return;
         }
         self.handle_request(unit_id, pdu, reply, deadline).await;
@@ -247,30 +250,33 @@ impl Actor {
         deadline: Instant,
     ) {
         if deadline <= Instant::now() {
-            let _ = reply.send(Err(ModbusError::ReadTimeout));
+            notify_waiter(reply, Err(ModbusError::ReadTimeout));
             return;
         }
         let tid = match self.allocate_tid() {
             Ok(tid) => tid,
             Err(error) => {
-                let _ = reply.send(Err(error));
+                notify_waiter(reply, Err(error));
                 return;
             }
         };
         let adu = match build_modbus_tcp_adu(tid, unit_id, &pdu) {
             Ok(adu) => adu,
             Err(error) => {
-                let _ = reply.send(Err(error));
+                notify_waiter(reply, Err(error));
                 return;
             }
         };
         debug!(tid, "Modbus TCP Frame: {:02X?}", adu);
         let Some(framed) = self.framed.as_mut() else {
             warn!(tid, "request reached actor without an open connection");
-            let _ = reply.send(Err(ModbusError::ReadError(io::Error::new(
-                io::ErrorKind::NotConnected,
-                "connection not open",
-            ))));
+            notify_waiter(
+                reply,
+                Err(ModbusError::ReadError(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "connection not open",
+                ))),
+            );
             return;
         };
         match timeout(self.timeouts.write_timeout, framed.send(adu)).await {
@@ -278,11 +284,11 @@ impl Actor {
                 self.pending.insert(tid, PendingEntry { reply, deadline });
             }
             Ok(Err(error)) => {
-                let _ = reply.send(Err(write_error_from_sink(error)));
+                notify_waiter(reply, Err(write_error_from_sink(error)));
                 self.teardown(None);
             }
             Err(_) => {
-                let _ = reply.send(Err(ModbusError::WriteTimeout));
+                notify_waiter(reply, Err(ModbusError::WriteTimeout));
                 self.teardown(None);
             }
         }
@@ -313,7 +319,7 @@ impl Actor {
         // The MBAP codec only yields complete frames with a full header and at least one PDU byte.
         let tid = u16::from_be_bytes([frame[0], frame[1]]);
         if let Some(entry) = self.pending.remove(&tid) {
-            let _ = entry.reply.send(Ok(frame));
+            notify_waiter(entry.reply, Ok(frame));
         } else {
             warn!(tid, "ignoring response for unknown transaction id");
         }
@@ -342,7 +348,7 @@ impl Actor {
             .collect();
         for tid in expired {
             if let Some(entry) = self.pending.remove(&tid) {
-                let _ = entry.reply.send(Err(ModbusError::ReadTimeout));
+                notify_waiter(entry.reply, Err(ModbusError::ReadTimeout));
             }
         }
         self.teardown(None);
@@ -355,10 +361,12 @@ impl Actor {
     /// * `reason` - Error to clone for pending waiters, or a default connection-closed error.
     fn teardown(&mut self, reason: Option<ModbusError>) {
         self.framed = None;
-        let _ = self.connected_tx.send(false);
+        if self.connected_tx.send(false).is_err() {
+            trace!("no connection-state subscribers to notify of teardown");
+        }
         let error = reason.unwrap_or_else(default_teardown_error);
         for (_, entry) in self.pending.drain() {
-            let _ = entry.reply.send(Err(clone_error_for_waiter(&error)));
+            notify_waiter(entry.reply, Err(clone_error_for_waiter(&error)));
         }
     }
 }
@@ -373,6 +381,22 @@ fn default_teardown_error() -> ModbusError {
         io::ErrorKind::ConnectionAborted,
         "connection closed",
     ))
+}
+
+/// Delivers a value to a oneshot waiter, tracing when the receiver has already been dropped.
+///
+/// A dropped receiver is the expected outcome when the originating caller timed out or was
+/// cancelled before the response arrived; there is no error to propagate, so the value is
+/// discarded and the occurrence is traced.
+///
+/// # Arguments
+///
+/// * `reply` - Oneshot sender whose receiver may have been dropped by a cancelled caller.
+/// * `value` - Value to deliver to the waiter.
+fn notify_waiter<T>(reply: oneshot::Sender<T>, value: T) {
+    if reply.send(value).is_err() {
+        trace!("waiter receiver dropped before delivery; discarding response");
+    }
 }
 
 /// Converts a sink failure into a write-side transport error.
@@ -616,6 +640,161 @@ mod tests {
         assert!(matches!(
             error,
             ModbusError::WriteError(error) if error.kind() == io::ErrorKind::BrokenPipe
+        ));
+    }
+
+    fn read_holding_registers(quantity: u16) -> ModbusRequest {
+        ModbusRequest::ReadHoldingRegisters {
+            starting_address: 0,
+            quantity,
+        }
+    }
+
+    /// A request whose deadline has already passed must short-circuit with a read
+    /// timeout instead of allocating a transaction id or touching the socket.
+    #[tokio::test]
+    async fn handle_request_with_expired_deadline_replies_read_timeout() {
+        let mut actor = actor_with_seed(0);
+        let (reply, response) = oneshot::channel();
+
+        actor
+            .handle_request(1, read_holding_registers(1), reply, Instant::now())
+            .await;
+
+        assert!(matches!(
+            response.await.unwrap(),
+            Err(ModbusError::ReadTimeout)
+        ));
+        assert!(actor.pending.is_empty());
+    }
+
+    /// The lazy-connect path must also honor an already-expired deadline before it
+    /// attempts to dial the server.
+    #[tokio::test]
+    async fn connect_then_request_with_expired_deadline_replies_read_timeout() {
+        let mut actor = actor_with_seed(0);
+        let (reply, response) = oneshot::channel();
+
+        actor
+            .connect_then_request(1, read_holding_registers(1), reply, Instant::now())
+            .await;
+
+        assert!(matches!(
+            response.await.unwrap(),
+            Err(ModbusError::ReadTimeout)
+        ));
+        assert!(actor.framed.is_none());
+    }
+
+    /// When every transaction id is already pending, a new request must be rejected
+    /// with `NoFreeTransactionId` rather than overwriting an in-flight waiter.
+    #[tokio::test]
+    async fn handle_request_without_free_tid_replies_no_free_transaction_id() {
+        let mut actor = actor_with_seed(0);
+        for tid in 0..=u16::MAX {
+            let (entry, _response) = pending_entry();
+            actor.pending.insert(tid, entry);
+        }
+        let (reply, response) = oneshot::channel();
+
+        actor
+            .handle_request(
+                1,
+                read_holding_registers(1),
+                reply,
+                Instant::now() + Duration::from_secs(1),
+            )
+            .await;
+
+        assert!(matches!(
+            response.await.unwrap(),
+            Err(ModbusError::NoFreeTransactionId)
+        ));
+    }
+
+    /// A request that fails PDU validation must surface the validation error to the
+    /// caller without consuming the allocated transaction id permanently.
+    #[tokio::test]
+    async fn handle_request_with_invalid_pdu_replies_validation_error() {
+        let mut actor = actor_with_seed(0);
+        let (reply, response) = oneshot::channel();
+
+        actor
+            .handle_request(
+                1,
+                read_holding_registers(0),
+                reply,
+                Instant::now() + Duration::from_secs(1),
+            )
+            .await;
+
+        assert!(matches!(
+            response.await.unwrap(),
+            Err(ModbusError::ValidationError(_))
+        ));
+        assert!(actor.pending.is_empty());
+    }
+
+    /// The defensive guard for a request that reaches `handle_request` without an
+    /// open socket must reply with a `NotConnected` read error.
+    #[tokio::test]
+    async fn handle_request_without_socket_replies_not_connected() {
+        let mut actor = actor_with_seed(0);
+        let (reply, response) = oneshot::channel();
+
+        actor
+            .handle_request(
+                1,
+                read_holding_registers(1),
+                reply,
+                Instant::now() + Duration::from_secs(1),
+            )
+            .await;
+
+        assert!(matches!(
+            response.await.unwrap(),
+            Err(ModbusError::ReadError(error)) if error.kind() == io::ErrorKind::NotConnected
+        ));
+    }
+
+    /// Without a socket, `next_frame` must yield `None` so the select arm stays idle.
+    #[tokio::test]
+    async fn next_frame_without_socket_yields_none() {
+        assert!(Actor::next_frame(None).await.is_none());
+    }
+
+    /// A Modbus write error carried by the codec must be preserved as a write error.
+    #[test]
+    fn sink_modbus_write_error_is_preserved_as_write_error() {
+        let error = write_error_from_sink(MbapCodecError::Modbus(ModbusError::WriteError(
+            io::Error::new(io::ErrorKind::BrokenPipe, "broken pipe"),
+        )));
+
+        assert!(matches!(
+            error,
+            ModbusError::WriteError(error) if error.kind() == io::ErrorKind::BrokenPipe
+        ));
+    }
+
+    /// A non-write Modbus error from the codec sink must be wrapped as a write error.
+    #[test]
+    fn sink_other_modbus_error_is_wrapped_as_write_error() {
+        let error = write_error_from_sink(MbapCodecError::Modbus(ModbusError::ValidationError(
+            "bad frame".to_string(),
+        )));
+
+        assert!(matches!(error, ModbusError::WriteError(_)));
+    }
+
+    /// Cloning an error backed by an `io::Error` of kind `Other` must keep that kind.
+    #[test]
+    fn clone_error_for_waiter_preserves_other_io_kind() {
+        let cloned =
+            clone_error_for_waiter(&ModbusError::WriteError(io::Error::other("custom failure")));
+
+        assert!(matches!(
+            cloned,
+            ModbusError::WriteError(error) if error.kind() == io::ErrorKind::Other
         ));
     }
 }
