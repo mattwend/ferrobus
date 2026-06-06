@@ -310,6 +310,7 @@ impl Actor {
     ///
     /// * `frame` - Complete Modbus TCP ADU whose first two bytes contain the transaction id.
     fn route_frame(&mut self, frame: Vec<u8>) {
+        // The MBAP codec only yields complete frames with a full header and at least one PDU byte.
         let tid = u16::from_be_bytes([frame[0], frame[1]]);
         if let Some(entry) = self.pending.remove(&tid) {
             let _ = entry.reply.send(Ok(frame));
@@ -328,6 +329,10 @@ impl Actor {
     }
 
     /// Completes expired waiters with read timeouts and closes the socket.
+    ///
+    /// Closing the socket is intentionally connection-wide: a timed-out request may still
+    /// leave an unread response on the stream, so remaining waiters receive a transient
+    /// connection-aborted error and can retry on a fresh connection.
     fn handle_deadline(&mut self) {
         let now = Instant::now();
         let expired: Vec<u16> = self
@@ -540,6 +545,65 @@ mod tests {
             result,
             Err(ModbusError::MalformedResponse(message)) if message == "invalid MBAP length"
         ));
+    }
+
+    #[test]
+    fn clone_error_for_waiter_accounts_for_every_error_variant() {
+        let errors = vec![
+            ModbusError::ConnectError(io::Error::new(io::ErrorKind::ConnectionRefused, "connect")),
+            ModbusError::ConnectTimeout,
+            ModbusError::WriteError(io::Error::new(io::ErrorKind::BrokenPipe, "write")),
+            ModbusError::WriteTimeout,
+            ModbusError::ReadError(io::Error::new(io::ErrorKind::UnexpectedEof, "read")),
+            ModbusError::ReadTimeout,
+            ModbusError::MalformedResponse("malformed".to_string()),
+            ModbusError::DeserializationError("decode".to_string()),
+            ModbusError::ExceptionResponse {
+                function: 0x81,
+                code: 0x02,
+            },
+            ModbusError::TransactionIdMismatch {
+                expected: 1,
+                actual: 2,
+            },
+            ModbusError::ProtocolIdMismatch { actual: 1 },
+            ModbusError::NoFreeTransactionId,
+            ModbusError::UnitIdMismatch {
+                expected: 1,
+                actual: 2,
+            },
+            ModbusError::RequestResponseMismatch("mismatch".to_string()),
+            ModbusError::ValidationError("invalid".to_string()),
+        ];
+
+        for error in &errors {
+            let cloned = clone_error_for_waiter(error);
+            assert_same_error_variant(error, &cloned);
+        }
+    }
+
+    fn assert_same_error_variant(left: &ModbusError, right: &ModbusError) {
+        assert_eq!(error_variant_name(left), error_variant_name(right));
+    }
+
+    fn error_variant_name(error: &ModbusError) -> &'static str {
+        match error {
+            ModbusError::ConnectError(_) => "ConnectError",
+            ModbusError::ConnectTimeout => "ConnectTimeout",
+            ModbusError::WriteError(_) => "WriteError",
+            ModbusError::WriteTimeout => "WriteTimeout",
+            ModbusError::ReadError(_) => "ReadError",
+            ModbusError::ReadTimeout => "ReadTimeout",
+            ModbusError::MalformedResponse(_) => "MalformedResponse",
+            ModbusError::DeserializationError(_) => "DeserializationError",
+            ModbusError::ExceptionResponse { .. } => "ExceptionResponse",
+            ModbusError::TransactionIdMismatch { .. } => "TransactionIdMismatch",
+            ModbusError::ProtocolIdMismatch { .. } => "ProtocolIdMismatch",
+            ModbusError::NoFreeTransactionId => "NoFreeTransactionId",
+            ModbusError::UnitIdMismatch { .. } => "UnitIdMismatch",
+            ModbusError::RequestResponseMismatch(_) => "RequestResponseMismatch",
+            ModbusError::ValidationError(_) => "ValidationError",
+        }
     }
 
     #[test]
