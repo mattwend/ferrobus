@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, watch};
+use tokio::task::JoinHandle;
 use tokio::time::{Instant, timeout, timeout_at};
 use tracing::debug;
 
@@ -58,17 +59,30 @@ impl ModbusTcpConnection {
         transaction_id: u16,
         timeouts: ModbusTcpTimeouts,
     ) -> Self {
+        Self::spawn_with_timeouts(address, port, unit_id, transaction_id, timeouts).0
+    }
+
+    fn spawn_with_timeouts(
+        address: IpAddr,
+        port: u16,
+        unit_id: u8,
+        transaction_id: u16,
+        timeouts: ModbusTcpTimeouts,
+    ) -> (Self, JoinHandle<()>) {
         let (tx, rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
         let (connected_tx, connected) = watch::channel(false);
         let actor = Actor::new(address, port, timeouts, transaction_id, rx, connected_tx);
-        tokio::spawn(actor.run());
-        Self {
-            tx,
-            unit_id,
-            connected,
-            read_timeout: timeouts.read_timeout,
-            retry: Some(ModbusTcpRetry::default()),
-        }
+        let actor_task = tokio::spawn(actor.run());
+        (
+            Self {
+                tx,
+                unit_id,
+                connected,
+                read_timeout: timeouts.read_timeout,
+                retry: Some(ModbusTcpRetry::default()),
+            },
+            actor_task,
+        )
     }
 
     /// Configures the retry policy used for future send operations on this handle.
