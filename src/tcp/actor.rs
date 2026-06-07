@@ -502,6 +502,8 @@ fn copy_io_error(error: &io::Error) -> io::Error {
 mod tests {
     use std::time::Duration;
 
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
     use super::*;
 
     fn actor_with_seed(seed: u16) -> Actor {
@@ -686,6 +688,43 @@ mod tests {
         assert!(actor.framed.is_none());
     }
 
+    /// Calling `ensure_connected` when a framed socket is already present must be a no-op.
+    #[tokio::test]
+    async fn ensure_connected_with_existing_socket_is_ok() {
+        let (client, _server) = loopback_stream_pair().await;
+        let (mut actor, _connected_rx) = connected_actor_with_stream(client);
+
+        // The actor address points at an unbound port, so reaching the dial path
+        // would fail the unwrap; succeeding proves the early-return guard was taken.
+        actor.ensure_connected().await.unwrap();
+    }
+
+    /// Connecting with no watch receivers must still succeed and trace the missing subscriber.
+    #[tokio::test]
+    async fn ensure_connected_without_state_subscribers_succeeds() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let (_tx, rx) = mpsc::channel(1);
+        let (connected_tx, connected_rx) = watch::channel(false);
+        drop(connected_rx);
+        let mut actor = Actor::new(
+            addr.ip(),
+            addr.port(),
+            ModbusTcpTimeouts::default(),
+            0,
+            rx,
+            connected_tx,
+        );
+
+        actor.ensure_connected().await.unwrap();
+
+        assert!(actor.framed.is_some());
+    }
+
     /// When every transaction id is already pending, a new request must be rejected
     /// with `NoFreeTransactionId` rather than overwriting an in-flight waiter.
     #[tokio::test]
@@ -796,5 +835,164 @@ mod tests {
             cloned,
             ModbusError::WriteError(error) if error.kind() == io::ErrorKind::Other
         ));
+    }
+
+    fn connected_actor_with_stream(stream: TcpStream) -> (Actor, watch::Receiver<bool>) {
+        let (_tx, rx) = mpsc::channel(1);
+        let (connected_tx, connected_rx) = watch::channel(true);
+        let mut actor = Actor::new(
+            "127.0.0.1".parse().unwrap(),
+            502,
+            ModbusTcpTimeouts {
+                connect_timeout: Duration::from_secs(1),
+                write_timeout: Duration::from_millis(10),
+                read_timeout: Duration::from_secs(1),
+            },
+            0,
+            rx,
+            connected_tx,
+        );
+        actor.framed = Some(Framed::new(stream, MbapCodec));
+        (actor, connected_rx)
+    }
+
+    async fn loopback_stream_pair() -> (TcpStream, TcpStream) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = TcpStream::connect(addr).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        (client, server)
+    }
+
+    async fn spawn_one_response_server() -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut header = [0u8; 7];
+            stream.read_exact(&mut header).await.unwrap();
+            let tid = u16::from_be_bytes([header[0], header[1]]);
+            let unit_id = header[6];
+            let pdu_len = usize::from(u16::from_be_bytes([header[4], header[5]])) - 1;
+            let mut pdu = vec![0u8; pdu_len];
+            stream.read_exact(&mut pdu).await.unwrap();
+            let response_pdu = [0x03, 0x02, 0x00, 0x01];
+            let response =
+                crate::tcp::adu::build_modbus_tcp_adu_from_pdu_bytes(tid, unit_id, &response_pdu)
+                    .unwrap();
+            stream.write_all(&response).await.unwrap();
+        });
+        addr
+    }
+
+    async fn assert_next_request_reconnects(actor: &mut Actor) {
+        let reconnect_addr = spawn_one_response_server().await;
+        actor.address = reconnect_addr.ip();
+        actor.port = reconnect_addr.port();
+        let (reply, response) = oneshot::channel();
+
+        actor
+            .connect_then_request(
+                1,
+                read_holding_registers(1),
+                reply,
+                Instant::now() + Duration::from_secs(1),
+            )
+            .await;
+        let frame = Actor::next_frame(actor.framed.as_mut())
+            .await
+            .unwrap()
+            .unwrap();
+        actor.route_frame(frame);
+
+        assert!(response.await.unwrap().is_ok());
+        assert!(actor.framed.is_some());
+    }
+
+    /// A sink I/O error must be reported to the current waiter and tear down the socket.
+    ///
+    /// This relies on the local OS honoring `SO_LINGER(0)` as an immediate reset for a
+    /// loopback socket pair before the client write below.
+    #[tokio::test]
+    async fn handle_request_write_error_replies_and_tears_down() {
+        let (client, server) = loopback_stream_pair().await;
+        let server = server.into_std().unwrap();
+        socket2::SockRef::from(&server)
+            .set_linger(Some(Duration::ZERO))
+            .unwrap();
+        drop(server);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let (mut actor, connected_rx) = connected_actor_with_stream(client);
+        let (pending, pending_response) = pending_entry();
+        actor.pending.insert(99, pending);
+        let (reply, response) = oneshot::channel();
+
+        actor
+            .handle_request(
+                1,
+                read_holding_registers(1),
+                reply,
+                Instant::now() + Duration::from_secs(1),
+            )
+            .await;
+
+        assert!(matches!(
+            response.await.unwrap(),
+            Err(ModbusError::WriteError(_))
+        ));
+        assert!(matches!(
+            pending_response.await.unwrap(),
+            Err(ModbusError::ReadError(error)) if error.kind() == io::ErrorKind::ConnectionAborted
+        ));
+        assert!(actor.pending.is_empty());
+        assert!(actor.framed.is_none());
+        assert!(!*connected_rx.borrow());
+
+        assert_next_request_reconnects(&mut actor).await;
+    }
+
+    /// A send that remains blocked past the write timeout must fail and close the socket.
+    ///
+    /// This assumes the local OS eventually reports `WouldBlock` after the test fills a
+    /// loopback socket send buffer while the peer remains open and unread.
+    #[tokio::test]
+    async fn handle_request_write_timeout_replies_and_tears_down() {
+        let (client, _server) = loopback_stream_pair().await;
+        let filler = vec![0xA5; 64 * 1024];
+        loop {
+            match client.try_write(&filler) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) => panic!("failed to fill client send buffer: {error}"),
+            }
+        }
+        let (mut actor, connected_rx) = connected_actor_with_stream(client);
+        let (pending, pending_response) = pending_entry();
+        actor.pending.insert(99, pending);
+        let (reply, response) = oneshot::channel();
+
+        actor
+            .handle_request(
+                1,
+                read_holding_registers(1),
+                reply,
+                Instant::now() + Duration::from_secs(1),
+            )
+            .await;
+
+        assert!(matches!(
+            response.await.unwrap(),
+            Err(ModbusError::WriteTimeout)
+        ));
+        assert!(matches!(
+            pending_response.await.unwrap(),
+            Err(ModbusError::ReadError(error)) if error.kind() == io::ErrorKind::ConnectionAborted
+        ));
+        assert!(actor.pending.is_empty());
+        assert!(actor.framed.is_none());
+        assert!(!*connected_rx.borrow());
+
+        assert_next_request_reconnects(&mut actor).await;
     }
 }

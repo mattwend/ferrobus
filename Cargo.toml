@@ -20,6 +20,9 @@ tokio-util = { version = "0.7", features = ["codec"] }
 futures-util = { version = "0.3", features = ["sink"] }
 bytes = "1"
 
+[dev-dependencies]
+socket2 = "0.5"
+
 [lints.rust]
 missing_docs = "warn"
 unreachable_pub = "warn"
