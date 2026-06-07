@@ -19,7 +19,7 @@ Small Rust Modbus library with typed request/response PDUs and a reusable Modbus
   - write multiple registers
 - Modbus TCP transport with:
   - lazy connect or explicit `connect()`
-  - reusable connections
+  - reusable actor-owned connections with bounded command-channel backpressure
   - concurrent in-flight requests across cloned handles on one socket
   - retry of transient I/O failures
   - per-phase timeouts for connect, write, and read
@@ -75,9 +75,11 @@ async fn main() -> Result<(), tiny_mb::ModbusError> {
 ```
 
 The TCP client opens connections lazily, retries short-lived I/O failures, and can reuse the
-same socket across multiple requests. Cloned handles, including those returned by `with_unit_id`,
-may issue requests concurrently; responses are matched by MBAP transaction ID. Writes are
-serialized and a cancellation in one caller cannot interrupt a partially written Modbus TCP frame.
+same socket across multiple requests. Internally, cloned handles send commands over a bounded
+channel to one actor task that owns the socket and MBAP codec; this provides backpressure under
+burst load. Cloned handles, including those returned by `with_unit_id`, may issue requests
+concurrently; responses are matched by MBAP transaction ID. Writes are serialized by the actor and
+a cancellation in one caller cannot interrupt a partially written Modbus TCP frame.
 
 Use `send_message_with_unit_id` or `with_unit_id(...)` when talking to multiple devices behind one
 Modbus TCP gateway.
@@ -112,6 +114,14 @@ let connection = ModbusTcpConnection::with_timeouts(
 }));
 ```
 
+Read timeout enforcement is actor-owned: each handle attaches an absolute `read_timeout`
+deadline when the request command is submitted. The deadline therefore bounds actor queue wait,
+write time, and response wait time; when it expires, the actor completes the waiter
+with `ReadTimeout` and tears down the socket in the same step. Because a timed-out request may
+leave an unread response on the stream, that teardown is connection-wide: other in-flight requests
+on the same socket can observe a transient connection-aborted read error and retry on a fresh
+connection.
+
 By default, transient TCP connect/write/read failures are retried with exponential backoff starting
 at 500 ms, multiplied by 1.5, with jitter, and bounded only by `max_elapsed` (2 s). Set
 `max_times` to cap the number of retries as well. To disable same-call retry, pass
@@ -120,9 +130,10 @@ connection state is still invalidated and the next call reconnects lazily.
 
 ## Error handling
 
-Transport and protocol failures are reported with `ModbusError`, including:
+Transport and protocol failures are reported with cloneable `ModbusError` values, including:
 
 - connect, write, and read errors/timeouts
+  - I/O error variants carry `Arc<std::io::Error>`; pattern matching still lets callers bind the error and call `err.kind()` through `Arc` deref.
 - malformed or invalid responses
 - Modbus exception responses
 - transaction ID, protocol ID, and unit ID mismatches

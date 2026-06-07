@@ -1,14 +1,22 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2025 tinymb contributors
 
+use std::sync::Arc;
+
 use thiserror::Error;
 
 /// Custom error type for the Modbus library.
-#[derive(Error, Debug)]
+///
+/// Transport I/O variants store their original [`std::io::Error`] behind an
+/// [`Arc`], so `ModbusError` values can be cloned without losing OS-specific
+/// error details. Downstream matchers can continue to call methods such as
+/// `kind()` on the bound error because `Arc<std::io::Error>` dereferences to
+/// `std::io::Error`.
+#[derive(Error, Debug, Clone)]
 pub enum ModbusError {
     /// TCP connection establishment failed.
     #[error("TCP connect error: {0}")]
-    ConnectError(std::io::Error),
+    ConnectError(Arc<std::io::Error>),
 
     /// TCP connection establishment exceeded the configured timeout.
     #[error("TCP connect timed out")]
@@ -16,7 +24,7 @@ pub enum ModbusError {
 
     /// Writing bytes to the TCP stream failed.
     #[error("TCP write error: {0}")]
-    WriteError(std::io::Error),
+    WriteError(Arc<std::io::Error>),
 
     /// Writing a frame exceeded the configured timeout.
     #[error("TCP write timed out")]
@@ -24,7 +32,7 @@ pub enum ModbusError {
 
     /// Reading bytes from the TCP stream failed.
     #[error("TCP read error: {0}")]
-    ReadError(std::io::Error),
+    ReadError(Arc<std::io::Error>),
 
     /// Reading a frame exceeded the configured timeout.
     #[error("TCP read timed out")]
@@ -90,9 +98,13 @@ pub enum ModbusError {
 
 impl ModbusError {
     /// Returns `true` if this error represents a transient transport failure
-    /// that callers may safely retry (connect, read, or write I/O failures and
-    /// their associated timeouts). Protocol-level and validation errors are
-    /// considered permanent.
+    /// that callers may safely retry (connect, read, or write I/O failures,
+    /// malformed TCP response frames, and their associated timeouts).
+    ///
+    /// Malformed TCP response frames are treated as transient because a corrupt or
+    /// desynchronized stream can often be recovered by reconnecting and retrying
+    /// on a fresh socket. Protocol-level and validation errors are considered
+    /// permanent.
     #[must_use]
     pub fn is_transient(&self) -> bool {
         matches!(
@@ -103,6 +115,7 @@ impl ModbusError {
                 | Self::WriteTimeout
                 | Self::ReadError(_)
                 | Self::ReadTimeout
+                | Self::MalformedResponse(_)
         )
     }
 }
