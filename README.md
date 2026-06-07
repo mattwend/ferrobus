@@ -130,9 +130,10 @@ connection state is still invalidated and the next call reconnects lazily.
 
 ## Error handling
 
-Transport and protocol failures are reported with `ModbusError`, including:
+Transport and protocol failures are reported with cloneable `ModbusError` values, including:
 
 - connect, write, and read errors/timeouts
+  - I/O error variants carry `Arc<std::io::Error>`; pattern matching still lets callers bind the error and call `err.kind()` through `Arc` deref.
 - malformed or invalid responses
 - Modbus exception responses
 - transaction ID, protocol ID, and unit ID mismatches

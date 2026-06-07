@@ -5,6 +5,7 @@
 
 use std::io;
 use std::net::IpAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::net::TcpStream;
@@ -113,7 +114,7 @@ impl ModbusTcpConnection {
         let stream = timeout(connect_timeout, TcpStream::connect(&server_addr))
             .await
             .map_err(|_| ModbusError::ConnectTimeout)?
-            .map_err(ModbusError::ConnectError)?;
+            .map_err(|error| ModbusError::ConnectError(Arc::new(error)))?;
         debug!(server_addr, "connected to Modbus TCP server");
         Ok(stream)
     }
@@ -246,10 +247,10 @@ impl ModbusTcpConnection {
 }
 
 fn actor_terminated_error() -> ModbusError {
-    ModbusError::ReadError(io::Error::new(
+    ModbusError::ReadError(Arc::new(io::Error::new(
         io::ErrorKind::ConnectionAborted,
         "reader task terminated",
-    ))
+    )))
 }
 
 #[cfg(test)]
