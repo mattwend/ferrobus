@@ -169,6 +169,7 @@ impl ModbusTcpConnection {
         };
         match timeout_at(deadline, self.tx.send(command)).await {
             Ok(Ok(())) => {}
+            // defensive: actor death races are non-deterministic in normal operation.
             Ok(Err(_)) => return Err(actor_terminated_error()),
             Err(_) => return Err(ModbusError::ReadTimeout),
         }
@@ -176,6 +177,7 @@ impl ModbusTcpConnection {
         let response_buffer = match response.await {
             Ok(Ok(frame)) => frame,
             Ok(Err(error)) => return Err(error),
+            // defensive: actor death races are non-deterministic in normal operation.
             Err(_) => return Err(actor_terminated_error()),
         };
 
@@ -254,40 +256,21 @@ fn actor_terminated_error() -> ModbusError {
 #[allow(clippy::panic, clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
-    async fn echo_server() -> std::net::SocketAddr {
+    async fn accept_and_hold_server() -> std::net::SocketAddr {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
-            loop {
-                let Ok((mut stream, _)) = listener.accept().await else {
-                    break;
-                };
-                tokio::spawn(async move {
-                    let mut header = [0_u8; 7];
-                    while stream.read_exact(&mut header).await.is_ok() {
-                        let len = u16::from_be_bytes([header[4], header[5]]) as usize;
-                        let mut rest = vec![0_u8; len.saturating_sub(1)];
-                        if stream.read_exact(&mut rest).await.is_err() {
-                            break;
-                        }
-                        let mut response = header.to_vec();
-                        response.extend(rest);
-                        if stream.write_all(&response).await.is_err() {
-                            break;
-                        }
-                    }
-                });
-            }
+            let (_stream, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
         });
         addr
     }
 
     #[tokio::test]
     async fn connection_starts_disconnected_and_connect_sets_connected() {
-        let addr = echo_server().await;
+        let addr = accept_and_hold_server().await;
         let connection = ModbusTcpConnection::new(addr.ip(), addr.port(), 1, 0);
         assert!(!connection.is_connected().await);
         connection.connect().await.unwrap();
@@ -296,12 +279,57 @@ mod tests {
 
     #[tokio::test]
     async fn disconnect_is_idempotent_and_clears_connected() {
-        let addr = echo_server().await;
+        let addr = accept_and_hold_server().await;
         let connection = ModbusTcpConnection::new(addr.ip(), addr.port(), 1, 0);
         connection.connect().await.unwrap();
         connection.disconnect().await;
         connection.disconnect().await;
         assert!(!connection.is_connected().await);
+    }
+
+    #[tokio::test]
+    async fn actor_exits_after_handles_drop_while_disconnected() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (connection, actor_task) = ModbusTcpConnection::spawn_with_timeouts(
+            addr.ip(),
+            addr.port(),
+            1,
+            0,
+            ModbusTcpTimeouts::default(),
+        );
+        let clone = connection.clone();
+
+        drop(connection);
+        drop(clone);
+
+        timeout(Duration::from_secs(1), actor_task)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn actor_exits_after_handles_drop_while_connected() {
+        let addr = accept_and_hold_server().await;
+        let (connection, actor_task) = ModbusTcpConnection::spawn_with_timeouts(
+            addr.ip(),
+            addr.port(),
+            1,
+            0,
+            ModbusTcpTimeouts::default(),
+        );
+        let clone = connection.clone();
+        connection.connect().await.unwrap();
+        assert!(connection.is_connected().await);
+
+        drop(connection);
+        drop(clone);
+
+        timeout(Duration::from_secs(1), actor_task)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]
@@ -339,6 +367,109 @@ mod tests {
             .await;
 
         assert!(matches!(result, Err(ModbusError::ReadTimeout)));
+    }
+
+    fn handle_with_dead_actor() -> ModbusTcpConnection {
+        let (tx, rx) = mpsc::channel(1);
+        let (_connected_tx, connected) = watch::channel(false);
+        drop(rx);
+        ModbusTcpConnection {
+            tx,
+            unit_id: 1,
+            connected,
+            read_timeout: Duration::from_millis(50),
+            retry: None,
+        }
+    }
+
+    /// Disconnecting a handle whose actor task has already stopped must return
+    /// gracefully instead of panicking on the closed command channel.
+    #[tokio::test]
+    async fn disconnect_returns_when_actor_already_stopped() {
+        let connection = handle_with_dead_actor();
+
+        // The closed command channel must be handled gracefully: reaching this point
+        // without panicking or hanging is the contract under test.
+        connection.disconnect().await;
+    }
+
+    /// A send issued after the actor task has stopped must surface a terminated-actor
+    /// transport error rather than blocking forever on the dropped channel.
+    #[tokio::test]
+    async fn send_once_reports_terminated_actor() {
+        let connection = handle_with_dead_actor();
+
+        let result = connection
+            .send_once(
+                1,
+                &ModbusRequest::ReadHoldingRegisters {
+                    starting_address: 0,
+                    quantity: 1,
+                },
+            )
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(ModbusError::ReadError(error)) if error.kind() == io::ErrorKind::ConnectionAborted
+        ));
+    }
+
+    /// If the actor drops the disconnect acknowledgement without replying, the
+    /// public disconnect call must return after logging the terminated actor.
+    #[tokio::test]
+    async fn disconnect_returns_when_actor_drops_ack() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let (_connected_tx, connected) = watch::channel(false);
+        let connection = ModbusTcpConnection {
+            tx,
+            unit_id: 1,
+            connected,
+            read_timeout: Duration::from_millis(50),
+            retry: None,
+        };
+        tokio::spawn(async move {
+            if let Some(Command::Disconnect { ack }) = rx.recv().await {
+                drop(ack);
+            }
+        });
+
+        connection.disconnect().await;
+    }
+
+    /// If the actor drops a request waiter without replying, the caller must see
+    /// a terminated-actor transport error.
+    #[tokio::test]
+    async fn send_once_reports_dropped_response_waiter() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let (_connected_tx, connected) = watch::channel(false);
+        let connection = ModbusTcpConnection {
+            tx,
+            unit_id: 1,
+            connected,
+            read_timeout: Duration::from_millis(50),
+            retry: None,
+        };
+        tokio::spawn(async move {
+            if let Some(Command::Request { reply, .. }) = rx.recv().await {
+                drop(reply);
+            }
+        });
+
+        let result = connection
+            .send_once(
+                1,
+                &ModbusRequest::ReadHoldingRegisters {
+                    starting_address: 0,
+                    quantity: 1,
+                },
+            )
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(ModbusError::ReadError(error)) if error.kind() == io::ErrorKind::ConnectionAborted
+        ));
     }
 
     #[tokio::test]

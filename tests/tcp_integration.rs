@@ -821,3 +821,49 @@ async fn invalid_retry_policy_surfaces_as_validation_error() {
         other => panic!("Expected ValidationError, got {other:?}"),
     }
 }
+
+#[tokio::test]
+async fn first_request_lazily_connects_and_reports_connect_failure() {
+    // Bind then drop the listener so the port is closed: the actor dials lazily on
+    // the first request and must surface the connect error to the caller.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+
+    let timeouts = ModbusTcpTimeouts {
+        connect_timeout: Duration::from_millis(50),
+        write_timeout: Duration::from_millis(50),
+        read_timeout: Duration::from_millis(200),
+    };
+    let conn =
+        ModbusTcpConnection::with_timeouts(addr.ip(), addr.port(), 1, 0, timeouts).with_retry(None);
+
+    let request = ModbusRequest::ReadHoldingRegisters {
+        starting_address: 0,
+        quantity: 1,
+    };
+    let error = conn.send_message(&request).await.unwrap_err();
+
+    assert!(matches!(
+        error,
+        ModbusError::ConnectError(_) | ModbusError::ConnectTimeout
+    ));
+    assert!(!conn.is_connected().await);
+}
+
+#[tokio::test]
+async fn connect_is_idempotent_while_already_connected() {
+    let addr = spawn_mock_server(|mut stream| async move {
+        // Keep the connection open so the second connect observes the live socket.
+        let mut buf = [0u8; 16];
+        let _ = stream.read(&mut buf).await;
+    })
+    .await;
+
+    let conn = ModbusTcpConnection::new(addr.ip(), addr.port(), 1, 0);
+    conn.connect().await.unwrap();
+    // The second connect must take the already-connected fast path and stay open.
+    conn.connect().await.unwrap();
+
+    assert!(conn.is_connected().await);
+}
