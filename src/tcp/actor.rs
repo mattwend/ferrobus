@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::net::IpAddr;
+use std::sync::Arc;
 
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
@@ -157,7 +158,7 @@ impl Actor {
                     item = Self::next_frame(self.framed.as_mut()) => match item {
                         Some(Ok(frame)) => self.route_frame(frame),
                         Some(Err(error)) => self.teardown(Some(read_error_from_stream(error))),
-                        None => self.teardown(Some(ModbusError::ReadError(io::Error::new(io::ErrorKind::UnexpectedEof, "peer closed connection")))),
+                        None => self.teardown(Some(ModbusError::ReadError(Arc::new(io::Error::new(io::ErrorKind::UnexpectedEof, "peer closed connection"))))),
                     },
                     () = async {
                         if let Some(deadline) = deadline { sleep_until(deadline).await; }
@@ -272,10 +273,10 @@ impl Actor {
             warn!(tid, "request reached actor without an open connection");
             notify_waiter(
                 reply,
-                Err(ModbusError::ReadError(io::Error::new(
+                Err(ModbusError::ReadError(Arc::new(io::Error::new(
                     io::ErrorKind::NotConnected,
                     "connection not open",
-                ))),
+                )))),
             );
             return;
         };
@@ -366,7 +367,7 @@ impl Actor {
         }
         let error = reason.unwrap_or_else(default_teardown_error);
         for (_, entry) in self.pending.drain() {
-            notify_waiter(entry.reply, Err(clone_error_for_waiter(&error)));
+            notify_waiter(entry.reply, Err(error.clone()));
         }
     }
 }
@@ -377,10 +378,10 @@ impl Actor {
 ///
 /// A connection-aborted read error describing the closed connection.
 fn default_teardown_error() -> ModbusError {
-    ModbusError::ReadError(io::Error::new(
+    ModbusError::ReadError(Arc::new(io::Error::new(
         io::ErrorKind::ConnectionAborted,
         "connection closed",
-    ))
+    )))
 }
 
 /// Delivers a value to a oneshot waiter, tracing when the receiver has already been dropped.
@@ -410,11 +411,10 @@ fn notify_waiter<T>(reply: oneshot::Sender<T>, value: T) {
 /// A `WriteError` preserving I/O details when possible.
 fn write_error_from_sink(error: MbapCodecError) -> ModbusError {
     match error {
-        MbapCodecError::Io(error) | MbapCodecError::Modbus(ModbusError::WriteError(error)) => {
-            ModbusError::WriteError(error)
-        }
+        MbapCodecError::Io(error) => ModbusError::WriteError(Arc::new(error)),
+        MbapCodecError::Modbus(ModbusError::WriteError(error)) => ModbusError::WriteError(error),
         MbapCodecError::Modbus(other) => {
-            ModbusError::WriteError(io::Error::other(other.to_string()))
+            ModbusError::WriteError(Arc::new(io::Error::other(other.to_string())))
         }
     }
 }
@@ -430,70 +430,8 @@ fn write_error_from_sink(error: MbapCodecError) -> ModbusError {
 /// A read error for socket I/O failures, or the original Modbus protocol error.
 fn read_error_from_stream(error: MbapCodecError) -> ModbusError {
     match error {
-        MbapCodecError::Io(error) => ModbusError::ReadError(error),
+        MbapCodecError::Io(error) => ModbusError::ReadError(Arc::new(error)),
         MbapCodecError::Modbus(error) => error,
-    }
-}
-
-/// Clones a transport error for delivery to an independent pending waiter.
-///
-/// # Arguments
-///
-/// * `error` - Source error that cannot be cloned directly because it may contain `io::Error`.
-///
-/// # Returns
-///
-/// A semantically equivalent `ModbusError` with copied I/O error information.
-fn clone_error_for_waiter(error: &ModbusError) -> ModbusError {
-    match error {
-        ModbusError::ConnectError(error) => ModbusError::ConnectError(copy_io_error(error)),
-        ModbusError::ConnectTimeout => ModbusError::ConnectTimeout,
-        ModbusError::WriteError(error) => ModbusError::WriteError(copy_io_error(error)),
-        ModbusError::WriteTimeout => ModbusError::WriteTimeout,
-        ModbusError::ReadError(error) => ModbusError::ReadError(copy_io_error(error)),
-        ModbusError::ReadTimeout => ModbusError::ReadTimeout,
-        ModbusError::MalformedResponse(message) => ModbusError::MalformedResponse(message.clone()),
-        ModbusError::DeserializationError(message) => {
-            ModbusError::DeserializationError(message.clone())
-        }
-        ModbusError::ExceptionResponse { function, code } => ModbusError::ExceptionResponse {
-            function: *function,
-            code: *code,
-        },
-        ModbusError::TransactionIdMismatch { expected, actual } => {
-            ModbusError::TransactionIdMismatch {
-                expected: *expected,
-                actual: *actual,
-            }
-        }
-        ModbusError::ProtocolIdMismatch { actual } => {
-            ModbusError::ProtocolIdMismatch { actual: *actual }
-        }
-        ModbusError::NoFreeTransactionId => ModbusError::NoFreeTransactionId,
-        ModbusError::UnitIdMismatch { expected, actual } => ModbusError::UnitIdMismatch {
-            expected: *expected,
-            actual: *actual,
-        },
-        ModbusError::RequestResponseMismatch(message) => {
-            ModbusError::RequestResponseMismatch(message.clone())
-        }
-        ModbusError::ValidationError(message) => ModbusError::ValidationError(message.clone()),
-    }
-}
-
-/// Copies an `io::Error` kind and message into a new error value.
-///
-/// # Arguments
-///
-/// * `error` - I/O error to duplicate for another owner.
-///
-/// # Returns
-///
-/// A new `io::Error` with the same kind and string representation.
-fn copy_io_error(error: &io::Error) -> io::Error {
-    match error.kind() {
-        io::ErrorKind::Other => io::Error::other(error.to_string()),
-        kind => io::Error::new(kind, error.to_string()),
     }
 }
 
@@ -571,65 +509,6 @@ mod tests {
             result,
             Err(ModbusError::MalformedResponse(message)) if message == "invalid MBAP length"
         ));
-    }
-
-    #[test]
-    fn clone_error_for_waiter_accounts_for_every_error_variant() {
-        let errors = vec![
-            ModbusError::ConnectError(io::Error::new(io::ErrorKind::ConnectionRefused, "connect")),
-            ModbusError::ConnectTimeout,
-            ModbusError::WriteError(io::Error::new(io::ErrorKind::BrokenPipe, "write")),
-            ModbusError::WriteTimeout,
-            ModbusError::ReadError(io::Error::new(io::ErrorKind::UnexpectedEof, "read")),
-            ModbusError::ReadTimeout,
-            ModbusError::MalformedResponse("malformed".to_string()),
-            ModbusError::DeserializationError("decode".to_string()),
-            ModbusError::ExceptionResponse {
-                function: 0x81,
-                code: 0x02,
-            },
-            ModbusError::TransactionIdMismatch {
-                expected: 1,
-                actual: 2,
-            },
-            ModbusError::ProtocolIdMismatch { actual: 1 },
-            ModbusError::NoFreeTransactionId,
-            ModbusError::UnitIdMismatch {
-                expected: 1,
-                actual: 2,
-            },
-            ModbusError::RequestResponseMismatch("mismatch".to_string()),
-            ModbusError::ValidationError("invalid".to_string()),
-        ];
-
-        for error in &errors {
-            let cloned = clone_error_for_waiter(error);
-            assert_same_error_variant(error, &cloned);
-        }
-    }
-
-    fn assert_same_error_variant(left: &ModbusError, right: &ModbusError) {
-        assert_eq!(error_variant_name(left), error_variant_name(right));
-    }
-
-    fn error_variant_name(error: &ModbusError) -> &'static str {
-        match error {
-            ModbusError::ConnectError(_) => "ConnectError",
-            ModbusError::ConnectTimeout => "ConnectTimeout",
-            ModbusError::WriteError(_) => "WriteError",
-            ModbusError::WriteTimeout => "WriteTimeout",
-            ModbusError::ReadError(_) => "ReadError",
-            ModbusError::ReadTimeout => "ReadTimeout",
-            ModbusError::MalformedResponse(_) => "MalformedResponse",
-            ModbusError::DeserializationError(_) => "DeserializationError",
-            ModbusError::ExceptionResponse { .. } => "ExceptionResponse",
-            ModbusError::TransactionIdMismatch { .. } => "TransactionIdMismatch",
-            ModbusError::ProtocolIdMismatch { .. } => "ProtocolIdMismatch",
-            ModbusError::NoFreeTransactionId => "NoFreeTransactionId",
-            ModbusError::UnitIdMismatch { .. } => "UnitIdMismatch",
-            ModbusError::RequestResponseMismatch(_) => "RequestResponseMismatch",
-            ModbusError::ValidationError(_) => "ValidationError",
-        }
     }
 
     #[test]
@@ -806,7 +685,7 @@ mod tests {
     #[test]
     fn sink_modbus_write_error_is_preserved_as_write_error() {
         let error = write_error_from_sink(MbapCodecError::Modbus(ModbusError::WriteError(
-            io::Error::new(io::ErrorKind::BrokenPipe, "broken pipe"),
+            Arc::new(io::Error::new(io::ErrorKind::BrokenPipe, "broken pipe")),
         )));
 
         assert!(matches!(
@@ -823,18 +702,6 @@ mod tests {
         )));
 
         assert!(matches!(error, ModbusError::WriteError(_)));
-    }
-
-    /// Cloning an error backed by an `io::Error` of kind `Other` must keep that kind.
-    #[test]
-    fn clone_error_for_waiter_preserves_other_io_kind() {
-        let cloned =
-            clone_error_for_waiter(&ModbusError::WriteError(io::Error::other("custom failure")));
-
-        assert!(matches!(
-            cloned,
-            ModbusError::WriteError(error) if error.kind() == io::ErrorKind::Other
-        ));
     }
 
     fn connected_actor_with_stream(stream: TcpStream) -> (Actor, watch::Receiver<bool>) {
