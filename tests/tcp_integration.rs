@@ -60,6 +60,7 @@ fn fast_retry(max_elapsed: Duration, max_times: Option<usize>) -> ModbusTcpRetry
         max_elapsed,
         max_times,
         jitter: false,
+        retry_gateway_busy: true,
     }
 }
 
@@ -524,7 +525,7 @@ async fn send_message_returns_read_timeout_from_slow_server() {
         ModbusTcpTimeouts {
             connect_timeout: Duration::from_millis(50),
             write_timeout: Duration::from_millis(50),
-            read_timeout: Duration::from_millis(25),
+            response_timeout: Duration::from_millis(25),
         },
     )
     .with_retry(None);
@@ -600,7 +601,7 @@ async fn reader_death_drains_pending_and_next_call_reconnects() {
         ModbusTcpTimeouts {
             connect_timeout: Duration::from_millis(100),
             write_timeout: Duration::from_millis(100),
-            read_timeout: Duration::from_millis(25),
+            response_timeout: Duration::from_millis(25),
         },
     );
     let request = ModbusRequest::ReadCoils {
@@ -651,7 +652,7 @@ async fn caller_future_cancellation_does_not_break_following_requests() {
         ModbusTcpTimeouts {
             connect_timeout: Duration::from_secs(1),
             write_timeout: Duration::from_secs(1),
-            read_timeout: Duration::from_secs(1),
+            response_timeout: Duration::from_secs(1),
         },
     );
 
@@ -833,7 +834,7 @@ async fn first_request_lazily_connects_and_reports_connect_failure() {
     let timeouts = ModbusTcpTimeouts {
         connect_timeout: Duration::from_millis(50),
         write_timeout: Duration::from_millis(50),
-        read_timeout: Duration::from_millis(200),
+        response_timeout: Duration::from_millis(200),
     };
     let conn =
         ModbusTcpConnection::with_timeouts(addr.ip(), addr.port(), 1, 0, timeouts).with_retry(None);
