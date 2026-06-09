@@ -11,10 +11,11 @@ use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
-use tokio::time::{Instant, timeout, timeout_at};
+use tokio::time::timeout;
 use tracing::debug;
 
-use crate::tcp::actor::{Actor, COMMAND_CHANNEL_CAPACITY, Command};
+use crate::tcp::actor::{Actor, ControlCommand, RequestCommand, control_channel_capacity};
+use crate::tcp::flow::ModbusTcpFlowControl;
 use crate::tcp::frame::MBAP_HEADER_LEN;
 use crate::tcp::retry::{ModbusTcpRetry, retry_transient};
 use crate::tcp::timeouts::ModbusTcpTimeouts;
@@ -25,16 +26,16 @@ use crate::{ModbusRequest, ModbusResponse, error::ModbusError};
 /// Clones are lightweight command senders to a single background actor that owns
 /// the TCP socket, pending response map, and transaction-id counter. The actor
 /// connects lazily on the first warm-up or request, reconnects after transport
-/// teardown, and applies bounded channel backpressure under burst load. The
-/// caller-facing read timeout deadline starts before the request enters the
-/// actor, so it bounds queue wait, write, and response wait time together while
-/// the actor remains the single owner of timeout enforcement and socket teardown.
+/// teardown, applies bounded in-flight flow control, and uses a bounded request
+/// channel as backpressure. Queue wait is bounded by flow-control settings;
+/// response timeout starts when the actor writes the request on the socket.
 #[derive(Clone, Debug)]
 pub struct ModbusTcpConnection {
-    tx: mpsc::Sender<Command>,
+    req_tx: mpsc::Sender<RequestCommand>,
+    ctrl_tx: mpsc::Sender<ControlCommand>,
     unit_id: u8,
     connected: watch::Receiver<bool>,
-    read_timeout: Duration,
+    queue_timeout: Duration,
     retry: Option<ModbusTcpRetry>,
 }
 
@@ -60,9 +61,81 @@ impl ModbusTcpConnection {
         transaction_id: u16,
         timeouts: ModbusTcpTimeouts,
     ) -> Self {
-        Self::spawn_with_timeouts(address, port, unit_id, transaction_id, timeouts).0
+        Self::with_config(
+            address,
+            port,
+            unit_id,
+            transaction_id,
+            timeouts,
+            ModbusTcpFlowControl::default(),
+        )
     }
 
+    /// Creates a connection handle with explicit timeout and flow-control settings.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `flow_control` violates [`ModbusTcpFlowControl::validate`].
+    #[must_use]
+    #[allow(clippy::expect_used)]
+    pub fn with_config(
+        address: IpAddr,
+        port: u16,
+        unit_id: u8,
+        transaction_id: u16,
+        timeouts: ModbusTcpTimeouts,
+        flow_control: ModbusTcpFlowControl,
+    ) -> Self {
+        flow_control
+            .validate()
+            .expect("invalid Modbus TCP flow-control configuration");
+        Self::spawn_with_config(
+            address,
+            port,
+            unit_id,
+            transaction_id,
+            timeouts,
+            flow_control,
+        )
+        .0
+    }
+
+    fn spawn_with_config(
+        address: IpAddr,
+        port: u16,
+        unit_id: u8,
+        transaction_id: u16,
+        timeouts: ModbusTcpTimeouts,
+        flow_control: ModbusTcpFlowControl,
+    ) -> (Self, JoinHandle<()>) {
+        let (req_tx, req_rx) = mpsc::channel(flow_control.max_queue_depth);
+        let (ctrl_tx, ctrl_rx) = mpsc::channel(control_channel_capacity());
+        let (connected_tx, connected) = watch::channel(false);
+        let actor = Actor::new(
+            address,
+            port,
+            timeouts,
+            flow_control,
+            transaction_id,
+            ctrl_rx,
+            req_rx,
+            connected_tx,
+        );
+        let actor_task = tokio::spawn(actor.run());
+        (
+            Self {
+                req_tx,
+                ctrl_tx,
+                unit_id,
+                connected,
+                queue_timeout: flow_control.queue_timeout,
+                retry: Some(ModbusTcpRetry::default()),
+            },
+            actor_task,
+        )
+    }
+
+    #[cfg(test)]
     fn spawn_with_timeouts(
         address: IpAddr,
         port: u16,
@@ -70,19 +143,13 @@ impl ModbusTcpConnection {
         transaction_id: u16,
         timeouts: ModbusTcpTimeouts,
     ) -> (Self, JoinHandle<()>) {
-        let (tx, rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
-        let (connected_tx, connected) = watch::channel(false);
-        let actor = Actor::new(address, port, timeouts, transaction_id, rx, connected_tx);
-        let actor_task = tokio::spawn(actor.run());
-        (
-            Self {
-                tx,
-                unit_id,
-                connected,
-                read_timeout: timeouts.read_timeout,
-                retry: Some(ModbusTcpRetry::default()),
-            },
-            actor_task,
+        Self::spawn_with_config(
+            address,
+            port,
+            unit_id,
+            transaction_id,
+            timeouts,
+            ModbusTcpFlowControl::default(),
         )
     }
 
@@ -97,10 +164,11 @@ impl ModbusTcpConnection {
     #[must_use]
     pub fn with_unit_id(&self, unit_id: u8) -> Self {
         Self {
-            tx: self.tx.clone(),
+            req_tx: self.req_tx.clone(),
+            ctrl_tx: self.ctrl_tx.clone(),
             unit_id,
             connected: self.connected.clone(),
-            read_timeout: self.read_timeout,
+            queue_timeout: self.queue_timeout,
             retry: self.retry,
         }
     }
@@ -126,8 +194,8 @@ impl ModbusTcpConnection {
     /// Returns connect or transport errors reported by the actor.
     pub async fn connect(&self) -> Result<(), ModbusError> {
         let (ack, reply) = oneshot::channel();
-        self.tx
-            .send(Command::Connect { ack })
+        self.ctrl_tx
+            .send(ControlCommand::Connect { ack })
             .await
             .map_err(|_| actor_terminated_error())?;
         reply.await.map_err(|_| actor_terminated_error())?
@@ -140,7 +208,7 @@ impl ModbusTcpConnection {
     /// another handle reconnects afterward.
     pub async fn disconnect(&self) {
         let (ack, processed) = oneshot::channel();
-        if let Err(error) = self.tx.send(Command::Disconnect { ack }).await {
+        if let Err(error) = self.ctrl_tx.send(ControlCommand::Disconnect { ack }).await {
             debug!(%error, "connection actor already stopped during disconnect");
             return;
         }
@@ -160,20 +228,17 @@ impl ModbusTcpConnection {
         unit_id: u8,
         pdu: &ModbusRequest,
     ) -> Result<ModbusResponse, ModbusError> {
-        let deadline = Instant::now() + self.read_timeout;
         let (reply, response) = oneshot::channel();
-        let command = Command::Request {
+        let command = RequestCommand {
             unit_id,
             pdu: pdu.clone(),
             reply,
-            deadline,
+            queue_deadline: tokio::time::Instant::now() + self.queue_timeout,
         };
-        match timeout_at(deadline, self.tx.send(command)).await {
-            Ok(Ok(())) => {}
-            // defensive: actor death races are non-deterministic in normal operation.
-            Ok(Err(_)) => return Err(actor_terminated_error()),
-            Err(_) => return Err(ModbusError::ReadTimeout),
-        }
+        self.req_tx
+            .send(command)
+            .await
+            .map_err(|_| actor_terminated_error())?;
 
         let response_buffer = match response.await {
             Ok(Ok(frame)) => frame,
@@ -343,42 +408,58 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_once_bounds_wait_for_full_command_channel() {
-        let (tx, _rx) = mpsc::channel(1);
-        let (connected_tx, connected) = watch::channel(false);
-        let (ack, _processed) = oneshot::channel();
-        tx.try_send(Command::Disconnect { ack }).unwrap();
-        drop(connected_tx);
+    async fn send_once_backpressures_on_full_request_channel() {
+        let (req_tx, _req_rx) = mpsc::channel(1);
+        let (ctrl_tx, _ctrl_rx) = mpsc::channel(1);
+        let (_connected_tx, connected) = watch::channel(false);
+        let (reply, _response) = oneshot::channel();
+        req_tx
+            .try_send(RequestCommand {
+                unit_id: 1,
+                pdu: ModbusRequest::ReadHoldingRegisters {
+                    starting_address: 0,
+                    quantity: 1,
+                },
+                reply,
+                queue_deadline: tokio::time::Instant::now() + Duration::from_secs(1),
+            })
+            .unwrap();
         let connection = ModbusTcpConnection {
-            tx,
+            req_tx,
+            ctrl_tx,
             unit_id: 1,
             connected,
-            read_timeout: Duration::from_millis(10),
+            queue_timeout: Duration::from_millis(10),
             retry: None,
         };
 
-        let result = connection
-            .send_once(
+        let result = timeout(
+            Duration::from_millis(10),
+            connection.send_once(
                 1,
                 &ModbusRequest::ReadHoldingRegisters {
                     starting_address: 0,
                     quantity: 1,
                 },
-            )
-            .await;
+            ),
+        )
+        .await;
 
-        assert!(matches!(result, Err(ModbusError::ReadTimeout)));
+        assert!(result.is_err());
     }
 
     fn handle_with_dead_actor() -> ModbusTcpConnection {
-        let (tx, rx) = mpsc::channel(1);
+        let (req_tx, req_rx) = mpsc::channel(1);
+        let (ctrl_tx, ctrl_rx) = mpsc::channel(1);
         let (_connected_tx, connected) = watch::channel(false);
-        drop(rx);
+        drop(req_rx);
+        drop(ctrl_rx);
         ModbusTcpConnection {
-            tx,
+            req_tx,
+            ctrl_tx,
             unit_id: 1,
             connected,
-            read_timeout: Duration::from_millis(50),
+            queue_timeout: Duration::from_millis(50),
             retry: None,
         }
     }
@@ -420,17 +501,19 @@ mod tests {
     /// public disconnect call must return after logging the terminated actor.
     #[tokio::test]
     async fn disconnect_returns_when_actor_drops_ack() {
-        let (tx, mut rx) = mpsc::channel(1);
+        let (req_tx, _req_rx) = mpsc::channel(1);
+        let (ctrl_tx, mut ctrl_rx) = mpsc::channel(1);
         let (_connected_tx, connected) = watch::channel(false);
         let connection = ModbusTcpConnection {
-            tx,
+            req_tx,
+            ctrl_tx,
             unit_id: 1,
             connected,
-            read_timeout: Duration::from_millis(50),
+            queue_timeout: Duration::from_millis(50),
             retry: None,
         };
         tokio::spawn(async move {
-            if let Some(Command::Disconnect { ack }) = rx.recv().await {
+            if let Some(ControlCommand::Disconnect { ack }) = ctrl_rx.recv().await {
                 drop(ack);
             }
         });
@@ -442,17 +525,19 @@ mod tests {
     /// a terminated-actor transport error.
     #[tokio::test]
     async fn send_once_reports_dropped_response_waiter() {
-        let (tx, mut rx) = mpsc::channel(1);
+        let (req_tx, mut req_rx) = mpsc::channel(1);
+        let (ctrl_tx, _ctrl_rx) = mpsc::channel(1);
         let (_connected_tx, connected) = watch::channel(false);
         let connection = ModbusTcpConnection {
-            tx,
+            req_tx,
+            ctrl_tx,
             unit_id: 1,
             connected,
-            read_timeout: Duration::from_millis(50),
+            queue_timeout: Duration::from_millis(50),
             retry: None,
         };
         tokio::spawn(async move {
-            if let Some(Command::Request { reply, .. }) = rx.recv().await {
+            if let Some(RequestCommand { reply, .. }) = req_rx.recv().await {
                 drop(reply);
             }
         });
@@ -481,7 +566,7 @@ mod tests {
         let timeouts = ModbusTcpTimeouts {
             connect_timeout: Duration::from_millis(50),
             write_timeout: Duration::from_millis(50),
-            read_timeout: Duration::from_millis(50),
+            response_timeout: Duration::from_millis(50),
         };
         let connection = ModbusTcpConnection::with_timeouts(addr.ip(), addr.port(), 1, 0, timeouts)
             .with_retry(None);
