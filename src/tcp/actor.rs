@@ -8,7 +8,7 @@ use std::io;
 use std::net::IpAddr;
 use std::sync::Arc;
 
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{SinkExt, StreamExt, future::poll_fn};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::{Instant, sleep_until, timeout};
@@ -116,11 +116,6 @@ impl Actor {
                 return;
             }
 
-            if let Some(tid) = self.cancelled_tid() {
-                self.cancel_in_flight(tid);
-                continue;
-            }
-
             let next_wake = self.earliest_wake();
             let window_has_room = self.pending.len() < self.flow.max_in_flight && !self.req_closed;
 
@@ -145,6 +140,7 @@ impl Actor {
                     Some(Err(error)) => self.teardown(Some(read_error_from_stream(error))),
                     None => self.teardown(Some(ModbusError::ReadError(Arc::new(io::Error::new(io::ErrorKind::UnexpectedEof, "peer closed connection"))))),
                 },
+                tid = Self::next_cancelled_tid(&mut self.pending), if !self.pending.is_empty() => self.cancel_in_flight(tid),
                 () = async { if let Some(deadline) = next_wake { sleep_until(deadline).await; } }, if next_wake.is_some() => self.handle_deadlines(),
             }
         }
@@ -157,6 +153,16 @@ impl Actor {
             Some(framed) => framed.next().await,
             None => None,
         }
+    }
+
+    async fn next_cancelled_tid(pending: &mut HashMap<u16, PendingEntry>) -> u16 {
+        poll_fn(|cx| {
+            pending
+                .iter_mut()
+                .find_map(|(tid, entry)| entry.reply.poll_closed(cx).is_ready().then_some(*tid))
+                .map_or(std::task::Poll::Pending, std::task::Poll::Ready)
+        })
+        .await
     }
 
     async fn ensure_connected(&mut self) -> Result<(), ModbusError> {
@@ -286,27 +292,15 @@ impl Actor {
     }
 
     fn earliest_wake(&self) -> Option<Instant> {
-        let deadline = self
-            .pending
+        self.pending
             .values()
             .map(|entry| entry.response_deadline)
             .chain(self.quarantined.values().copied())
-            .min();
-        let cancellation_poll = (!self.pending.is_empty())
-            .then(|| Instant::now() + std::time::Duration::from_millis(10));
-        deadline.into_iter().chain(cancellation_poll).min()
+            .min()
     }
 
     fn handle_deadlines(&mut self) {
         let now = Instant::now();
-        let cancelled: Vec<u16> = self
-            .pending
-            .iter()
-            .filter_map(|(tid, entry)| entry.reply.is_closed().then_some(*tid))
-            .collect();
-        for tid in cancelled {
-            self.cancel_in_flight(tid);
-        }
         let expired: Vec<u16> = self
             .pending
             .iter()
@@ -325,12 +319,6 @@ impl Actor {
         let now = Instant::now();
         self.quarantined
             .retain(|_, reclaim_after| *reclaim_after > now);
-    }
-
-    fn cancelled_tid(&self) -> Option<u16> {
-        self.pending
-            .iter()
-            .find_map(|(tid, entry)| entry.reply.is_closed().then_some(*tid))
     }
 
     fn cancel_in_flight(&mut self, tid: u16) {
