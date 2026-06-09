@@ -812,6 +812,70 @@ async fn one_timed_out_tid_is_quarantined_while_sibling_and_socket_survive() {
 }
 
 #[tokio::test]
+async fn gateway_busy_exception_retries_when_enabled() {
+    let addr = spawn_mock_server(|mut stream| async move {
+        let first = read_request_frame(&mut stream).await.unwrap();
+        let busy =
+            build_exception_response_frame(first.transaction_id, first.unit_id, first.pdu[0], 0x0B);
+        stream.write_all(&busy).await.unwrap();
+
+        let second = read_request_frame(&mut stream).await.unwrap();
+        let response = make_read_coils_response(second.transaction_id, second.unit_id, &[true]);
+        stream.write_all(&response).await.unwrap();
+    })
+    .await;
+
+    let conn = ModbusTcpConnection::new(addr.ip(), addr.port(), 1, 0)
+        .with_retry(Some(fast_retry(Duration::from_millis(500), None)));
+    let request = ModbusRequest::ReadCoils {
+        starting_address: 0,
+        quantity: 1,
+    };
+
+    let response = conn.send_message(&request).await.unwrap();
+
+    assert_eq!(response, ModbusResponse::ReadCoils { coils: vec![true] });
+}
+
+#[tokio::test]
+async fn gateway_busy_exception_does_not_retry_when_disabled() {
+    let requests = Arc::new(AtomicU8::new(0));
+    let addr = spawn_mock_server({
+        let requests = Arc::clone(&requests);
+        move |mut stream| async move {
+            let request = read_request_frame(&mut stream).await.unwrap();
+            requests.fetch_add(1, Ordering::SeqCst);
+            let busy = build_exception_response_frame(
+                request.transaction_id,
+                request.unit_id,
+                request.pdu[0],
+                0x0B,
+            );
+            stream.write_all(&busy).await.unwrap();
+        }
+    })
+    .await;
+
+    let conn =
+        ModbusTcpConnection::new(addr.ip(), addr.port(), 1, 0).with_retry(Some(ModbusTcpRetry {
+            retry_gateway_busy: false,
+            ..fast_retry(Duration::from_millis(500), None)
+        }));
+    let request = ModbusRequest::ReadCoils {
+        starting_address: 0,
+        quantity: 1,
+    };
+
+    let error = conn.send_message(&request).await.unwrap_err();
+
+    assert!(matches!(
+        error,
+        ModbusError::ExceptionResponse { code: 0x0B, .. }
+    ));
+    assert_eq!(requests.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn send_message_with_disabled_retry_does_not_retry() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

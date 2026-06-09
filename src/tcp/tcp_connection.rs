@@ -76,6 +76,9 @@ impl ModbusTcpConnection {
     /// # Panics
     ///
     /// Panics if `flow_control` violates [`ModbusTcpFlowControl::validate`].
+    /// Flow control is validated synchronously because its queue depth is needed
+    /// before the actor task and request channel are spawned; retry policies are
+    /// validated later when a request starts.
     #[must_use]
     #[allow(clippy::expect_used)]
     pub fn with_config(
