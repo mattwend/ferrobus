@@ -11,11 +11,13 @@
 mod actor;
 mod adu;
 mod codec;
+mod flow;
 mod frame;
 mod retry;
 mod timeouts;
 
 mod tcp_connection;
+pub use flow::ModbusTcpFlowControl;
 pub use retry::ModbusTcpRetry;
 pub use tcp_connection::ModbusTcpConnection;
 pub use timeouts::ModbusTcpTimeouts;

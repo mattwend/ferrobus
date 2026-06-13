@@ -7,7 +7,7 @@ use std::time::Duration;
 
 pub(crate) const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const DEFAULT_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
-pub(crate) const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const DEFAULT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Per-operation time limits used by [`crate::tcp::ModbusTcpConnection`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -16,8 +16,8 @@ pub struct ModbusTcpTimeouts {
     pub connect_timeout: Duration,
     /// Maximum time allowed to write one Modbus TCP frame.
     pub write_timeout: Duration,
-    /// Maximum time allowed to read one Modbus TCP response.
-    pub read_timeout: Duration,
+    /// Maximum time allowed to receive one Modbus TCP response after its frame is written.
+    pub response_timeout: Duration,
 }
 
 impl Default for ModbusTcpTimeouts {
@@ -25,7 +25,7 @@ impl Default for ModbusTcpTimeouts {
         Self {
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             write_timeout: DEFAULT_WRITE_TIMEOUT,
-            read_timeout: DEFAULT_READ_TIMEOUT,
+            response_timeout: DEFAULT_RESPONSE_TIMEOUT,
         }
     }
 }
@@ -41,6 +41,6 @@ mod tests {
 
         assert_eq!(timeouts.connect_timeout, Duration::from_secs(5));
         assert_eq!(timeouts.write_timeout, Duration::from_secs(5));
-        assert_eq!(timeouts.read_timeout, Duration::from_secs(5));
+        assert_eq!(timeouts.response_timeout, Duration::from_secs(5));
     }
 }
