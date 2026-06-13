@@ -38,6 +38,10 @@ pub enum ModbusError {
     #[error("TCP read timed out")]
     ReadTimeout,
 
+    /// A request waited longer than the configured queue timeout before reaching the wire.
+    #[error("Modbus request queue timed out")]
+    QueueTimeout,
+
     /// A Modbus TCP response frame was structurally invalid.
     #[error("Malformed response: {0}")]
     MalformedResponse(String),
@@ -115,7 +119,35 @@ impl ModbusError {
                 | Self::WriteTimeout
                 | Self::ReadError(_)
                 | Self::ReadTimeout
+                | Self::QueueTimeout
                 | Self::MalformedResponse(_)
         )
+    }
+
+    /// Returns true for Modbus exception codes that indicate temporary gateway/slave busy states.
+    #[must_use]
+    pub fn is_gateway_busy(&self) -> bool {
+        matches!(
+            self,
+            Self::ExceptionResponse { code, .. } if matches!(code, 0x05 | 0x06 | 0x0A | 0x0B)
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gateway_busy_exception_codes_are_classified() {
+        for code in [0x05, 0x06, 0x0A, 0x0B] {
+            assert!(ModbusError::ExceptionResponse { function: 0x83, code }.is_gateway_busy());
+        }
+        assert!(!ModbusError::ExceptionResponse { function: 0x83, code: 0x02 }.is_gateway_busy());
+    }
+
+    #[test]
+    fn queue_timeout_is_transient() {
+        assert!(ModbusError::QueueTimeout.is_transient());
     }
 }

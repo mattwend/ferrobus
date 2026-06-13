@@ -24,10 +24,11 @@ use crate::error::ModbusError;
 ///
 /// # Retried errors
 ///
-/// Only errors classified as transient by [`ModbusError::is_transient`] are
-/// retried. Invalid retry configuration, request validation failures, protocol
-/// mismatches, Modbus exception responses, and request/response mismatches are
-/// returned immediately.
+/// Errors classified as transient by [`ModbusError::is_transient`] are retried.
+/// Gateway/slave-busy Modbus exception responses are also retried when
+/// [`Self::retry_gateway_busy`] is enabled. Invalid retry configuration, request
+/// validation failures, protocol mismatches, non-busy Modbus exception responses,
+/// and request/response mismatches are returned immediately.
 ///
 /// # Validation
 ///
@@ -60,6 +61,8 @@ pub struct ModbusTcpRetry {
     pub max_times: Option<usize>,
     /// Whether to add jitter to retry sleeps.
     pub jitter: bool,
+    /// Whether Modbus gateway/slave busy exception responses should be retried.
+    pub retry_gateway_busy: bool,
 }
 
 impl ModbusTcpRetry {
@@ -149,7 +152,9 @@ where
 {
     operation
         .retry(retry.to_backoff()?)
-        .when(ModbusError::is_transient)
+        .when(move |error: &ModbusError| {
+            error.is_transient() || (retry.retry_gateway_busy && error.is_gateway_busy())
+        })
         .await
 }
 
@@ -162,6 +167,7 @@ impl Default for ModbusTcpRetry {
             max_elapsed: Duration::from_secs(2),
             max_times: None,
             jitter: true,
+            retry_gateway_busy: true,
         }
     }
 }
@@ -190,6 +196,7 @@ mod tests {
         assert_eq!(retry.max_elapsed, Duration::from_secs(2));
         assert_eq!(retry.max_times, None);
         assert!(retry.jitter);
+        assert!(retry.retry_gateway_busy);
     }
 
     #[test]
