@@ -19,10 +19,10 @@ Small Rust Modbus library with typed request/response PDUs and a reusable Modbus
   - write multiple registers
 - Modbus TCP transport with:
   - lazy connect or explicit `connect()`
-  - reusable actor-owned connections with bounded command-channel backpressure
-  - concurrent in-flight requests across cloned handles on one socket
-  - retry of transient I/O failures
-  - per-phase timeouts for connect, write, and read
+  - reusable actor-owned connections with bounded request-channel backpressure
+  - configurable in-flight window for slow gateway-backed buses
+  - retry of transient I/O failures and gateway-busy exception responses
+  - per-phase timeouts for connect, write, queue wait, and on-wire response wait
   - request/response validation for transaction ID, protocol ID, unit ID, and echoed payloads
 - Support for talking to multiple unit IDs through one Modbus TCP connection handle
 - Optional CLI example behind the `cli` feature
@@ -94,9 +94,9 @@ construct the connection with `with_timeouts(...)`.
 use std::net::{IpAddr, Ipv4Addr};
 use std::time::Duration;
 
-use tiny_mb::tcp::{ModbusTcpConnection, ModbusTcpRetry, ModbusTcpTimeouts};
+use tiny_mb::tcp::{ModbusTcpConnection, ModbusTcpFlowControl, ModbusTcpRetry, ModbusTcpTimeouts};
 
-let connection = ModbusTcpConnection::with_timeouts(
+let connection = ModbusTcpConnection::with_config(
     IpAddr::V4(Ipv4Addr::LOCALHOST),
     502,
     1,
@@ -104,8 +104,9 @@ let connection = ModbusTcpConnection::with_timeouts(
     ModbusTcpTimeouts {
         connect_timeout: Duration::from_secs(2),
         write_timeout: Duration::from_secs(2),
-        read_timeout: Duration::from_secs(2),
+        response_timeout: Duration::from_secs(2),
     },
+    ModbusTcpFlowControl::serial_gateway(),
 )
 .with_retry(Some(ModbusTcpRetry {
     initial_delay: Duration::from_millis(100),
@@ -114,16 +115,16 @@ let connection = ModbusTcpConnection::with_timeouts(
 }));
 ```
 
-Read timeout enforcement is actor-owned: each handle attaches an absolute `read_timeout`
-deadline when the request command is submitted. The deadline therefore bounds actor queue wait,
-write time, and response wait time; when it expires, the actor completes the waiter
-with `ReadTimeout` and tears down the socket in the same step. Because a timed-out request may
-leave an unread response on the stream, that teardown is connection-wide: other in-flight requests
-on the same socket can observe a transient connection-aborted read error and retry on a fresh
-connection.
+Flow control is actor-owned: `ModbusTcpFlowControl::max_in_flight` caps requests on the wire,
+and `max_queue_depth` is the bounded backlog that applies backpressure to callers. Use
+`ModbusTcpFlowControl::serial_gateway()` for RTU gateways that drain one serial bus sequentially.
+Queue wait is bounded by `queue_timeout`; the `response_timeout` clock starts only after the actor
+successfully writes the frame to the socket. A single response timeout now fails that transaction,
+quarantines its transaction ID to avoid late-response aliasing, and keeps the TCP socket open.
 
-By default, transient TCP connect/write/read failures are retried with exponential backoff starting
-at 500 ms, multiplied by 1.5, with jitter, and bounded only by `max_elapsed` (2 s). Set
+By default, transient TCP connect/write/read/queue failures and gateway-busy exception responses
+(`0x05`, `0x06`, `0x0A`, `0x0B`) are retried with exponential backoff starting at 500 ms,
+multiplied by 1.5, with jitter, and bounded only by `max_elapsed` (2 s). Set
 `max_times` to cap the number of retries as well. To disable same-call retry, pass
 `with_retry(None)`; the first transient error is returned to the caller for that call, but the
 connection state is still invalidated and the next call reconnects lazily.

@@ -89,7 +89,15 @@ impl ModbusTcpConnection {
         flow_control
             .validate()
             .expect("invalid Modbus TCP flow-control configuration");
-        Self::spawn_with_config(address, port, unit_id, transaction_id, timeouts, flow_control).0
+        Self::spawn_with_config(
+            address,
+            port,
+            unit_id,
+            transaction_id,
+            timeouts,
+            flow_control,
+        )
+        .0
     }
 
     fn spawn_with_config(
@@ -135,7 +143,14 @@ impl ModbusTcpConnection {
         transaction_id: u16,
         timeouts: ModbusTcpTimeouts,
     ) -> (Self, JoinHandle<()>) {
-        Self::spawn_with_config(address, port, unit_id, transaction_id, timeouts, ModbusTcpFlowControl::default())
+        Self::spawn_with_config(
+            address,
+            port,
+            unit_id,
+            transaction_id,
+            timeouts,
+            ModbusTcpFlowControl::default(),
+        )
     }
 
     /// Configures the retry policy used for future send operations on this handle.
@@ -398,12 +413,17 @@ mod tests {
         let (ctrl_tx, _ctrl_rx) = mpsc::channel(1);
         let (_connected_tx, connected) = watch::channel(false);
         let (reply, _response) = oneshot::channel();
-        req_tx.try_send(RequestCommand {
-            unit_id: 1,
-            pdu: ModbusRequest::ReadHoldingRegisters { starting_address: 0, quantity: 1 },
-            reply,
-            queue_deadline: tokio::time::Instant::now() + Duration::from_secs(1),
-        }).unwrap();
+        req_tx
+            .try_send(RequestCommand {
+                unit_id: 1,
+                pdu: ModbusRequest::ReadHoldingRegisters {
+                    starting_address: 0,
+                    quantity: 1,
+                },
+                reply,
+                queue_deadline: tokio::time::Instant::now() + Duration::from_secs(1),
+            })
+            .unwrap();
         let connection = ModbusTcpConnection {
             req_tx,
             ctrl_tx,
@@ -413,10 +433,17 @@ mod tests {
             retry: None,
         };
 
-        let result = timeout(Duration::from_millis(10), connection.send_once(
-            1,
-            &ModbusRequest::ReadHoldingRegisters { starting_address: 0, quantity: 1 },
-        )).await;
+        let result = timeout(
+            Duration::from_millis(10),
+            connection.send_once(
+                1,
+                &ModbusRequest::ReadHoldingRegisters {
+                    starting_address: 0,
+                    quantity: 1,
+                },
+            ),
+        )
+        .await;
 
         assert!(result.is_err());
     }

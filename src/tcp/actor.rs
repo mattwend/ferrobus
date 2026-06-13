@@ -8,7 +8,7 @@ use std::io;
 use std::net::IpAddr;
 use std::sync::Arc;
 
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{SinkExt, StreamExt, future::poll_fn};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::{Instant, sleep_until, timeout};
@@ -32,7 +32,9 @@ const MAX_TID_PROBES: usize = u16::MAX as usize + 1;
 #[derive(Debug)]
 pub(crate) enum ControlCommand {
     /// Eagerly connect and acknowledge the result.
-    Connect { ack: oneshot::Sender<Result<(), ModbusError>> },
+    Connect {
+        ack: oneshot::Sender<Result<(), ModbusError>>,
+    },
     /// Drop the current socket and fail pending waiters.
     Disconnect { ack: oneshot::Sender<()> },
 }
@@ -48,7 +50,9 @@ pub(crate) struct RequestCommand {
 }
 
 /// Small control-channel capacity used by connection handles.
-pub(crate) const fn control_channel_capacity() -> usize { CONTROL_CHANNEL_CAPACITY }
+pub(crate) const fn control_channel_capacity() -> usize {
+    CONTROL_CHANNEL_CAPACITY
+}
 
 /// Pending response waiter and timeout metadata for one transaction id.
 #[derive(Debug)]
@@ -108,11 +112,8 @@ impl Actor {
     /// Runs the actor until both command channels are closed and no requests are pending.
     pub(crate) async fn run(mut self) {
         loop {
-            if self.ctrl_closed && self.req_closed && self.pending.is_empty() { return; }
-
-            if let Some(tid) = self.cancelled_tid() {
-                self.cancel_in_flight(tid);
-                continue;
+            if self.ctrl_closed && self.req_closed && self.pending.is_empty() {
+                return;
             }
 
             let next_wake = self.earliest_wake();
@@ -139,6 +140,7 @@ impl Actor {
                     Some(Err(error)) => self.teardown(Some(read_error_from_stream(error))),
                     None => self.teardown(Some(ModbusError::ReadError(Arc::new(io::Error::new(io::ErrorKind::UnexpectedEof, "peer closed connection"))))),
                 },
+                tid = Self::next_cancelled_tid(&mut self.pending), if !self.pending.is_empty() => self.cancel_in_flight(tid),
                 () = async { if let Some(deadline) = next_wake { sleep_until(deadline).await; } }, if next_wake.is_some() => self.handle_deadlines(),
             }
         }
@@ -147,14 +149,36 @@ impl Actor {
     async fn next_frame(
         framed: Option<&mut Framed<TcpStream, MbapCodec>>,
     ) -> Option<Result<Vec<u8>, MbapCodecError>> {
-        match framed { Some(framed) => framed.next().await, None => None }
+        match framed {
+            Some(framed) => framed.next().await,
+            None => None,
+        }
+    }
+
+    async fn next_cancelled_tid(pending: &mut HashMap<u16, PendingEntry>) -> u16 {
+        poll_fn(|cx| {
+            pending
+                .iter_mut()
+                .find_map(|(tid, entry)| entry.reply.poll_closed(cx).is_ready().then_some(*tid))
+                .map_or(std::task::Poll::Pending, std::task::Poll::Ready)
+        })
+        .await
     }
 
     async fn ensure_connected(&mut self) -> Result<(), ModbusError> {
-        if self.framed.is_some() { return Ok(()); }
-        let stream = ModbusTcpConnection::connect_stream(self.address, self.port, self.timeouts.connect_timeout).await?;
+        if self.framed.is_some() {
+            return Ok(());
+        }
+        let stream = ModbusTcpConnection::connect_stream(
+            self.address,
+            self.port,
+            self.timeouts.connect_timeout,
+        )
+        .await?;
         self.framed = Some(Framed::new(stream, MbapCodec));
-        if self.connected_tx.send(true).is_err() { trace!("no connection-state subscribers to notify of connect"); }
+        if self.connected_tx.send(true).is_err() {
+            trace!("no connection-state subscribers to notify of connect");
+        }
         Ok(())
     }
 
@@ -178,25 +202,44 @@ impl Actor {
     }
 
 
+
     async fn write_on_wire(&mut self, cmd: RequestCommand) {
         let tid = match self.allocate_tid() {
             Ok(tid) => tid,
-            Err(error) => { notify_waiter(cmd.reply, Err(error)); return; }
+            Err(error) => {
+                notify_waiter(cmd.reply, Err(error));
+                return;
+            }
         };
         let adu = match build_modbus_tcp_adu(tid, cmd.unit_id, &cmd.pdu) {
             Ok(adu) => adu,
-            Err(error) => { notify_waiter(cmd.reply, Err(error)); return; }
+            Err(error) => {
+                notify_waiter(cmd.reply, Err(error));
+                return;
+            }
         };
         debug!(tid, "Modbus TCP Frame: {:02X?}", adu);
         let Some(framed) = self.framed.as_mut() else {
             warn!(tid, "request reached actor without an open connection");
-            notify_waiter(cmd.reply, Err(ModbusError::ReadError(Arc::new(io::Error::new(io::ErrorKind::NotConnected, "connection not open")))));
+            notify_waiter(
+                cmd.reply,
+                Err(ModbusError::ReadError(Arc::new(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "connection not open",
+                )))),
+            );
             return;
         };
         match timeout(self.timeouts.write_timeout, framed.send(adu)).await {
             Ok(Ok(())) => {
                 let response_deadline = Instant::now() + self.timeouts.response_timeout;
-                self.pending.insert(tid, PendingEntry { reply: cmd.reply, response_deadline });
+                self.pending.insert(
+                    tid,
+                    PendingEntry {
+                        reply: cmd.reply,
+                        response_deadline,
+                    },
+                );
             }
             Ok(Err(error)) => {
                 notify_waiter(cmd.reply, Err(write_error_from_sink(error)));
@@ -241,29 +284,28 @@ impl Actor {
         if let Some(entry) = self.pending.remove(&tid) {
             notify_waiter(entry.reply, Ok(frame));
         } else if self.quarantined.remove(&tid).is_some() {
-            debug!(tid, "discarding late response for quarantined transaction id");
+            debug!(
+                tid,
+                "discarding late response for quarantined transaction id"
+            );
         } else {
             warn!(tid, "ignoring response for unknown transaction id");
         }
     }
 
     fn earliest_wake(&self) -> Option<Instant> {
-        let deadline = self.pending.values().map(|entry| entry.response_deadline)
+        self.pending
+            .values()
+            .map(|entry| entry.response_deadline)
             .chain(self.quarantined.values().copied())
-            .min();
-        let cancellation_poll = (!self.pending.is_empty()).then(|| Instant::now() + std::time::Duration::from_millis(10));
-        deadline.into_iter().chain(cancellation_poll).min()
+            .min()
     }
 
     fn handle_deadlines(&mut self) {
         let now = Instant::now();
-        let cancelled: Vec<u16> = self.pending.iter()
-            .filter_map(|(tid, entry)| entry.reply.is_closed().then_some(*tid))
-            .collect();
-        for tid in cancelled {
-            self.cancel_in_flight(tid);
-        }
-        let expired: Vec<u16> = self.pending.iter()
+        let expired: Vec<u16> = self
+            .pending
+            .iter()
             .filter_map(|(tid, entry)| (entry.response_deadline <= now).then_some(*tid))
             .collect();
         for tid in expired {
@@ -277,22 +319,22 @@ impl Actor {
 
     fn reclaim_quarantine(&mut self) {
         let now = Instant::now();
-        self.quarantined.retain(|_, reclaim_after| *reclaim_after > now);
-    }
-
-    fn cancelled_tid(&self) -> Option<u16> {
-        self.pending.iter().find_map(|(tid, entry)| entry.reply.is_closed().then_some(*tid))
+        self.quarantined
+            .retain(|_, reclaim_after| *reclaim_after > now);
     }
 
     fn cancel_in_flight(&mut self, tid: u16) {
         if self.pending.remove(&tid).is_some() {
-            self.quarantined.insert(tid, Instant::now() + self.flow.quarantine_ttl);
+            self.quarantined
+                .insert(tid, Instant::now() + self.flow.quarantine_ttl);
         }
     }
 
     fn teardown(&mut self, reason: Option<ModbusError>) {
         self.framed = None;
-        if self.connected_tx.send(false).is_err() { trace!("no connection-state subscribers to notify of teardown"); }
+        if self.connected_tx.send(false).is_err() {
+            trace!("no connection-state subscribers to notify of teardown");
+        }
         let error = reason.unwrap_or_else(default_teardown_error);
         for (_, entry) in self.pending.drain() {
             notify_waiter(entry.reply, Err(error.clone()));
@@ -301,23 +343,33 @@ impl Actor {
 }
 
 fn default_teardown_error() -> ModbusError {
-    ModbusError::ReadError(Arc::new(io::Error::new(io::ErrorKind::ConnectionAborted, "connection closed")))
+    ModbusError::ReadError(Arc::new(io::Error::new(
+        io::ErrorKind::ConnectionAborted,
+        "connection closed",
+    )))
 }
 
 fn notify_waiter<T>(reply: oneshot::Sender<T>, value: T) {
-    if reply.send(value).is_err() { trace!("waiter receiver dropped before delivery; discarding response"); }
+    if reply.send(value).is_err() {
+        trace!("waiter receiver dropped before delivery; discarding response");
+    }
 }
 
 fn write_error_from_sink(error: MbapCodecError) -> ModbusError {
     match error {
         MbapCodecError::Io(error) => ModbusError::WriteError(Arc::new(error)),
         MbapCodecError::Modbus(ModbusError::WriteError(error)) => ModbusError::WriteError(error),
-        MbapCodecError::Modbus(other) => ModbusError::WriteError(Arc::new(io::Error::other(other.to_string()))),
+        MbapCodecError::Modbus(other) => {
+            ModbusError::WriteError(Arc::new(io::Error::other(other.to_string())))
+        }
     }
 }
 
 fn read_error_from_stream(error: MbapCodecError) -> ModbusError {
-    match error { MbapCodecError::Io(error) => ModbusError::ReadError(Arc::new(error)), MbapCodecError::Modbus(error) => error }
+    match error {
+        MbapCodecError::Io(error) => ModbusError::ReadError(Arc::new(error)),
+        MbapCodecError::Modbus(error) => error,
+    }
 }
 
 #[cfg(test)]

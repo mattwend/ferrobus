@@ -141,9 +141,21 @@ mod tests {
     #[test]
     fn gateway_busy_exception_codes_are_classified() {
         for code in [0x05, 0x06, 0x0A, 0x0B] {
-            assert!(ModbusError::ExceptionResponse { function: 0x83, code }.is_gateway_busy());
+            assert!(
+                ModbusError::ExceptionResponse {
+                    function: 0x83,
+                    code
+                }
+                .is_gateway_busy()
+            );
         }
-        assert!(!ModbusError::ExceptionResponse { function: 0x83, code: 0x02 }.is_gateway_busy());
+        assert!(
+            !ModbusError::ExceptionResponse {
+                function: 0x83,
+                code: 0x02
+            }
+            .is_gateway_busy()
+        );
     }
 
     #[test]

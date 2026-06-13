@@ -25,7 +25,10 @@ impl ModbusTcpFlowControl {
     /// Preset for serial-backed gateways where the downstream bus is sequential.
     #[must_use]
     pub fn serial_gateway() -> Self {
-        Self { max_in_flight: 1, ..Self::default() }
+        Self {
+            max_in_flight: 1,
+            ..Self::default()
+        }
     }
 
     /// Validates flow-control invariants.
@@ -35,16 +38,24 @@ impl ModbusTcpFlowControl {
     /// Returns [`ModbusError::ValidationError`] if any numeric bound is zero.
     pub fn validate(&self) -> Result<(), ModbusError> {
         if self.max_in_flight == 0 {
-            return Err(ModbusError::ValidationError("flow_control max_in_flight must be >= 1".to_string()));
+            return Err(ModbusError::ValidationError(
+                "flow_control max_in_flight must be >= 1".to_string(),
+            ));
         }
         if self.max_queue_depth == 0 {
-            return Err(ModbusError::ValidationError("flow_control max_queue_depth must be >= 1".to_string()));
+            return Err(ModbusError::ValidationError(
+                "flow_control max_queue_depth must be >= 1".to_string(),
+            ));
         }
         if self.queue_timeout.is_zero() {
-            return Err(ModbusError::ValidationError("flow_control queue_timeout must be > 0".to_string()));
+            return Err(ModbusError::ValidationError(
+                "flow_control queue_timeout must be > 0".to_string(),
+            ));
         }
         if self.quarantine_ttl.is_zero() {
-            return Err(ModbusError::ValidationError("flow_control quarantine_ttl must be > 0".to_string()));
+            return Err(ModbusError::ValidationError(
+                "flow_control quarantine_ttl must be > 0".to_string(),
+            ));
         }
         Ok(())
     }
@@ -73,10 +84,38 @@ mod tests {
 
     #[test]
     fn validate_rejects_invalid_values() {
-        assert!(ModbusTcpFlowControl { max_in_flight: 0, ..Default::default() }.validate().is_err());
-        assert!(ModbusTcpFlowControl { max_queue_depth: 0, ..Default::default() }.validate().is_err());
-        assert!(ModbusTcpFlowControl { queue_timeout: Duration::ZERO, ..Default::default() }.validate().is_err());
-        assert!(ModbusTcpFlowControl { quarantine_ttl: Duration::ZERO, ..Default::default() }.validate().is_err());
+        assert!(
+            ModbusTcpFlowControl {
+                max_in_flight: 0,
+                ..Default::default()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            ModbusTcpFlowControl {
+                max_queue_depth: 0,
+                ..Default::default()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            ModbusTcpFlowControl {
+                queue_timeout: Duration::ZERO,
+                ..Default::default()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            ModbusTcpFlowControl {
+                quarantine_ttl: Duration::ZERO,
+                ..Default::default()
+            }
+            .validate()
+            .is_err()
+        );
         assert!(ModbusTcpFlowControl::default().validate().is_ok());
     }
 }
