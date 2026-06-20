@@ -16,6 +16,7 @@ use crate::tcp::actor::{ControlCommand, RequestCommand};
 use crate::tcp::frame::MBAP_HEADER_LEN;
 use crate::tcp::retry::{ModbusTcpRetry, retry_transient};
 use crate::tcp::socket::ModbusTcpSocket;
+#[cfg(test)]
 use crate::tcp::timeouts::ModbusTcpTimeouts;
 use crate::{ModbusRequest, ModbusResponse, error::ModbusError};
 
