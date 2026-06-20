@@ -17,9 +17,13 @@ use crate::tcp::timeouts::ModbusTcpTimeouts;
 ///
 /// A socket stores construction-time settings as plain configuration. Creating
 /// or modifying a socket does not spawn the background actor, resolve `host`, or
-/// open a TCP connection. Call [`ModbusTcpSocket::connect`] to validate the
-/// configuration, spawn the actor, eagerly open the first TCP connection, and
-/// receive a live [`ModbusTcpConnection`].
+/// open a TCP connection. Use [`Self::with_timeouts`] for connect/write/response
+/// deadlines, [`Self::with_flow_control`] for in-flight and queue limits,
+/// [`Self::with_retry`] for same-call send retry, and
+/// [`Self::with_initial_transaction_id`] when a diagnostic caller needs a custom
+/// MBAP transaction-id seed. Call [`ModbusTcpSocket::connect`] to validate flow
+/// control, spawn the actor, eagerly open the first TCP connection, consume the
+/// socket, and receive a live [`ModbusTcpConnection`].
 #[derive(Clone, Debug)]
 pub struct ModbusTcpSocket {
     host: String,

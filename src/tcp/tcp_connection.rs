@@ -20,14 +20,21 @@ use crate::tcp::socket::ModbusTcpSocket;
 use crate::tcp::timeouts::ModbusTcpTimeouts;
 use crate::{ModbusRequest, ModbusResponse, error::ModbusError};
 
-/// Reusable Modbus TCP client handle.
+/// Live Modbus TCP client handle.
+///
+/// Construct a handle with [`ModbusTcpSocket::connect`] when custom timeouts,
+/// flow control, retry, or an initial transaction-id seed are needed. Use
+/// [`ModbusTcpConnection::connect`] for the default configuration shortcut. Both
+/// paths spawn the background actor and eagerly open the first TCP connection
+/// before returning this live handle.
 ///
 /// Clones are lightweight command senders to a single background actor that owns
 /// the TCP socket, pending response map, and transaction-id counter. The actor
-/// connects lazily on the first warm-up or request, reconnects after transport
-/// teardown, applies bounded in-flight flow control, and uses a bounded request
-/// channel as backpressure. Queue wait is bounded by flow-control settings;
-/// response timeout starts when the actor writes the request on the socket.
+/// reconnects lazily after transport teardown, applies bounded in-flight flow
+/// control, and uses a bounded request channel as backpressure. Queue wait is
+/// bounded by flow-control settings; response timeout starts when the actor
+/// writes the request on the socket. Use [`Self::with_unit_id`] to derive another
+/// live handle that shares the same actor with a different default unit id.
 #[derive(Clone, Debug)]
 pub struct ModbusTcpConnection {
     req_tx: mpsc::Sender<RequestCommand>,

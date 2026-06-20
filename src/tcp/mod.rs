@@ -3,10 +3,14 @@
 
 //! Modbus TCP framing and transport helpers.
 //!
-//! The public surface exports the reusable connection handle plus its retry and
-//! timeout configuration. Internal submodules keep ADU/MBAP frame construction,
-//! actor-based socket ownership, MBAP codec framing, and retry/timeout
-//! configuration separated by concern.
+//! The public construction surface is split into two phases:
+//! [`ModbusTcpSocket`] stores configurable settings without opening a network
+//! connection, then [`ModbusTcpSocket::connect`] validates those settings,
+//! eagerly opens the first TCP connection, and returns a live
+//! [`ModbusTcpConnection`] actor handle. [`ModbusTcpConnection::connect`] is the
+//! default-configuration shortcut. Internal submodules keep ADU/MBAP frame
+//! construction, actor-based socket ownership, MBAP codec framing, and
+//! retry/timeout configuration separated by concern.
 
 mod actor;
 mod adu;
