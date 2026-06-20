@@ -66,14 +66,15 @@ impl ModbusTcpConnection {
         transaction_id: u16,
         timeouts: ModbusTcpTimeouts,
     ) -> Self {
-        Self::with_config(
-            host,
+        Self::spawn_with_config(
+            host.into(),
             port,
             unit_id,
             transaction_id,
             timeouts,
             ModbusTcpFlowControl::default(),
         )
+        .0
     }
 
     /// Creates a connection handle with explicit timeout and flow-control settings.
@@ -81,14 +82,13 @@ impl ModbusTcpConnection {
     /// `host` may be a DNS name or numeric IP address and is resolved whenever
     /// the actor opens a TCP connection.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if `flow_control` violates [`ModbusTcpFlowControl::validate`].
-    /// Flow control is validated synchronously because its queue depth is needed
-    /// before the actor task and request channel are spawned; retry policies are
-    /// validated later when a request starts.
-    #[must_use]
-    #[allow(clippy::expect_used)]
+    /// Returns [`ModbusError::ValidationError`] if `flow_control` violates
+    /// [`ModbusTcpFlowControl::validate`]. Flow control is validated
+    /// synchronously because its queue depth is needed before the actor task and
+    /// request channel are spawned; retry policies are validated later when a
+    /// request starts.
     pub fn with_config(
         host: impl Into<String>,
         port: u16,
@@ -96,11 +96,9 @@ impl ModbusTcpConnection {
         transaction_id: u16,
         timeouts: ModbusTcpTimeouts,
         flow_control: ModbusTcpFlowControl,
-    ) -> Self {
-        flow_control
-            .validate()
-            .expect("invalid Modbus TCP flow-control configuration");
-        Self::spawn_with_config(
+    ) -> Result<Self, ModbusError> {
+        flow_control.validate()?;
+        Ok(Self::spawn_with_config(
             host.into(),
             port,
             unit_id,
@@ -108,7 +106,7 @@ impl ModbusTcpConnection {
             timeouts,
             flow_control,
         )
-        .0
+        .0)
     }
 
     fn spawn_with_config(

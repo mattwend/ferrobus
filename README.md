@@ -105,7 +105,7 @@ let connection = ModbusTcpConnection::with_config(
         response_timeout: Duration::from_secs(2),
     },
     ModbusTcpFlowControl::serial_gateway(),
-)
+)?
 .with_retry(Some(ModbusTcpRetry {
     initial_delay: Duration::from_millis(100),
     max_elapsed: Duration::from_secs(1),

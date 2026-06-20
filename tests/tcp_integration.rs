@@ -655,7 +655,8 @@ async fn caller_future_cancellation_does_not_break_following_requests() {
             response_timeout: Duration::from_secs(1),
         },
         ModbusTcpFlowControl::serial_gateway(),
-    );
+    )
+    .unwrap();
 
     let request = ModbusRequest::ReadCoils {
         starting_address: 0x0000,
@@ -713,7 +714,8 @@ async fn serial_gateway_never_exceeds_one_in_flight_request() {
             response_timeout: Duration::from_secs(1),
         },
         ModbusTcpFlowControl::serial_gateway(),
-    );
+    )
+    .unwrap();
     let request = ModbusRequest::ReadCoils {
         starting_address: 0,
         quantity: 1,
@@ -772,6 +774,7 @@ async fn one_timed_out_tid_is_quarantined_while_sibling_and_socket_survive() {
             ..ModbusTcpFlowControl::default()
         },
     )
+    .unwrap()
     .with_retry(None);
     let slow_request = ModbusRequest::ReadCoils {
         starting_address: 0,
