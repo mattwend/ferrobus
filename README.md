@@ -45,14 +45,12 @@ tiny-mb = "0.1.0"
 Create a typed request and send it over Modbus TCP:
 
 ```rust
-use std::net::{IpAddr, Ipv4Addr};
-
 use tiny_mb::tcp::ModbusTcpConnection;
 use tiny_mb::{ModbusRequest, ModbusResponse};
 
 #[tokio::main]
 async fn main() -> Result<(), tiny_mb::ModbusError> {
-    let connection = ModbusTcpConnection::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 502, 1, 1);
+    let connection = ModbusTcpConnection::new("127.0.0.1", 502, 1, 1);
 
     let response = connection
         .send_message(&ModbusRequest::ReadHoldingRegisters {
@@ -74,9 +72,10 @@ async fn main() -> Result<(), tiny_mb::ModbusError> {
 }
 ```
 
-The TCP client opens connections lazily, retries short-lived I/O failures, and can reuse the
-same socket across multiple requests. Internally, cloned handles send commands over a bounded
-channel to one actor task that owns the socket and MBAP codec; this provides backpressure under
+The TCP client accepts host names or numeric IP addresses, opens connections lazily, retries
+short-lived I/O failures, and can reuse the same socket across multiple requests. Internally,
+cloned handles send commands over a bounded channel to one actor task that owns the socket and
+MBAP codec; this provides backpressure under
 burst load. Cloned handles, including those returned by `with_unit_id`, may issue requests
 concurrently; responses are matched by MBAP transaction ID. Writes are serialized by the actor and
 a cancellation in one caller cannot interrupt a partially written Modbus TCP frame.
@@ -91,13 +90,12 @@ The write timeout covers both sending the frame and flushing the socket. If you 
 construct the connection with `with_timeouts(...)`.
 
 ```rust
-use std::net::{IpAddr, Ipv4Addr};
 use std::time::Duration;
 
 use tiny_mb::tcp::{ModbusTcpConnection, ModbusTcpFlowControl, ModbusTcpRetry, ModbusTcpTimeouts};
 
 let connection = ModbusTcpConnection::with_config(
-    IpAddr::V4(Ipv4Addr::LOCALHOST),
+    "localhost",
     502,
     1,
     1,

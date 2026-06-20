@@ -5,7 +5,6 @@
 
 use std::collections::HashMap;
 use std::io;
-use std::net::IpAddr;
 use std::sync::Arc;
 
 use futures_util::{SinkExt, StreamExt, future::poll_fn};
@@ -65,7 +64,7 @@ struct PendingEntry {
 /// Actor that owns the TCP socket, transaction ids, and pending response map.
 #[derive(Debug)]
 pub(crate) struct Actor {
-    address: IpAddr,
+    host: String,
     port: u16,
     timeouts: ModbusTcpTimeouts,
     flow: ModbusTcpFlowControl,
@@ -83,7 +82,7 @@ pub(crate) struct Actor {
 impl Actor {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
-        address: IpAddr,
+        host: String,
         port: u16,
         timeouts: ModbusTcpTimeouts,
         flow: ModbusTcpFlowControl,
@@ -93,7 +92,7 @@ impl Actor {
         connected_tx: watch::Sender<bool>,
     ) -> Self {
         Self {
-            address,
+            host,
             port,
             timeouts,
             flow,
@@ -170,7 +169,7 @@ impl Actor {
             return Ok(());
         }
         let stream = ModbusTcpConnection::connect_stream(
-            self.address,
+            &self.host,
             self.port,
             self.timeouts.connect_timeout,
         )
@@ -384,7 +383,7 @@ mod tests {
         let (_req_tx, req_rx) = mpsc::channel(1);
         let (connected_tx, _connected_rx) = watch::channel(false);
         Actor::new(
-            "127.0.0.1".parse().unwrap(),
+            "127.0.0.1".to_string(),
             502,
             ModbusTcpTimeouts::default(),
             ModbusTcpFlowControl::default(),
@@ -520,7 +519,7 @@ mod tests {
         let (req_tx, req_rx) = mpsc::channel(2);
         let (connected_tx, _connected_rx) = watch::channel(false);
         let mut actor = Actor::new(
-            "127.0.0.1".parse().unwrap(),
+            "127.0.0.1".to_string(),
             502,
             ModbusTcpTimeouts::default(),
             ModbusTcpFlowControl {
@@ -582,7 +581,7 @@ mod tests {
         let (req_tx, req_rx) = mpsc::channel(2);
         let (connected_tx, _connected_rx) = watch::channel(false);
         let actor = Actor::new(
-            dead_addr.ip(),
+            dead_addr.ip().to_string(),
             dead_addr.port(),
             ModbusTcpTimeouts {
                 connect_timeout: Duration::from_millis(200),
@@ -717,7 +716,7 @@ mod tests {
         let (connected_tx, connected_rx) = watch::channel(false);
         drop(connected_rx);
         let mut actor = Actor::new(
-            addr.ip(),
+            addr.ip().to_string(),
             addr.port(),
             ModbusTcpTimeouts::default(),
             ModbusTcpFlowControl::default(),
@@ -836,7 +835,7 @@ mod tests {
         let (_req_tx, req_rx) = mpsc::channel(1);
         let (connected_tx, connected_rx) = watch::channel(true);
         let mut actor = Actor::new(
-            "127.0.0.1".parse().unwrap(),
+            "127.0.0.1".to_string(),
             502,
             ModbusTcpTimeouts {
                 connect_timeout: Duration::from_secs(1),
@@ -884,7 +883,7 @@ mod tests {
 
     async fn assert_next_request_reconnects(actor: &mut Actor) {
         let reconnect_addr = spawn_one_response_server().await;
-        actor.address = reconnect_addr.ip();
+        actor.host = reconnect_addr.ip().to_string();
         actor.port = reconnect_addr.port();
         let (reply, response) = oneshot::channel();
 
