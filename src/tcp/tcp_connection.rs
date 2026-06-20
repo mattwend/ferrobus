@@ -31,7 +31,7 @@ use crate::{ModbusRequest, ModbusResponse, error::ModbusError};
 #[derive(Clone, Debug)]
 pub struct ModbusTcpConnection {
     req_tx: mpsc::Sender<RequestCommand>,
-    ctrl_tx: mpsc::Sender<ControlCommand>,
+    pub(crate) ctrl_tx: mpsc::Sender<ControlCommand>,
     unit_id: u8,
     connected: watch::Receiver<bool>,
     queue_timeout: Duration,
@@ -39,6 +39,24 @@ pub struct ModbusTcpConnection {
 }
 
 impl ModbusTcpConnection {
+    pub(crate) fn from_actor_parts(
+        req_tx: mpsc::Sender<RequestCommand>,
+        ctrl_tx: mpsc::Sender<ControlCommand>,
+        unit_id: u8,
+        connected: watch::Receiver<bool>,
+        queue_timeout: Duration,
+        retry: Option<ModbusTcpRetry>,
+    ) -> Self {
+        Self {
+            req_tx,
+            ctrl_tx,
+            unit_id,
+            connected,
+            queue_timeout,
+            retry,
+        }
+    }
+
     /// Creates a connection handle with default connect, write, and read timeouts.
     ///
     /// `host` may be a DNS name or numeric IP address and is resolved whenever
@@ -319,7 +337,7 @@ impl ModbusTcpConnection {
     }
 }
 
-fn actor_terminated_error() -> ModbusError {
+pub(crate) fn actor_terminated_error() -> ModbusError {
     ModbusError::ReadError(Arc::new(io::Error::new(
         io::ErrorKind::ConnectionAborted,
         "reader task terminated",
