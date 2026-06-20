@@ -5,7 +5,6 @@
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::error::Error;
-use std::net::IpAddr;
 use std::process;
 use tracing::info;
 use tracing_subscriber::{filter::EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
@@ -45,9 +44,9 @@ struct Cli {
         long = "address",
         global = true,
         default_value = "127.0.0.1",
-        help = "Target device IP address"
+        help = "Target device host name or IP address"
     )]
-    ip_address: IpAddr,
+    host: String,
 
     #[arg(
         short = 'p',
@@ -504,41 +503,41 @@ fn print_response(request: &ModbusRequest, response: ModbusResponse, output_form
 
 /// Formats a `ModbusError` with phase-specific guidance so the operator
 /// knows which stage failed and what to try next.
-fn format_error(error: &ModbusError, address: IpAddr, port: u16) -> String {
+fn format_error(error: &ModbusError, host: &str, port: u16) -> String {
     match error {
         ModbusError::ConnectError(e) => {
             format!(
-                "Connect failed ({address}:{port}): {e}\n\
+                "Connect failed ({host}:{port}): {e}\n\
                  Hint: verify the device is reachable and the port is correct."
             )
         }
         ModbusError::ConnectTimeout => {
             format!(
-                "Connect timed out ({address}:{port}).\n\
+                "Connect timed out ({host}:{port}).\n\
                  Hint: check network connectivity and firewall rules."
             )
         }
         ModbusError::WriteError(e) => {
             format!(
-                "Write failed ({address}:{port}): {e}\n\
+                "Write failed ({host}:{port}): {e}\n\
                  Hint: the TCP session may have been closed by the device. Retry the request."
             )
         }
         ModbusError::WriteTimeout => {
             format!(
-                "Write timed out ({address}:{port}).\n\
+                "Write timed out ({host}:{port}).\n\
                  Hint: the device may be unresponsive. Check the connection and retry."
             )
         }
         ModbusError::ReadError(e) => {
             format!(
-                "Read failed ({address}:{port}): {e}\n\
+                "Read failed ({host}:{port}): {e}\n\
                  Hint: the device may have dropped the connection after the request was sent."
             )
         }
         ModbusError::ReadTimeout => {
             format!(
-                "Read timed out ({address}:{port}).\n\
+                "Read timed out ({host}:{port}).\n\
                  Hint: the device accepted the connection but did not respond in time. \
                  Verify the unit ID and function are supported."
             )
@@ -571,17 +570,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     info!(
         "Connecting to {}:{} (unit_id={}, transaction_id={})",
-        cli.ip_address, cli.port, cli.unit_id, cli.transaction_id
+        cli.host, cli.port, cli.unit_id, cli.transaction_id
     );
     info!("{}", describe_request(&request));
 
     let connection =
-        ModbusTcpConnection::new(cli.ip_address, cli.port, cli.unit_id, cli.transaction_id);
+        ModbusTcpConnection::new(cli.host.clone(), cli.port, cli.unit_id, cli.transaction_id);
 
     connection
         .connect()
         .await
-        .map_err(|e| format_error(&e, cli.ip_address, cli.port))?;
+        .map_err(|e| format_error(&e, &cli.host, cli.port))?;
 
     match connection.send_message(&request).await {
         Ok(response) => print_response(&request, response, cli.output),
@@ -592,7 +591,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
         Err(error) => {
             eprintln!("Request: {}", describe_request(&request));
-            eprintln!("{}", format_error(&error, cli.ip_address, cli.port));
+            eprintln!("{}", format_error(&error, &cli.host, cli.port));
             process::exit(1);
         }
     }
@@ -878,8 +877,7 @@ mod tests {
 
     #[test]
     fn format_error_connect_timeout_includes_hint() {
-        let addr: IpAddr = "192.168.1.10".parse().unwrap();
-        let msg = format_error(&ModbusError::ConnectTimeout, addr, 502);
+        let msg = format_error(&ModbusError::ConnectTimeout, "192.168.1.10", 502);
         assert!(msg.contains("Connect timed out"));
         assert!(msg.contains("192.168.1.10:502"));
         assert!(msg.contains("Hint"));
@@ -887,8 +885,7 @@ mod tests {
 
     #[test]
     fn format_error_read_timeout_includes_hint() {
-        let addr: IpAddr = "10.0.0.1".parse().unwrap();
-        let msg = format_error(&ModbusError::ReadTimeout, addr, 502);
+        let msg = format_error(&ModbusError::ReadTimeout, "10.0.0.1", 502);
         assert!(msg.contains("Read timed out"));
         assert!(msg.contains("10.0.0.1:502"));
         assert!(msg.contains("unit ID"));
@@ -896,8 +893,7 @@ mod tests {
 
     #[test]
     fn format_error_write_timeout_includes_hint() {
-        let addr: IpAddr = "10.0.0.1".parse().unwrap();
-        let msg = format_error(&ModbusError::WriteTimeout, addr, 502);
+        let msg = format_error(&ModbusError::WriteTimeout, "10.0.0.1", 502);
         assert!(msg.contains("Write timed out"));
         assert!(msg.contains("Hint"));
     }
@@ -946,7 +942,7 @@ mod tests {
             "16000",
         ]);
 
-        assert_eq!(cli.ip_address, "192.168.0.89".parse::<IpAddr>().unwrap());
+        assert_eq!(cli.host, "192.168.0.89");
         match cli.command {
             Command::Write { operation } => match operation {
                 WriteOperation::Register(args) => {

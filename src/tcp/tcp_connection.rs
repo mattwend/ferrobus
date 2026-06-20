@@ -4,7 +4,6 @@
 //! Public Modbus TCP connection handle and request orchestration.
 
 use std::io;
-use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -41,10 +40,13 @@ pub struct ModbusTcpConnection {
 
 impl ModbusTcpConnection {
     /// Creates a connection handle with default connect, write, and read timeouts.
+    ///
+    /// `host` may be a DNS name or numeric IP address and is resolved whenever
+    /// the actor opens a TCP connection.
     #[must_use]
-    pub fn new(address: IpAddr, port: u16, unit_id: u8, transaction_id: u16) -> Self {
+    pub fn new(host: impl Into<String>, port: u16, unit_id: u8, transaction_id: u16) -> Self {
         Self::with_timeouts(
-            address,
+            host,
             port,
             unit_id,
             transaction_id,
@@ -53,58 +55,62 @@ impl ModbusTcpConnection {
     }
 
     /// Creates a connection handle with explicit timeout settings.
+    ///
+    /// `host` may be a DNS name or numeric IP address and is resolved whenever
+    /// the actor opens a TCP connection.
     #[must_use]
     pub fn with_timeouts(
-        address: IpAddr,
+        host: impl Into<String>,
         port: u16,
         unit_id: u8,
         transaction_id: u16,
         timeouts: ModbusTcpTimeouts,
     ) -> Self {
-        Self::with_config(
-            address,
+        Self::spawn_with_config(
+            host.into(),
             port,
             unit_id,
             transaction_id,
             timeouts,
             ModbusTcpFlowControl::default(),
         )
+        .0
     }
 
     /// Creates a connection handle with explicit timeout and flow-control settings.
     ///
-    /// # Panics
+    /// `host` may be a DNS name or numeric IP address and is resolved whenever
+    /// the actor opens a TCP connection.
     ///
-    /// Panics if `flow_control` violates [`ModbusTcpFlowControl::validate`].
-    /// Flow control is validated synchronously because its queue depth is needed
-    /// before the actor task and request channel are spawned; retry policies are
-    /// validated later when a request starts.
-    #[must_use]
-    #[allow(clippy::expect_used)]
+    /// # Errors
+    ///
+    /// Returns [`ModbusError::ValidationError`] if `flow_control` violates
+    /// [`ModbusTcpFlowControl::validate`]. Flow control is validated
+    /// synchronously because its queue depth is needed before the actor task and
+    /// request channel are spawned; retry policies are validated later when a
+    /// request starts.
     pub fn with_config(
-        address: IpAddr,
+        host: impl Into<String>,
         port: u16,
         unit_id: u8,
         transaction_id: u16,
         timeouts: ModbusTcpTimeouts,
         flow_control: ModbusTcpFlowControl,
-    ) -> Self {
-        flow_control
-            .validate()
-            .expect("invalid Modbus TCP flow-control configuration");
-        Self::spawn_with_config(
-            address,
+    ) -> Result<Self, ModbusError> {
+        flow_control.validate()?;
+        Ok(Self::spawn_with_config(
+            host.into(),
             port,
             unit_id,
             transaction_id,
             timeouts,
             flow_control,
         )
-        .0
+        .0)
     }
 
     fn spawn_with_config(
-        address: IpAddr,
+        host: String,
         port: u16,
         unit_id: u8,
         transaction_id: u16,
@@ -115,7 +121,7 @@ impl ModbusTcpConnection {
         let (ctrl_tx, ctrl_rx) = mpsc::channel(control_channel_capacity());
         let (connected_tx, connected) = watch::channel(false);
         let actor = Actor::new(
-            address,
+            host,
             port,
             timeouts,
             flow_control,
@@ -140,14 +146,14 @@ impl ModbusTcpConnection {
 
     #[cfg(test)]
     fn spawn_with_timeouts(
-        address: IpAddr,
+        host: impl Into<String>,
         port: u16,
         unit_id: u8,
         transaction_id: u16,
         timeouts: ModbusTcpTimeouts,
     ) -> (Self, JoinHandle<()>) {
         Self::spawn_with_config(
-            address,
+            host.into(),
             port,
             unit_id,
             transaction_id,
@@ -177,16 +183,15 @@ impl ModbusTcpConnection {
     }
 
     pub(crate) async fn connect_stream(
-        address: IpAddr,
+        host: &str,
         port: u16,
         connect_timeout: Duration,
     ) -> Result<TcpStream, ModbusError> {
-        let server_addr = format!("{address}:{port}");
-        let stream = timeout(connect_timeout, TcpStream::connect(&server_addr))
+        let stream = timeout(connect_timeout, TcpStream::connect((host, port)))
             .await
             .map_err(|_| ModbusError::ConnectTimeout)?
             .map_err(|error| ModbusError::ConnectError(Arc::new(error)))?;
-        debug!(server_addr, "connected to Modbus TCP server");
+        debug!(host, port, "connected to Modbus TCP server");
         Ok(stream)
     }
 
@@ -340,7 +345,7 @@ mod tests {
     #[tokio::test]
     async fn connection_starts_disconnected_and_connect_sets_connected() {
         let addr = accept_and_hold_server().await;
-        let connection = ModbusTcpConnection::new(addr.ip(), addr.port(), 1, 0);
+        let connection = ModbusTcpConnection::new(addr.ip().to_string(), addr.port(), 1, 0);
         assert!(!connection.is_connected().await);
         connection.connect().await.unwrap();
         assert!(connection.is_connected().await);
@@ -349,7 +354,7 @@ mod tests {
     #[tokio::test]
     async fn disconnect_is_idempotent_and_clears_connected() {
         let addr = accept_and_hold_server().await;
-        let connection = ModbusTcpConnection::new(addr.ip(), addr.port(), 1, 0);
+        let connection = ModbusTcpConnection::new(addr.ip().to_string(), addr.port(), 1, 0);
         connection.connect().await.unwrap();
         connection.disconnect().await;
         connection.disconnect().await;
@@ -357,11 +362,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn connect_accepts_domain_style_host() {
+        let addr = accept_and_hold_server().await;
+        let connection = ModbusTcpConnection::new("localhost", addr.port(), 1, 0);
+
+        connection.connect().await.unwrap();
+
+        assert!(connection.is_connected().await);
+    }
+
+    #[tokio::test]
     async fn actor_exits_after_handles_drop_while_disconnected() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (connection, actor_task) = ModbusTcpConnection::spawn_with_timeouts(
-            addr.ip(),
+            addr.ip().to_string(),
             addr.port(),
             1,
             0,
@@ -382,7 +397,7 @@ mod tests {
     async fn actor_exits_after_handles_drop_while_connected() {
         let addr = accept_and_hold_server().await;
         let (connection, actor_task) = ModbusTcpConnection::spawn_with_timeouts(
-            addr.ip(),
+            addr.ip().to_string(),
             addr.port(),
             1,
             0,
@@ -403,8 +418,7 @@ mod tests {
 
     #[tokio::test]
     async fn with_unit_id_keeps_retry_policy_and_overrides_unit() {
-        let connection =
-            ModbusTcpConnection::new("127.0.0.1".parse().unwrap(), 502, 1, 0).with_retry(None);
+        let connection = ModbusTcpConnection::new("127.0.0.1", 502, 1, 0).with_retry(None);
         let child = connection.with_unit_id(7);
         assert_eq!(child.retry, None);
         assert_eq!(child.unit_id, 7);
@@ -571,8 +585,9 @@ mod tests {
             write_timeout: Duration::from_millis(50),
             response_timeout: Duration::from_millis(50),
         };
-        let connection = ModbusTcpConnection::with_timeouts(addr.ip(), addr.port(), 1, 0, timeouts)
-            .with_retry(None);
+        let connection =
+            ModbusTcpConnection::with_timeouts(addr.ip().to_string(), addr.port(), 1, 0, timeouts)
+                .with_retry(None);
         assert!(matches!(
             connection.connect().await,
             Err(ModbusError::ConnectError(_) | ModbusError::ConnectTimeout)

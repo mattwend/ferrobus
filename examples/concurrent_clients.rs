@@ -7,7 +7,6 @@
 //! `cargo run --example concurrent_clients`.
 
 use std::error::Error;
-use std::net::{IpAddr, Ipv4Addr};
 
 use tiny_mb::ModbusRequest;
 use tiny_mb::tcp::ModbusTcpConnection;
@@ -15,7 +14,7 @@ use tracing::info;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    let connection = ModbusTcpConnection::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 502, 1, 0);
+    let connection = ModbusTcpConnection::new("127.0.0.1", 502, 1, 0);
     let mut tasks = Vec::new();
 
     for offset in 0..4 {
