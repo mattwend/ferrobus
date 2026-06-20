@@ -4,6 +4,7 @@
 //! Configurable Modbus TCP socket phase.
 
 use tokio::sync::{mpsc, oneshot, watch};
+use tokio::task::JoinHandle;
 
 use crate::error::ModbusError;
 use crate::tcp::actor::{Actor, ControlCommand, RequestCommand, control_channel_capacity};
@@ -109,7 +110,7 @@ impl ModbusTcpSocket {
     /// the warm-up command.
     pub async fn connect(self) -> Result<ModbusTcpConnection, ModbusError> {
         self.flow_control.validate()?;
-        let connection = self.spawn_actor();
+        let (connection, _actor_task) = self.spawn_actor();
         let (ack, reply) = oneshot::channel();
         connection
             .ctrl_tx
@@ -120,7 +121,7 @@ impl ModbusTcpSocket {
         Ok(connection)
     }
 
-    pub(crate) fn spawn_actor(self) -> ModbusTcpConnection {
+    pub(crate) fn spawn_actor(self) -> (ModbusTcpConnection, JoinHandle<()>) {
         let (req_tx, req_rx) = mpsc::channel::<RequestCommand>(self.flow_control.max_queue_depth);
         let (ctrl_tx, ctrl_rx) = mpsc::channel(control_channel_capacity());
         let (connected_tx, connected) = watch::channel(false);
@@ -134,15 +135,16 @@ impl ModbusTcpSocket {
             req_rx,
             connected_tx,
         );
-        tokio::spawn(actor.run());
-        ModbusTcpConnection::from_actor_parts(
+        let actor_task = tokio::spawn(actor.run());
+        let connection = ModbusTcpConnection::from_actor_parts(
             req_tx,
             ctrl_tx,
             self.unit_id,
             connected,
             self.flow_control.queue_timeout,
             self.retry,
-        )
+        );
+        (connection, actor_task)
     }
 }
 

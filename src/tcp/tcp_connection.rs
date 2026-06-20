@@ -9,14 +9,13 @@ use std::time::Duration;
 
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, watch};
-use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use tracing::debug;
 
-use crate::tcp::actor::{Actor, ControlCommand, RequestCommand, control_channel_capacity};
-use crate::tcp::flow::ModbusTcpFlowControl;
+use crate::tcp::actor::{ControlCommand, RequestCommand};
 use crate::tcp::frame::MBAP_HEADER_LEN;
 use crate::tcp::retry::{ModbusTcpRetry, retry_transient};
+use crate::tcp::socket::ModbusTcpSocket;
 use crate::tcp::timeouts::ModbusTcpTimeouts;
 use crate::{ModbusRequest, ModbusResponse, error::ModbusError};
 
@@ -57,134 +56,23 @@ impl ModbusTcpConnection {
         }
     }
 
-    /// Creates a connection handle with default connect, write, and read timeouts.
+    /// Connects to a Modbus TCP server with default construction settings.
     ///
-    /// `host` may be a DNS name or numeric IP address and is resolved whenever
-    /// the actor opens a TCP connection.
-    #[must_use]
-    pub fn new(host: impl Into<String>, port: u16, unit_id: u8, transaction_id: u16) -> Self {
-        Self::with_timeouts(
-            host,
-            port,
-            unit_id,
-            transaction_id,
-            ModbusTcpTimeouts::default(),
-        )
-    }
-
-    /// Creates a connection handle with explicit timeout settings.
-    ///
-    /// `host` may be a DNS name or numeric IP address and is resolved whenever
-    /// the actor opens a TCP connection.
-    #[must_use]
-    pub fn with_timeouts(
-        host: impl Into<String>,
-        port: u16,
-        unit_id: u8,
-        transaction_id: u16,
-        timeouts: ModbusTcpTimeouts,
-    ) -> Self {
-        Self::spawn_with_config(
-            host.into(),
-            port,
-            unit_id,
-            transaction_id,
-            timeouts,
-            ModbusTcpFlowControl::default(),
-        )
-        .0
-    }
-
-    /// Creates a connection handle with explicit timeout and flow-control settings.
-    ///
-    /// `host` may be a DNS name or numeric IP address and is resolved whenever
-    /// the actor opens a TCP connection.
+    /// `host` may be a DNS name or numeric IP address. `port` is the TCP port,
+    /// and `unit_id` is the default Modbus unit id used by the returned live
+    /// handle. This is a shortcut for configuring a [`ModbusTcpSocket`] with
+    /// defaults and awaiting [`ModbusTcpSocket::connect`].
     ///
     /// # Errors
     ///
-    /// Returns [`ModbusError::ValidationError`] if `flow_control` violates
-    /// [`ModbusTcpFlowControl::validate`]. Flow control is validated
-    /// synchronously because its queue depth is needed before the actor task and
-    /// request channel are spawned; retry policies are validated later when a
-    /// request starts.
-    pub fn with_config(
+    /// Returns validation, connection, timeout, or actor-termination errors from
+    /// [`ModbusTcpSocket::connect`].
+    pub async fn connect(
         host: impl Into<String>,
         port: u16,
         unit_id: u8,
-        transaction_id: u16,
-        timeouts: ModbusTcpTimeouts,
-        flow_control: ModbusTcpFlowControl,
     ) -> Result<Self, ModbusError> {
-        flow_control.validate()?;
-        Ok(Self::spawn_with_config(
-            host.into(),
-            port,
-            unit_id,
-            transaction_id,
-            timeouts,
-            flow_control,
-        )
-        .0)
-    }
-
-    fn spawn_with_config(
-        host: String,
-        port: u16,
-        unit_id: u8,
-        transaction_id: u16,
-        timeouts: ModbusTcpTimeouts,
-        flow_control: ModbusTcpFlowControl,
-    ) -> (Self, JoinHandle<()>) {
-        let (req_tx, req_rx) = mpsc::channel(flow_control.max_queue_depth);
-        let (ctrl_tx, ctrl_rx) = mpsc::channel(control_channel_capacity());
-        let (connected_tx, connected) = watch::channel(false);
-        let actor = Actor::new(
-            host,
-            port,
-            timeouts,
-            flow_control,
-            transaction_id,
-            ctrl_rx,
-            req_rx,
-            connected_tx,
-        );
-        let actor_task = tokio::spawn(actor.run());
-        (
-            Self {
-                req_tx,
-                ctrl_tx,
-                unit_id,
-                connected,
-                queue_timeout: flow_control.queue_timeout,
-                retry: Some(ModbusTcpRetry::default()),
-            },
-            actor_task,
-        )
-    }
-
-    #[cfg(test)]
-    fn spawn_with_timeouts(
-        host: impl Into<String>,
-        port: u16,
-        unit_id: u8,
-        transaction_id: u16,
-        timeouts: ModbusTcpTimeouts,
-    ) -> (Self, JoinHandle<()>) {
-        Self::spawn_with_config(
-            host.into(),
-            port,
-            unit_id,
-            transaction_id,
-            timeouts,
-            ModbusTcpFlowControl::default(),
-        )
-    }
-
-    /// Configures the retry policy used for future send operations on this handle.
-    #[must_use]
-    pub fn with_retry(mut self, retry: Option<ModbusTcpRetry>) -> Self {
-        self.retry = retry;
-        self
+        ModbusTcpSocket::new(host, port, unit_id).connect().await
     }
 
     /// Returns a new handle that shares the same transport but overrides the default unit id.
@@ -211,20 +99,6 @@ impl ModbusTcpConnection {
             .map_err(|error| ModbusError::ConnectError(Arc::new(error)))?;
         debug!(host, port, "connected to Modbus TCP server");
         Ok(stream)
-    }
-
-    /// Opens the TCP connection eagerly.
-    ///
-    /// # Errors
-    ///
-    /// Returns connect or transport errors reported by the actor.
-    pub async fn connect(&self) -> Result<(), ModbusError> {
-        let (ack, reply) = oneshot::channel();
-        self.ctrl_tx
-            .send(ControlCommand::Connect { ack })
-            .await
-            .map_err(|_| actor_terminated_error())?;
-        reply.await.map_err(|_| actor_terminated_error())?
     }
 
     /// Closes the current TCP session if one is open.
@@ -360,20 +234,48 @@ mod tests {
         addr
     }
 
+    fn spawn_actor_with_timeouts(
+        host: impl Into<String>,
+        port: u16,
+        unit_id: u8,
+        transaction_id: u16,
+        timeouts: ModbusTcpTimeouts,
+    ) -> (ModbusTcpConnection, tokio::task::JoinHandle<()>) {
+        ModbusTcpSocket::new(host, port, unit_id)
+            .with_initial_transaction_id(transaction_id)
+            .with_timeouts(timeouts)
+            .spawn_actor()
+    }
+
+    async fn warm_up_actor(connection: &ModbusTcpConnection) -> Result<(), ModbusError> {
+        let (ack, reply) = oneshot::channel();
+        connection
+            .ctrl_tx
+            .send(ControlCommand::Connect { ack })
+            .await
+            .map_err(|_| actor_terminated_error())?;
+        reply.await.map_err(|_| actor_terminated_error())?
+    }
+
     #[tokio::test]
-    async fn connection_starts_disconnected_and_connect_sets_connected() {
+    async fn socket_connect_returns_connected_handle() {
         let addr = accept_and_hold_server().await;
-        let connection = ModbusTcpConnection::new(addr.ip().to_string(), addr.port(), 1, 0);
-        assert!(!connection.is_connected().await);
-        connection.connect().await.unwrap();
+        let connection = ModbusTcpSocket::new(addr.ip().to_string(), addr.port(), 1)
+            .with_initial_transaction_id(0)
+            .connect()
+            .await
+            .unwrap();
         assert!(connection.is_connected().await);
     }
 
     #[tokio::test]
     async fn disconnect_is_idempotent_and_clears_connected() {
         let addr = accept_and_hold_server().await;
-        let connection = ModbusTcpConnection::new(addr.ip().to_string(), addr.port(), 1, 0);
-        connection.connect().await.unwrap();
+        let connection = ModbusTcpSocket::new(addr.ip().to_string(), addr.port(), 1)
+            .with_initial_transaction_id(0)
+            .connect()
+            .await
+            .unwrap();
         connection.disconnect().await;
         connection.disconnect().await;
         assert!(!connection.is_connected().await);
@@ -382,9 +284,11 @@ mod tests {
     #[tokio::test]
     async fn connect_accepts_domain_style_host() {
         let addr = accept_and_hold_server().await;
-        let connection = ModbusTcpConnection::new("localhost", addr.port(), 1, 0);
-
-        connection.connect().await.unwrap();
+        let connection = ModbusTcpSocket::new("localhost", addr.port(), 1)
+            .with_initial_transaction_id(0)
+            .connect()
+            .await
+            .unwrap();
 
         assert!(connection.is_connected().await);
     }
@@ -393,7 +297,7 @@ mod tests {
     async fn actor_exits_after_handles_drop_while_disconnected() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let (connection, actor_task) = ModbusTcpConnection::spawn_with_timeouts(
+        let (connection, actor_task) = spawn_actor_with_timeouts(
             addr.ip().to_string(),
             addr.port(),
             1,
@@ -414,7 +318,7 @@ mod tests {
     #[tokio::test]
     async fn actor_exits_after_handles_drop_while_connected() {
         let addr = accept_and_hold_server().await;
-        let (connection, actor_task) = ModbusTcpConnection::spawn_with_timeouts(
+        let (connection, actor_task) = spawn_actor_with_timeouts(
             addr.ip().to_string(),
             addr.port(),
             1,
@@ -422,7 +326,7 @@ mod tests {
             ModbusTcpTimeouts::default(),
         );
         let clone = connection.clone();
-        connection.connect().await.unwrap();
+        warm_up_actor(&connection).await.unwrap();
         assert!(connection.is_connected().await);
 
         drop(connection);
@@ -436,7 +340,17 @@ mod tests {
 
     #[tokio::test]
     async fn with_unit_id_keeps_retry_policy_and_overrides_unit() {
-        let connection = ModbusTcpConnection::new("127.0.0.1", 502, 1, 0).with_retry(None);
+        let (req_tx, _req_rx) = mpsc::channel(1);
+        let (ctrl_tx, _ctrl_rx) = mpsc::channel(1);
+        let (_connected_tx, connected) = watch::channel(false);
+        let connection = ModbusTcpConnection::from_actor_parts(
+            req_tx,
+            ctrl_tx,
+            1,
+            connected,
+            Duration::from_millis(50),
+            None,
+        );
         let child = connection.with_unit_id(7);
         assert_eq!(child.retry, None);
         assert_eq!(child.unit_id, 7);
@@ -603,12 +517,30 @@ mod tests {
             write_timeout: Duration::from_millis(50),
             response_timeout: Duration::from_millis(50),
         };
-        let connection =
-            ModbusTcpConnection::with_timeouts(addr.ip().to_string(), addr.port(), 1, 0, timeouts)
-                .with_retry(None);
         assert!(matches!(
-            connection.connect().await,
+            ModbusTcpSocket::new(addr.ip().to_string(), addr.port(), 1)
+                .with_initial_transaction_id(0)
+                .with_timeouts(timeouts)
+                .connect()
+                .await,
             Err(ModbusError::ConnectError(_) | ModbusError::ConnectTimeout)
         ));
+    }
+
+    #[tokio::test]
+    async fn connect_is_idempotent_while_already_connected() {
+        let addr = accept_and_hold_server().await;
+        let (connection, _actor_task) = spawn_actor_with_timeouts(
+            addr.ip().to_string(),
+            addr.port(),
+            1,
+            0,
+            ModbusTcpTimeouts::default(),
+        );
+
+        warm_up_actor(&connection).await.unwrap();
+        warm_up_actor(&connection).await.unwrap();
+
+        assert!(connection.is_connected().await);
     }
 }
