@@ -21,7 +21,7 @@ use tokio::sync::Mutex;
 mod support;
 
 use tiny_mb::ModbusError;
-use tiny_mb::tcp::{ModbusTcpConnection, ModbusTcpRetry, ModbusTcpTimeouts};
+use tiny_mb::tcp::{ModbusTcpConnection, ModbusTcpFlowControl, ModbusTcpRetry, ModbusTcpTimeouts};
 use tiny_mb::{ModbusRequest, ModbusResponse};
 
 use support::{
@@ -60,6 +60,7 @@ fn fast_retry(max_elapsed: Duration, max_times: Option<usize>) -> ModbusTcpRetry
         max_elapsed,
         max_times,
         jitter: false,
+        retry_gateway_busy: true,
     }
 }
 
@@ -524,7 +525,7 @@ async fn send_message_returns_read_timeout_from_slow_server() {
         ModbusTcpTimeouts {
             connect_timeout: Duration::from_millis(50),
             write_timeout: Duration::from_millis(50),
-            read_timeout: Duration::from_millis(25),
+            response_timeout: Duration::from_millis(25),
         },
     )
     .with_retry(None);
@@ -600,7 +601,7 @@ async fn reader_death_drains_pending_and_next_call_reconnects() {
         ModbusTcpTimeouts {
             connect_timeout: Duration::from_millis(100),
             write_timeout: Duration::from_millis(100),
-            read_timeout: Duration::from_millis(25),
+            response_timeout: Duration::from_millis(25),
         },
     );
     let request = ModbusRequest::ReadCoils {
@@ -643,7 +644,7 @@ async fn caller_future_cancellation_does_not_break_following_requests() {
         }
     });
 
-    let conn = ModbusTcpConnection::with_timeouts(
+    let conn = ModbusTcpConnection::with_config(
         addr.ip(),
         addr.port(),
         1,
@@ -651,8 +652,9 @@ async fn caller_future_cancellation_does_not_break_following_requests() {
         ModbusTcpTimeouts {
             connect_timeout: Duration::from_secs(1),
             write_timeout: Duration::from_secs(1),
-            read_timeout: Duration::from_secs(1),
+            response_timeout: Duration::from_secs(1),
         },
+        ModbusTcpFlowControl::serial_gateway(),
     );
 
     let request = ModbusRequest::ReadCoils {
@@ -676,6 +678,201 @@ async fn caller_future_cancellation_does_not_break_following_requests() {
             coils: vec![true, false]
         }
     );
+}
+
+#[tokio::test]
+async fn serial_gateway_never_exceeds_one_in_flight_request() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let first = read_request_frame(&mut stream).await.unwrap();
+
+        let second_before_first_response =
+            tokio::time::timeout(Duration::from_millis(50), read_request_frame(&mut stream)).await;
+        assert!(second_before_first_response.is_err());
+
+        let first_response = make_read_coils_response(first.transaction_id, first.unit_id, &[true]);
+        stream.write_all(&first_response).await.unwrap();
+
+        let second = read_request_frame(&mut stream).await.unwrap();
+        let second_response =
+            make_read_coils_response(second.transaction_id, second.unit_id, &[false]);
+        stream.write_all(&second_response).await.unwrap();
+    });
+
+    let conn = ModbusTcpConnection::with_config(
+        addr.ip(),
+        addr.port(),
+        1,
+        0,
+        ModbusTcpTimeouts {
+            connect_timeout: Duration::from_secs(1),
+            write_timeout: Duration::from_secs(1),
+            response_timeout: Duration::from_secs(1),
+        },
+        ModbusTcpFlowControl::serial_gateway(),
+    );
+    let request = ModbusRequest::ReadCoils {
+        starting_address: 0,
+        quantity: 1,
+    };
+
+    let first_conn = conn.clone();
+    let first_request = request.clone();
+    let first = tokio::spawn(async move { first_conn.send_message(&first_request).await });
+    let second = conn.send_message(&request);
+    let (first, second) = tokio::join!(first, second);
+
+    assert!(first.unwrap().is_ok());
+    assert!(second.is_ok());
+}
+
+#[tokio::test]
+async fn one_timed_out_tid_is_quarantined_while_sibling_and_socket_survive() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (slow_started_tx, slow_started_rx) = tokio::sync::oneshot::channel::<()>();
+
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let slow = read_request_frame(&mut stream).await.unwrap();
+        let _ = slow_started_tx.send(());
+        let sibling = read_request_frame(&mut stream).await.unwrap();
+
+        let sibling_response =
+            make_read_coils_response(sibling.transaction_id, sibling.unit_id, &[false, true]);
+        stream.write_all(&sibling_response).await.unwrap();
+
+        tokio::time::sleep(Duration::from_millis(45)).await;
+        let late_slow_response =
+            make_read_coils_response(slow.transaction_id, slow.unit_id, &[true]);
+        stream.write_all(&late_slow_response).await.unwrap();
+
+        let follow_up = read_request_frame(&mut stream).await.unwrap();
+        let follow_up_response =
+            make_read_coils_response(follow_up.transaction_id, follow_up.unit_id, &[true, false]);
+        stream.write_all(&follow_up_response).await.unwrap();
+    });
+
+    let conn = ModbusTcpConnection::with_config(
+        addr.ip(),
+        addr.port(),
+        1,
+        0,
+        ModbusTcpTimeouts {
+            connect_timeout: Duration::from_secs(1),
+            write_timeout: Duration::from_secs(1),
+            response_timeout: Duration::from_millis(30),
+        },
+        ModbusTcpFlowControl {
+            max_in_flight: 2,
+            quarantine_ttl: Duration::from_secs(1),
+            ..ModbusTcpFlowControl::default()
+        },
+    )
+    .with_retry(None);
+    let slow_request = ModbusRequest::ReadCoils {
+        starting_address: 0,
+        quantity: 1,
+    };
+    let sibling_request = ModbusRequest::ReadCoils {
+        starting_address: 10,
+        quantity: 2,
+    };
+
+    let slow_conn = conn.clone();
+    let slow = tokio::spawn(async move { slow_conn.send_message(&slow_request).await });
+    slow_started_rx.await.unwrap();
+    let sibling = conn.send_message(&sibling_request);
+    let (slow, sibling) = tokio::join!(slow, sibling);
+
+    assert!(matches!(slow.unwrap(), Err(ModbusError::ReadTimeout)));
+    assert_eq!(
+        sibling.unwrap(),
+        ModbusResponse::ReadCoils {
+            coils: vec![false, true]
+        }
+    );
+
+    let follow_up = conn
+        .send_message(&ModbusRequest::ReadCoils {
+            starting_address: 20,
+            quantity: 2,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        follow_up,
+        ModbusResponse::ReadCoils {
+            coils: vec![true, false]
+        }
+    );
+}
+
+#[tokio::test]
+async fn gateway_busy_exception_retries_when_enabled() {
+    let addr = spawn_mock_server(|mut stream| async move {
+        let first = read_request_frame(&mut stream).await.unwrap();
+        let busy =
+            build_exception_response_frame(first.transaction_id, first.unit_id, first.pdu[0], 0x0B);
+        stream.write_all(&busy).await.unwrap();
+
+        let second = read_request_frame(&mut stream).await.unwrap();
+        let response = make_read_coils_response(second.transaction_id, second.unit_id, &[true]);
+        stream.write_all(&response).await.unwrap();
+    })
+    .await;
+
+    let conn = ModbusTcpConnection::new(addr.ip(), addr.port(), 1, 0)
+        .with_retry(Some(fast_retry(Duration::from_millis(500), None)));
+    let request = ModbusRequest::ReadCoils {
+        starting_address: 0,
+        quantity: 1,
+    };
+
+    let response = conn.send_message(&request).await.unwrap();
+
+    assert_eq!(response, ModbusResponse::ReadCoils { coils: vec![true] });
+}
+
+#[tokio::test]
+async fn gateway_busy_exception_does_not_retry_when_disabled() {
+    let requests = Arc::new(AtomicU8::new(0));
+    let addr = spawn_mock_server({
+        let requests = Arc::clone(&requests);
+        move |mut stream| async move {
+            let request = read_request_frame(&mut stream).await.unwrap();
+            requests.fetch_add(1, Ordering::SeqCst);
+            let busy = build_exception_response_frame(
+                request.transaction_id,
+                request.unit_id,
+                request.pdu[0],
+                0x0B,
+            );
+            stream.write_all(&busy).await.unwrap();
+        }
+    })
+    .await;
+
+    let conn =
+        ModbusTcpConnection::new(addr.ip(), addr.port(), 1, 0).with_retry(Some(ModbusTcpRetry {
+            retry_gateway_busy: false,
+            ..fast_retry(Duration::from_millis(500), None)
+        }));
+    let request = ModbusRequest::ReadCoils {
+        starting_address: 0,
+        quantity: 1,
+    };
+
+    let error = conn.send_message(&request).await.unwrap_err();
+
+    assert!(matches!(
+        error,
+        ModbusError::ExceptionResponse { code: 0x0B, .. }
+    ));
+    assert_eq!(requests.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
@@ -833,7 +1030,7 @@ async fn first_request_lazily_connects_and_reports_connect_failure() {
     let timeouts = ModbusTcpTimeouts {
         connect_timeout: Duration::from_millis(50),
         write_timeout: Duration::from_millis(50),
-        read_timeout: Duration::from_millis(200),
+        response_timeout: Duration::from_millis(200),
     };
     let conn =
         ModbusTcpConnection::with_timeouts(addr.ip(), addr.port(), 1, 0, timeouts).with_retry(None);
