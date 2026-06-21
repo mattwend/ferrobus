@@ -83,7 +83,11 @@ impl ModbusTcpConnection {
         ModbusTcpSocket::new(host, port, unit_id).connect().await
     }
 
-    /// Returns a new handle that shares the same transport but overrides the default unit id.
+    /// Returns a new handle with a different default unit id.
+    ///
+    /// The returned handle shares the same background actor, TCP session,
+    /// in-flight request window, and retry policy. It does not spawn another
+    /// actor or open another TCP connection.
     #[must_use]
     pub fn with_unit_id(&self, unit_id: u8) -> Self {
         Self {
