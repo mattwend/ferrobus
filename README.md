@@ -1,7 +1,7 @@
-# tiny-mb
+# ferrobus
 
-[![CI](https://github.com/mattwend/tiny-mb/actions/workflows/ci.yml/badge.svg)](https://github.com/mattwend/tiny-mb/actions/workflows/ci.yml)
-[![codecov](https://codecov.io/gh/mattwend/tiny-mb/branch/v0.x.x/graph/badge.svg)](https://codecov.io/gh/mattwend/tiny-mb)
+[![CI](https://github.com/mattwend/ferrobus/actions/workflows/ci.yml/badge.svg)](https://github.com/mattwend/ferrobus/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/mattwend/ferrobus/branch/v0.x.x/graph/badge.svg)](https://codecov.io/gh/mattwend/ferrobus)
 
 Small Rust Modbus library with typed request/response PDUs and a reusable Modbus TCP transport.
 
@@ -38,7 +38,7 @@ Add the crate to your project:
 
 ```toml
 [dependencies]
-tiny-mb = "0.1.0"
+ferrobus = "0.1.0"
 ```
 
 ## Library usage
@@ -46,11 +46,11 @@ tiny-mb = "0.1.0"
 Create a typed request and send it over Modbus TCP:
 
 ```rust
-use tiny_mb::tcp::ModbusTcpConnection;
-use tiny_mb::{ModbusRequest, ModbusResponse};
+use ferrobus::tcp::ModbusTcpConnection;
+use ferrobus::{ModbusRequest, ModbusResponse};
 
 #[tokio::main]
-async fn main() -> Result<(), tiny_mb::ModbusError> {
+async fn main() -> Result<(), ferrobus::ModbusError> {
     let connection = ModbusTcpConnection::connect("127.0.0.1", 502, 1).await?;
 
     let response = connection
@@ -94,7 +94,7 @@ configure a `ModbusTcpSocket` before calling `connect().await`.
 ```rust
 use std::time::Duration;
 
-use tiny_mb::tcp::{ModbusTcpFlowControl, ModbusTcpRetry, ModbusTcpSocket, ModbusTcpTimeouts};
+use ferrobus::tcp::{ModbusTcpFlowControl, ModbusTcpRetry, ModbusTcpSocket, ModbusTcpTimeouts};
 
 let connection = ModbusTcpSocket::new("localhost", 502, 1)
     .with_timeouts(ModbusTcpTimeouts {

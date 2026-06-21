@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (c) 2025 tiny-mb contributors
+// Copyright (c) 2025 ferrobus contributors
 
 #![allow(missing_docs, clippy::match_same_arms, clippy::uninlined_format_args)]
 
@@ -9,10 +9,10 @@ use std::process;
 use tracing::info;
 use tracing_subscriber::{filter::EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
-use tiny_mb::ModbusError;
-use tiny_mb::ModbusRequest;
-use tiny_mb::ModbusResponse;
-use tiny_mb::tcp::ModbusTcpSocket;
+use ferrobus::ModbusError;
+use ferrobus::ModbusRequest;
+use ferrobus::ModbusResponse;
+use ferrobus::tcp::ModbusTcpSocket;
 
 // ---------------------------------------------------------------------------
 // CLI definition
@@ -20,7 +20,7 @@ use tiny_mb::tcp::ModbusTcpSocket;
 
 #[derive(Parser, Debug)]
 #[command(name = "modbus_cli")]
-#[command(about = "Modbus TCP client for the tiny-mb library")]
+#[command(about = "Modbus TCP client for the ferrobus library")]
 #[command(long_about = "\
 Connects to a Modbus TCP device and issues one request at a time.\n\
 \n\

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (c) 2025 tiny-mb contributors
+// Copyright (c) 2025 ferrobus contributors
 
 //! Issues concurrent Modbus TCP requests over one shared connection.
 //!
@@ -8,8 +8,8 @@
 
 use std::error::Error;
 
-use tiny_mb::ModbusRequest;
-use tiny_mb::tcp::ModbusTcpConnection;
+use ferrobus::ModbusRequest;
+use ferrobus::tcp::ModbusTcpConnection;
 use tracing::info;
 
 #[tokio::main]
@@ -27,7 +27,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
             let response = client.send_message(&request).await?;
             info!(offset, ?response, "received concurrent Modbus response");
-            Ok::<_, tiny_mb::ModbusError>(())
+            Ok::<_, ferrobus::ModbusError>(())
         }));
     }
 

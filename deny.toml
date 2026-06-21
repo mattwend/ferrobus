@@ -1,4 +1,4 @@
-# cargo-deny configuration for tiny-mb.
+# cargo-deny configuration for ferrobus.
 #
 # Run `cargo deny check` to validate the dependency graph against the
 # policies below. The config uses the v2 schema; see
