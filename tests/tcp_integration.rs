@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (c) 2025 tinymb contributors
+// Copyright (c) 2025 ferrobus contributors
 
 #![allow(
     missing_docs,
@@ -20,11 +20,11 @@ use tokio::sync::Mutex;
 
 mod support;
 
-use tiny_mb::ModbusError;
-use tiny_mb::tcp::{
+use ferrobus::ModbusError;
+use ferrobus::tcp::{
     ModbusTcpConnection, ModbusTcpFlowControl, ModbusTcpRetry, ModbusTcpSocket, ModbusTcpTimeouts,
 };
-use tiny_mb::{ModbusRequest, ModbusResponse};
+use ferrobus::{ModbusRequest, ModbusResponse};
 
 use support::{
     build_exception_response_frame, build_protocol_mismatch_frame, build_tcp_response_frame,

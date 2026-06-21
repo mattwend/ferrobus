@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (c) 2025 tinymb contributors
+// Copyright (c) 2025 ferrobus contributors
 
 //! MBAP header constants and response frame length validation.
 

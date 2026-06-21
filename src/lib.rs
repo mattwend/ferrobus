@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: MIT
-// Copyright (c) 2025 tinymb contributors
+// Copyright (c) 2025 ferrobus contributors
 
 #![deny(missing_docs)]
 
-//! `tiny-mb` provides small, explicit Modbus request/response types plus a
+//! `ferrobus` provides small, explicit Modbus request/response types plus a
 //! Modbus TCP transport.
 //!
 //! The crate is organized around typed PDUs:
