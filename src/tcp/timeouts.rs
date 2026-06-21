@@ -36,7 +36,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_timeouts_match_previous_behavior() {
+    fn default_timeouts_are_five_seconds() {
         let timeouts = ModbusTcpTimeouts::default();
 
         assert_eq!(timeouts.connect_timeout, Duration::from_secs(5));

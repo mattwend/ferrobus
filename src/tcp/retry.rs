@@ -12,14 +12,17 @@ use crate::error::ModbusError;
 
 /// Exponential retry policy used by [`crate::tcp::ModbusTcpConnection`].
 ///
-/// The policy applies to one `send_message` or `send_message_with_unit_id` call.
-/// Each retry performs a fresh connect/write/read attempt after the connection
-/// has been invalidated by the transient failure that triggered the retry.
+/// Configure the policy during the socket phase with
+/// [`crate::tcp::ModbusTcpSocket::with_retry`]. The policy applies to one
+/// `send_message` or `send_message_with_unit_id` call on the resulting live
+/// connection. Each retry performs a fresh connect/write/read attempt after the
+/// connection has been invalidated by the transient failure that triggered the
+/// retry.
 ///
 /// The [`Default::default`] policy starts at 500 ms, multiplies delays by
 /// 1.5, adds jitter, and retries until 2 s of total retry delay has elapsed.
 /// Set [`Self::max_times`] when you also need to cap the number of retry
-/// attempts. Pass `None` to [`crate::tcp::ModbusTcpConnection::with_retry`] to
+/// attempts. Pass `None` to [`crate::tcp::ModbusTcpSocket::with_retry`] to
 /// disable same-call retry entirely.
 ///
 /// # Retried errors

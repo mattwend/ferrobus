@@ -18,7 +18,8 @@ Small Rust Modbus library with typed request/response PDUs and a reusable Modbus
   - write multiple coils
   - write multiple registers
 - Modbus TCP transport with:
-  - lazy connect or explicit `connect()`
+  - two-phase `ModbusTcpSocket` → `ModbusTcpConnection` construction
+  - eager, fallible first TCP connect followed by lazy reconnect after transport failures
   - reusable actor-owned connections with bounded request-channel backpressure
   - configurable in-flight window for slow gateway-backed buses
   - retry of transient I/O failures and gateway-busy exception responses
@@ -50,7 +51,7 @@ use tiny_mb::{ModbusRequest, ModbusResponse};
 
 #[tokio::main]
 async fn main() -> Result<(), tiny_mb::ModbusError> {
-    let connection = ModbusTcpConnection::new("127.0.0.1", 502, 1, 1);
+    let connection = ModbusTcpConnection::connect("127.0.0.1", 502, 1).await?;
 
     let response = connection
         .send_message(&ModbusRequest::ReadHoldingRegisters {
@@ -72,12 +73,13 @@ async fn main() -> Result<(), tiny_mb::ModbusError> {
 }
 ```
 
-The TCP client accepts host names or numeric IP addresses, opens connections lazily, retries
-short-lived I/O failures, and can reuse the same socket across multiple requests. Internally,
-cloned handles send commands over a bounded channel to one actor task that owns the socket and
-MBAP codec; this provides backpressure under
-burst load. Cloned handles, including those returned by `with_unit_id`, may issue requests
-concurrently; responses are matched by MBAP transaction ID. Writes are serialized by the actor and
+The TCP client accepts host names or numeric IP addresses. `ModbusTcpConnection::connect(...)`
+is async and fallible: it opens the first TCP socket eagerly, then the live actor handle retries
+short-lived I/O failures and reconnects lazily after transport teardown. Internally, cloned
+handles send commands over a bounded channel to one actor task that owns the socket and MBAP codec;
+this provides backpressure under burst load. Cloned handles, including those returned by
+`with_unit_id`, may issue requests concurrently; responses are matched by MBAP transaction ID.
+Writes are serialized by the actor and
 a cancellation in one caller cannot interrupt a partially written Modbus TCP frame.
 
 Use `send_message_with_unit_id` or `with_unit_id(...)` when talking to multiple devices behind one
@@ -85,39 +87,38 @@ Modbus TCP gateway.
 
 ## Timeouts and retries
 
-`ModbusTcpConnection::new(...)` uses sensible defaults for connect, write, and read timeouts.
+`ModbusTcpConnection::connect(...)` uses sensible defaults for connect, write, and response timeouts.
 The write timeout covers both sending the frame and flushing the socket. If you need custom limits,
-construct the connection with `with_timeouts(...)`.
+configure a `ModbusTcpSocket` before calling `connect().await`.
 
 ```rust
 use std::time::Duration;
 
-use tiny_mb::tcp::{ModbusTcpConnection, ModbusTcpFlowControl, ModbusTcpRetry, ModbusTcpTimeouts};
+use tiny_mb::tcp::{ModbusTcpFlowControl, ModbusTcpRetry, ModbusTcpSocket, ModbusTcpTimeouts};
 
-let connection = ModbusTcpConnection::with_config(
-    "localhost",
-    502,
-    1,
-    1,
-    ModbusTcpTimeouts {
+let connection = ModbusTcpSocket::new("localhost", 502, 1)
+    .with_timeouts(ModbusTcpTimeouts {
         connect_timeout: Duration::from_secs(2),
         write_timeout: Duration::from_secs(2),
         response_timeout: Duration::from_secs(2),
-    },
-    ModbusTcpFlowControl::serial_gateway(),
-)?
-.with_retry(Some(ModbusTcpRetry {
-    initial_delay: Duration::from_millis(100),
-    max_elapsed: Duration::from_secs(1),
-    ..ModbusTcpRetry::default()
-}));
+    })
+    .with_flow_control(ModbusTcpFlowControl::serial_gateway())
+    .with_retry(Some(ModbusTcpRetry {
+        initial_delay: Duration::from_millis(100),
+        max_elapsed: Duration::from_secs(1),
+        ..ModbusTcpRetry::default()
+    }))
+    .connect()
+    .await?;
 ```
 
-Flow control is actor-owned: `ModbusTcpFlowControl::max_in_flight` caps requests on the wire,
-and `max_queue_depth` is the bounded backlog that applies backpressure to callers. Use
+Flow control is actor-owned and validated when `ModbusTcpSocket::connect` is awaited:
+`ModbusTcpFlowControl::max_in_flight` caps requests on the wire, and `max_queue_depth` is the
+bounded backlog that applies backpressure to callers. Invalid flow-control settings return
+`ModbusError::ValidationError` from socket `connect`. Use
 `ModbusTcpFlowControl::serial_gateway()` for RTU gateways that drain one serial bus sequentially.
 Queue wait is bounded by `queue_timeout`; the `response_timeout` clock starts only after the actor
-successfully writes the frame to the socket. A single response timeout now fails that transaction,
+successfully writes the frame to the socket. A single response timeout fails that transaction,
 quarantines its transaction ID to avoid late-response aliasing, and keeps the TCP socket open.
 
 By default, transient TCP connect/write/read/queue failures and gateway-busy exception responses

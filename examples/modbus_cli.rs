@@ -12,7 +12,7 @@ use tracing_subscriber::{filter::EnvFilter, fmt, layer::SubscriberExt, util::Sub
 use tiny_mb::ModbusError;
 use tiny_mb::ModbusRequest;
 use tiny_mb::ModbusResponse;
-use tiny_mb::tcp::ModbusTcpConnection;
+use tiny_mb::tcp::ModbusTcpSocket;
 
 // ---------------------------------------------------------------------------
 // CLI definition
@@ -574,10 +574,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     );
     info!("{}", describe_request(&request));
 
-    let connection =
-        ModbusTcpConnection::new(cli.host.clone(), cli.port, cli.unit_id, cli.transaction_id);
-
-    connection
+    let connection = ModbusTcpSocket::new(cli.host.clone(), cli.port, cli.unit_id)
+        .with_initial_transaction_id(cli.transaction_id)
         .connect()
         .await
         .map_err(|e| format_error(&e, &cli.host, cli.port))?;
