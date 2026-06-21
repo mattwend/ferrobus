@@ -381,14 +381,14 @@ mod tests {
                 queue_deadline: tokio::time::Instant::now() + Duration::from_secs(1),
             })
             .unwrap();
-        let connection = ModbusTcpConnection {
+        let connection = ModbusTcpConnection::from_actor_parts(
             req_tx,
             ctrl_tx,
-            unit_id: 1,
+            1,
             connected,
-            queue_timeout: Duration::from_millis(10),
-            retry: None,
-        };
+            Duration::from_millis(10),
+            None,
+        );
 
         let result = timeout(
             Duration::from_millis(10),
@@ -411,14 +411,14 @@ mod tests {
         let (_connected_tx, connected) = watch::channel(false);
         drop(req_rx);
         drop(ctrl_rx);
-        ModbusTcpConnection {
+        ModbusTcpConnection::from_actor_parts(
             req_tx,
             ctrl_tx,
-            unit_id: 1,
+            1,
             connected,
-            queue_timeout: Duration::from_millis(50),
-            retry: None,
-        }
+            Duration::from_millis(50),
+            None,
+        )
     }
 
     /// Disconnecting a handle whose actor task has already stopped must return
@@ -461,14 +461,14 @@ mod tests {
         let (req_tx, _req_rx) = mpsc::channel(1);
         let (ctrl_tx, mut ctrl_rx) = mpsc::channel(1);
         let (_connected_tx, connected) = watch::channel(false);
-        let connection = ModbusTcpConnection {
+        let connection = ModbusTcpConnection::from_actor_parts(
             req_tx,
             ctrl_tx,
-            unit_id: 1,
+            1,
             connected,
-            queue_timeout: Duration::from_millis(50),
-            retry: None,
-        };
+            Duration::from_millis(50),
+            None,
+        );
         tokio::spawn(async move {
             if let Some(ControlCommand::Disconnect { ack }) = ctrl_rx.recv().await {
                 drop(ack);
@@ -485,14 +485,14 @@ mod tests {
         let (req_tx, mut req_rx) = mpsc::channel(1);
         let (ctrl_tx, _ctrl_rx) = mpsc::channel(1);
         let (_connected_tx, connected) = watch::channel(false);
-        let connection = ModbusTcpConnection {
+        let connection = ModbusTcpConnection::from_actor_parts(
             req_tx,
             ctrl_tx,
-            unit_id: 1,
+            1,
             connected,
-            queue_timeout: Duration::from_millis(50),
-            retry: None,
-        };
+            Duration::from_millis(50),
+            None,
+        );
         tokio::spawn(async move {
             if let Some(RequestCommand { reply, .. }) = req_rx.recv().await {
                 drop(reply);
