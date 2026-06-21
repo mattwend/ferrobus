@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
+description = "Rust Modbus library with a reusable async Modbus TCP transport"
+repository = "https://github.com/mattwend/ferrobus"
+readme = "README.md"
+keywords = ["async", "industrial", "iot", "modbus", "tokio"]
+categories = ["network-programming", "asynchronous"]
 
 [features]
 default = []
