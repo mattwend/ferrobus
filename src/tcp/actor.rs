@@ -155,6 +155,9 @@ impl Actor {
     }
 
     async fn next_cancelled_tid(pending: &mut HashMap<u16, PendingEntry>) -> u16 {
+        // Cancellation detection scans the bounded pending map on each wake. With the current
+        // public API this is capped by `max_in_flight` (default 16), so the simple scan avoids
+        // per-entry task allocation while keeping wake handling cheap.
         poll_fn(|cx| {
             pending
                 .iter_mut()
@@ -255,7 +258,8 @@ impl Actor {
     /// channel at failure time deposits its request once this drain frees capacity, and
     /// the `run` loop re-dispatches it on the next iteration — where it is either failed
     /// by a fresh (still-failing) connect attempt or short-circuited by its elapsed
-    /// queue deadline. Looping here until producers quiesce would block the actor from
+    /// queue deadline. In the worst case, that straggler can observe one additional
+    /// connect timeout before it is failed. Looping here until producers quiesce would block the actor from
     /// servicing control commands and pending-response deadlines, and could not fail
     /// parked senders deterministically anyway (their wake ordering is runtime-defined).
     fn fail_backlog(&mut self, error: &ModbusError) {

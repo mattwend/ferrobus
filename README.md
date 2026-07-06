@@ -119,7 +119,10 @@ bounded backlog that applies backpressure to callers. Invalid flow-control setti
 `ModbusTcpFlowControl::serial_gateway()` for RTU gateways that drain one serial bus sequentially.
 Queue wait is bounded by `queue_timeout`; the `response_timeout` clock starts only after the actor
 successfully writes the frame to the socket. A single response timeout fails that transaction,
-quarantines its transaction ID to avoid late-response aliasing, and keeps the TCP socket open.
+quarantines its transaction ID to avoid late-response aliasing, and keeps the TCP socket open. If a
+connection attempt fails while callers are parked on a full request queue, one parked caller may be
+admitted after the actor drains the backlog and can observe one additional failing connect attempt
+before its request fails or its queue deadline elapses.
 
 By default, transient TCP connect/write/read/queue failures and gateway-busy exception responses
 (`0x05`, `0x06`, `0x0A`, `0x0B`) are retried with exponential backoff starting at 500 ms,
