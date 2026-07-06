@@ -12,7 +12,7 @@ const MAX_WRITE_MULTIPLE_REGISTERS: u16 = 0x007B;
 const MAX_REQUEST_PDU_LEN: usize = 252;
 
 /// Typed Modbus request PDUs.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModbusRequest {
     /// Read coil outputs starting at `starting_address`.
     ReadCoils {
@@ -76,60 +76,30 @@ impl ModbusRequest {
     fn validate(&self) -> Result<(), ModbusError> {
         match self {
             ModbusRequest::ReadCoils { quantity, .. } => {
-                if *quantity == 0 || *quantity > MAX_READ_COILS {
-                    return Err(ModbusError::ValidationError(format!(
-                        "ReadCoils quantity must be 1-{MAX_READ_COILS}, got {quantity}"
-                    )));
-                }
+                validate_quantity("ReadCoils", *quantity, MAX_READ_COILS)?;
             }
             ModbusRequest::ReadDiscreteInputs { quantity, .. } => {
-                if *quantity == 0 || *quantity > MAX_READ_DISCRETE_INPUTS {
-                    return Err(ModbusError::ValidationError(format!(
-                        "ReadDiscreteInputs quantity must be 1-{MAX_READ_DISCRETE_INPUTS}, got {quantity}"
-                    )));
-                }
+                validate_quantity("ReadDiscreteInputs", *quantity, MAX_READ_DISCRETE_INPUTS)?;
             }
             ModbusRequest::ReadHoldingRegisters { quantity, .. } => {
-                if *quantity == 0 || *quantity > MAX_READ_HOLDING_REGISTERS {
-                    return Err(ModbusError::ValidationError(format!(
-                        "ReadHoldingRegisters quantity must be 1-{MAX_READ_HOLDING_REGISTERS}, got {quantity}"
-                    )));
-                }
+                validate_quantity(
+                    "ReadHoldingRegisters",
+                    *quantity,
+                    MAX_READ_HOLDING_REGISTERS,
+                )?;
             }
             ModbusRequest::ReadInputRegisters { quantity, .. } => {
-                if *quantity == 0 || *quantity > MAX_READ_INPUT_REGISTERS {
-                    return Err(ModbusError::ValidationError(format!(
-                        "ReadInputRegisters quantity must be 1-{MAX_READ_INPUT_REGISTERS}, got {quantity}"
-                    )));
-                }
+                validate_quantity("ReadInputRegisters", *quantity, MAX_READ_INPUT_REGISTERS)?;
             }
             ModbusRequest::WriteMultipleCoils { values, .. } => {
-                let qty = u16::try_from(values.len()).map_err(|_| {
-                    ModbusError::ValidationError(format!(
-                        "WriteMultipleCoils quantity must be 1-{}, got {}",
-                        MAX_WRITE_MULTIPLE_COILS,
-                        values.len()
-                    ))
-                })?;
-                if qty == 0 || qty > MAX_WRITE_MULTIPLE_COILS {
-                    return Err(ModbusError::ValidationError(format!(
-                        "WriteMultipleCoils quantity must be 1-{MAX_WRITE_MULTIPLE_COILS}, got {qty}"
-                    )));
-                }
+                validate_values_len("WriteMultipleCoils", values.len(), MAX_WRITE_MULTIPLE_COILS)?;
             }
             ModbusRequest::WriteMultipleRegisters { values, .. } => {
-                let qty = u16::try_from(values.len()).map_err(|_| {
-                    ModbusError::ValidationError(format!(
-                        "WriteMultipleRegisters quantity must be 1-{}, got {}",
-                        MAX_WRITE_MULTIPLE_REGISTERS,
-                        values.len()
-                    ))
-                })?;
-                if qty == 0 || qty > MAX_WRITE_MULTIPLE_REGISTERS {
-                    return Err(ModbusError::ValidationError(format!(
-                        "WriteMultipleRegisters quantity must be 1-{MAX_WRITE_MULTIPLE_REGISTERS}, got {qty}"
-                    )));
-                }
+                validate_values_len(
+                    "WriteMultipleRegisters",
+                    values.len(),
+                    MAX_WRITE_MULTIPLE_REGISTERS,
+                )?;
             }
             ModbusRequest::WriteSingleCoil { .. } | ModbusRequest::WriteSingleRegister { .. } => {}
         }
@@ -171,7 +141,24 @@ fn pack_coils(coils: &[bool]) -> Vec<u8> {
     bytes
 }
 
-pub(crate) fn serialize_modbus_request(pdu: &ModbusRequest) -> Result<Vec<u8>, ModbusError> {
+fn validate_quantity(name: &str, quantity: u16, max: u16) -> Result<(), ModbusError> {
+    if quantity == 0 || quantity > max {
+        return Err(ModbusError::ValidationError(format!(
+            "{name} quantity must be 1-{max}, got {quantity}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_values_len(name: &str, len: usize, max: u16) -> Result<u16, ModbusError> {
+    let quantity = u16::try_from(len).map_err(|_| {
+        ModbusError::ValidationError(format!("{name} quantity must be 1-{max}, got {len}"))
+    })?;
+    validate_quantity(name, quantity, max)?;
+    Ok(quantity)
+}
+
+fn serialize_modbus_request(pdu: &ModbusRequest) -> Result<Vec<u8>, ModbusError> {
     let mut frame = Vec::with_capacity(MAX_REQUEST_PDU_LEN);
     match pdu {
         ModbusRequest::ReadCoils {
@@ -222,8 +209,8 @@ pub(crate) fn serialize_modbus_request(pdu: &ModbusRequest) -> Result<Vec<u8>, M
             values,
         } => {
             // `ModbusRequest::serialize` validates the public API bounds first.
-            // Keep the conversions defensive here as a backstop for crate-internal
-            // callers and tests that bypass validation.
+            // Keep the conversions defensive here as a backstop for tests that
+            // intentionally bypass validation inside this module.
             frame.push(15u8);
             let quantity = u16::try_from(values.len()).map_err(|_| {
                 ModbusError::ValidationError(format!(
@@ -248,8 +235,8 @@ pub(crate) fn serialize_modbus_request(pdu: &ModbusRequest) -> Result<Vec<u8>, M
             values,
         } => {
             // `ModbusRequest::serialize` validates the public API bounds first.
-            // Keep the conversions defensive here as a backstop for crate-internal
-            // callers and tests that bypass validation.
+            // Keep the conversions defensive here as a backstop for tests that
+            // intentionally bypass validation inside this module.
             frame.push(16u8);
             let quantity = u16::try_from(values.len()).map_err(|_| {
                 ModbusError::ValidationError(format!(
