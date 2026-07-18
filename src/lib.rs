@@ -23,4 +23,8 @@ pub use request::ModbusRequest;
 mod response;
 pub use response::ModbusResponse;
 
+/// Multi-register word-order helpers for wide scalar values.
+mod word_order;
+pub use word_order::{WordOrder, WordOrderError};
+
 pub mod tcp;
