@@ -3,8 +3,7 @@
 
 use crate::error::ModbusError;
 use crate::request::ModbusRequest;
-
-const MBAP_HEADER_LEN: usize = 7;
+use crate::tcp::frame::MBAP_HEADER_LEN;
 
 /// Builds a Modbus TCP frame by constructing the 7-byte MBAP header
 /// and appending the Modbus PDU.

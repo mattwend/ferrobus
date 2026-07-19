@@ -12,6 +12,7 @@ use tracing_subscriber::{filter::EnvFilter, fmt, layer::SubscriberExt, util::Sub
 use ferrobus::ModbusError;
 use ferrobus::ModbusRequest;
 use ferrobus::ModbusResponse;
+use ferrobus::WordOrder;
 use ferrobus::tcp::ModbusTcpSocket;
 
 // ---------------------------------------------------------------------------
@@ -29,6 +30,7 @@ Results are printed to stdout; errors and exceptions go to stderr.")]
 #[command(after_help = "\
 Examples:\n  \
 modbus_cli read holding --address 192.168.1.10 100 4\n  \
+modbus_cli read holding 100 2 --as f32 --word-order little\n  \
 modbus_cli read coils 0 16\n  \
 modbus_cli write coil 12 on\n  \
 modbus_cli write register --output hex 200 4660\n  \
@@ -130,27 +132,54 @@ enum ReadOperation {
     /// Read one or more holding registers (function code 0x03)
     #[command(
         about = "Read holding registers starting at <ADDRESS> (FC 0x03)",
-        after_help = "Example: modbus_cli read holding 40001 10"
+        long_about = "Read holding registers. Values are returned as u16 by default. \
+                      Use --value-type/--as to decode read results as wide values; \
+                      --word-order changes only multi-register word order, not wire byte order. \
+                      Wide-value writes are intentionally not supported by this example.",
+        after_help = "Example: modbus_cli read holding 40001 2 --as f32 --word-order little"
     )]
-    Holding(ReadArgs),
+    Holding(RegisterReadArgs),
 
     /// Read one or more input registers (function code 0x04)
     #[command(
         about = "Read input registers starting at <ADDRESS> (FC 0x04)",
-        after_help = "Example: modbus_cli read input 30001 5"
+        long_about = "Read input registers. Values are returned as u16 by default. \
+                      Use --value-type/--as to decode read results as wide values; \
+                      --word-order changes only multi-register word order, not wire byte order. \
+                      Wide-value writes are intentionally not supported by this example.",
+        after_help = "Example: modbus_cli read input 30001 4 --value-type f64"
     )]
-    Input(ReadArgs),
+    Input(RegisterReadArgs),
 }
 
 #[derive(Args, Debug)]
 struct ReadArgs {
-    /// Starting register or coil address (0-65535)
+    /// Starting coil/input address (0-65535)
     #[arg(value_name = "ADDRESS")]
     address: u16,
 
-    /// Number of items to read (1-2000 for coils/discretes, 1-125 for registers)
+    /// Number of items to read (1-2000)
     #[arg(value_name = "QUANTITY")]
     quantity: u16,
+}
+
+#[derive(Args, Debug)]
+struct RegisterReadArgs {
+    /// Starting register address (0-65535)
+    #[arg(value_name = "ADDRESS")]
+    address: u16,
+
+    /// Raw register count to read (1-125). For wide value types this must be a multiple of the register width.
+    #[arg(value_name = "QUANTITY")]
+    quantity: u16,
+
+    /// Interpret read registers as this scalar type; wide-value writes are out of scope.
+    #[arg(long = "value-type", visible_alias = "as", default_value = "u16")]
+    value_type: ValueType,
+
+    /// Word order for multi-register values only; ignored for u16. Registers remain big-endian on the wire.
+    #[arg(long = "word-order", default_value = "big")]
+    word_order: CliWordOrder,
 }
 
 #[derive(Subcommand, Debug)]
@@ -245,6 +274,80 @@ enum OutputFormat {
     Hex,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
+enum ValueType {
+    #[default]
+    #[clap(name = "u16")]
+    U16,
+    #[clap(name = "u32")]
+    U32,
+    #[clap(name = "i32")]
+    I32,
+    #[clap(name = "f32")]
+    F32,
+    #[clap(name = "u64")]
+    U64,
+    #[clap(name = "i64")]
+    I64,
+    #[clap(name = "f64")]
+    F64,
+}
+
+impl ValueType {
+    fn register_width(self) -> u16 {
+        match self {
+            ValueType::U16 => 1,
+            ValueType::U32 | ValueType::I32 | ValueType::F32 => 2,
+            ValueType::U64 | ValueType::I64 | ValueType::F64 => 4,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            ValueType::U16 => "u16",
+            ValueType::U32 => "u32",
+            ValueType::I32 => "i32",
+            ValueType::F32 => "f32",
+            ValueType::U64 => "u64",
+            ValueType::I64 => "i64",
+            ValueType::F64 => "f64",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
+enum CliWordOrder {
+    #[default]
+    #[clap(name = "big")]
+    Big,
+    #[clap(name = "little")]
+    Little,
+}
+
+impl From<CliWordOrder> for WordOrder {
+    fn from(value: CliWordOrder) -> Self {
+        match value {
+            CliWordOrder::Big => WordOrder::BigEndian,
+            CliWordOrder::Little => WordOrder::LittleEndian,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DisplayPlan {
+    Default,
+    RegisterRead {
+        value_type: ValueType,
+        word_order: WordOrder,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PlannedRequest {
+    request: ModbusRequest,
+    display_plan: DisplayPlan,
+}
+
 // ---------------------------------------------------------------------------
 // Display name helpers
 // ---------------------------------------------------------------------------
@@ -301,6 +404,128 @@ fn format_register(value: u16, format: OutputFormat) -> String {
     match format {
         OutputFormat::Decimal => value.to_string(),
         OutputFormat::Hex => format!("0x{value:04X}"),
+    }
+}
+
+fn format_u32(value: u32, format: OutputFormat) -> String {
+    match format {
+        OutputFormat::Decimal => value.to_string(),
+        OutputFormat::Hex => format!("0x{value:08X}"),
+    }
+}
+
+fn format_i32(value: i32, format: OutputFormat) -> String {
+    match format {
+        OutputFormat::Decimal => value.to_string(),
+        OutputFormat::Hex => format!("0x{:08X}", u32::from_ne_bytes(value.to_ne_bytes())),
+    }
+}
+
+fn format_f32(value: f32, format: OutputFormat) -> String {
+    match format {
+        OutputFormat::Decimal => value.to_string(),
+        OutputFormat::Hex => format!("0x{:08X}", value.to_bits()),
+    }
+}
+
+fn format_u64(value: u64, format: OutputFormat) -> String {
+    match format {
+        OutputFormat::Decimal => value.to_string(),
+        OutputFormat::Hex => format!("0x{value:016X}"),
+    }
+}
+
+fn format_i64(value: i64, format: OutputFormat) -> String {
+    match format {
+        OutputFormat::Decimal => value.to_string(),
+        OutputFormat::Hex => format!("0x{:016X}", u64::from_ne_bytes(value.to_ne_bytes())),
+    }
+}
+
+fn format_f64(value: f64, format: OutputFormat) -> String {
+    match format {
+        OutputFormat::Decimal => value.to_string(),
+        OutputFormat::Hex => format!("0x{:016X}", value.to_bits()),
+    }
+}
+
+fn formatted_register_values(
+    registers: &[u16],
+    display_plan: DisplayPlan,
+    output_format: OutputFormat,
+) -> Result<Vec<String>, String> {
+    match display_plan {
+        DisplayPlan::Default
+        | DisplayPlan::RegisterRead {
+            value_type: ValueType::U16,
+            ..
+        } => Ok(registers
+            .iter()
+            .map(|reg| format_register(*reg, output_format))
+            .collect()),
+        DisplayPlan::RegisterRead {
+            value_type,
+            word_order,
+        } => match value_type {
+            ValueType::U16 => Ok(registers
+                .iter()
+                .map(|reg| format_register(*reg, output_format))
+                .collect()),
+            ValueType::U32 => word_order
+                .decode_u32_block(registers)
+                .map(|values| {
+                    values
+                        .into_iter()
+                        .map(|value| format_u32(value, output_format))
+                        .collect()
+                })
+                .map_err(|error| error.to_string()),
+            ValueType::I32 => word_order
+                .decode_i32_block(registers)
+                .map(|values| {
+                    values
+                        .into_iter()
+                        .map(|value| format_i32(value, output_format))
+                        .collect()
+                })
+                .map_err(|error| error.to_string()),
+            ValueType::F32 => word_order
+                .decode_f32_block(registers)
+                .map(|values| {
+                    values
+                        .into_iter()
+                        .map(|value| format_f32(value, output_format))
+                        .collect()
+                })
+                .map_err(|error| error.to_string()),
+            ValueType::U64 => word_order
+                .decode_u64_block(registers)
+                .map(|values| {
+                    values
+                        .into_iter()
+                        .map(|value| format_u64(value, output_format))
+                        .collect()
+                })
+                .map_err(|error| error.to_string()),
+            ValueType::I64 => word_order
+                .decode_i64_block(registers)
+                .map(|values| {
+                    values
+                        .into_iter()
+                        .map(|value| format_i64(value, output_format))
+                        .collect()
+                })
+                .map_err(|error| error.to_string()),
+            ValueType::F64 => word_order
+                .decode_f64_block(registers)
+                .map(|values| {
+                    values
+                        .into_iter()
+                        .map(|value| format_f64(value, output_format))
+                        .collect()
+                })
+                .map_err(|error| error.to_string()),
+        },
     }
 }
 
@@ -380,57 +605,104 @@ fn describe_request(request: &ModbusRequest) -> String {
 // ---------------------------------------------------------------------------
 
 /// Translates CLI subcommands into the typed request enum expected by the library.
-fn build_request(command: &Command) -> Result<ModbusRequest, String> {
+fn build_request(command: &Command) -> Result<PlannedRequest, String> {
     match command {
         Command::Read { operation } => match operation {
-            ReadOperation::Coils(args) => Ok(ModbusRequest::ReadCoils {
-                starting_address: args.address,
-                quantity: args.quantity,
+            ReadOperation::Coils(args) => Ok(PlannedRequest {
+                request: ModbusRequest::ReadCoils {
+                    starting_address: args.address,
+                    quantity: args.quantity,
+                },
+                display_plan: DisplayPlan::Default,
             }),
-            ReadOperation::Discrete(args) => Ok(ModbusRequest::ReadDiscreteInputs {
-                starting_address: args.address,
-                quantity: args.quantity,
+            ReadOperation::Discrete(args) => Ok(PlannedRequest {
+                request: ModbusRequest::ReadDiscreteInputs {
+                    starting_address: args.address,
+                    quantity: args.quantity,
+                },
+                display_plan: DisplayPlan::Default,
             }),
-            ReadOperation::Holding(args) => Ok(ModbusRequest::ReadHoldingRegisters {
-                starting_address: args.address,
-                quantity: args.quantity,
-            }),
-            ReadOperation::Input(args) => Ok(ModbusRequest::ReadInputRegisters {
-                starting_address: args.address,
-                quantity: args.quantity,
-            }),
+            ReadOperation::Holding(args) => build_register_read_request(true, args),
+            ReadOperation::Input(args) => build_register_read_request(false, args),
         },
         Command::Write { operation } => match operation {
             WriteOperation::Coil(args) => {
                 let value = parse_coil_value(&args.value)?;
-                Ok(ModbusRequest::WriteSingleCoil {
-                    address: args.address,
-                    value,
+                Ok(PlannedRequest {
+                    request: ModbusRequest::WriteSingleCoil {
+                        address: args.address,
+                        value,
+                    },
+                    display_plan: DisplayPlan::Default,
                 })
             }
             WriteOperation::Register(args) => {
                 let value = parse_register_value(&args.value)?;
-                Ok(ModbusRequest::WriteSingleRegister {
-                    address: args.address,
-                    value,
+                Ok(PlannedRequest {
+                    request: ModbusRequest::WriteSingleRegister {
+                        address: args.address,
+                        value,
+                    },
+                    display_plan: DisplayPlan::Default,
                 })
             }
             WriteOperation::Coils(args) => {
                 let values = parse_coil_values(&args.values)?;
-                Ok(ModbusRequest::WriteMultipleCoils {
-                    starting_address: args.address,
-                    values,
+                Ok(PlannedRequest {
+                    request: ModbusRequest::WriteMultipleCoils {
+                        starting_address: args.address,
+                        values,
+                    },
+                    display_plan: DisplayPlan::Default,
                 })
             }
             WriteOperation::Registers(args) => {
                 let values = parse_register_values(&args.values)?;
-                Ok(ModbusRequest::WriteMultipleRegisters {
-                    starting_address: args.address,
-                    values,
+                Ok(PlannedRequest {
+                    request: ModbusRequest::WriteMultipleRegisters {
+                        starting_address: args.address,
+                        values,
+                    },
+                    display_plan: DisplayPlan::Default,
                 })
             }
         },
     }
+}
+
+fn build_register_read_request(
+    holding: bool,
+    args: &RegisterReadArgs,
+) -> Result<PlannedRequest, String> {
+    let width = args.value_type.register_width();
+    if args.quantity % width != 0 {
+        return Err(format!(
+            "quantity {} is not a multiple of {} registers for {}",
+            args.quantity,
+            width,
+            args.value_type.label()
+        ));
+    }
+
+    let request = if holding {
+        ModbusRequest::ReadHoldingRegisters {
+            starting_address: args.address,
+            quantity: args.quantity,
+        }
+    } else {
+        ModbusRequest::ReadInputRegisters {
+            starting_address: args.address,
+            quantity: args.quantity,
+        }
+    };
+
+    Ok(PlannedRequest {
+        request,
+        display_plan: DisplayPlan::RegisterRead {
+            value_type: args.value_type,
+            word_order: WordOrder::from(args.word_order),
+        },
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -438,7 +710,12 @@ fn build_request(command: &Command) -> Result<ModbusRequest, String> {
 // ---------------------------------------------------------------------------
 
 /// Formats responses for interactive use and simple shell pipelines.
-fn print_response(request: &ModbusRequest, response: ModbusResponse, output_format: OutputFormat) {
+fn print_response(
+    request: &ModbusRequest,
+    response: ModbusResponse,
+    output_format: OutputFormat,
+    display_plan: DisplayPlan,
+) -> Result<(), String> {
     // Echo the requested action so the operator can confirm what was issued.
     eprintln!("Request: {}", describe_request(request));
 
@@ -453,14 +730,10 @@ fn print_response(request: &ModbusRequest, response: ModbusResponse, output_form
                 println!("{}", format_coil(input));
             }
         }
-        ModbusResponse::ReadHoldingRegisters { registers } => {
-            for reg in registers {
-                println!("{}", format_register(reg, output_format));
-            }
-        }
-        ModbusResponse::ReadInputRegisters { registers } => {
-            for reg in registers {
-                println!("{}", format_register(reg, output_format));
+        ModbusResponse::ReadHoldingRegisters { registers }
+        | ModbusResponse::ReadInputRegisters { registers } => {
+            for value in formatted_register_values(&registers, display_plan, output_format)? {
+                println!("{value}");
             }
         }
         ModbusResponse::WriteSingleCoil { address, value } => {
@@ -495,6 +768,8 @@ fn print_response(request: &ModbusRequest, response: ModbusResponse, output_form
             eprintln!("{}", format_exception(function, code));
         }
     }
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -560,13 +835,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let cli = Cli::parse();
 
-    let request = match build_request(&cli.command) {
+    let planned = match build_request(&cli.command) {
         Ok(r) => r,
         Err(message) => {
             eprintln!("Error: {message}");
             process::exit(2);
         }
     };
+    let request = planned.request;
+    let display_plan = planned.display_plan;
 
     info!(
         "Connecting to {}:{} (unit_id={}, transaction_id={})",
@@ -581,7 +858,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .map_err(|e| format_error(&e, &cli.host, cli.port))?;
 
     match connection.send_message(&request).await {
-        Ok(response) => print_response(&request, response, cli.output),
+        Ok(response) => {
+            if let Err(message) = print_response(&request, response, cli.output, display_plan) {
+                eprintln!("Error: {message}");
+                process::exit(1);
+            }
+        }
         Err(ModbusError::ExceptionResponse { function, code }) => {
             eprintln!("Request: {}", describe_request(&request));
             eprintln!("{}", format_exception(function, code));
@@ -654,7 +936,7 @@ mod tests {
                 quantity: 8,
             }),
         };
-        let request = build_request(&cmd).unwrap();
+        let request = build_request(&cmd).unwrap().request;
         assert_eq!(
             request,
             ModbusRequest::ReadCoils {
@@ -672,7 +954,7 @@ mod tests {
                 quantity: 16,
             }),
         };
-        let request = build_request(&cmd).unwrap();
+        let request = build_request(&cmd).unwrap().request;
         assert_eq!(
             request,
             ModbusRequest::ReadDiscreteInputs {
@@ -685,17 +967,26 @@ mod tests {
     #[test]
     fn build_read_holding_request() {
         let cmd = Command::Read {
-            operation: ReadOperation::Holding(ReadArgs {
+            operation: ReadOperation::Holding(RegisterReadArgs {
                 address: 40001,
                 quantity: 10,
+                value_type: ValueType::U16,
+                word_order: CliWordOrder::Big,
             }),
         };
-        let request = build_request(&cmd).unwrap();
+        let planned = build_request(&cmd).unwrap();
         assert_eq!(
-            request,
+            planned.request,
             ModbusRequest::ReadHoldingRegisters {
                 starting_address: 40001,
                 quantity: 10
+            }
+        );
+        assert_eq!(
+            planned.display_plan,
+            DisplayPlan::RegisterRead {
+                value_type: ValueType::U16,
+                word_order: WordOrder::BigEndian,
             }
         );
     }
@@ -703,12 +994,14 @@ mod tests {
     #[test]
     fn build_read_input_request() {
         let cmd = Command::Read {
-            operation: ReadOperation::Input(ReadArgs {
+            operation: ReadOperation::Input(RegisterReadArgs {
                 address: 30001,
                 quantity: 5,
+                value_type: ValueType::U16,
+                word_order: CliWordOrder::Big,
             }),
         };
-        let request = build_request(&cmd).unwrap();
+        let request = build_request(&cmd).unwrap().request;
         assert_eq!(
             request,
             ModbusRequest::ReadInputRegisters {
@@ -726,7 +1019,7 @@ mod tests {
                 value: "on".to_string(),
             }),
         };
-        let request = build_request(&cmd).unwrap();
+        let request = build_request(&cmd).unwrap().request;
         assert_eq!(
             request,
             ModbusRequest::WriteSingleCoil {
@@ -744,7 +1037,7 @@ mod tests {
                 value: "4660".to_string(),
             }),
         };
-        let request = build_request(&cmd).unwrap();
+        let request = build_request(&cmd).unwrap().request;
         assert_eq!(
             request,
             ModbusRequest::WriteSingleRegister {
@@ -767,7 +1060,7 @@ mod tests {
                 ],
             }),
         };
-        let request = build_request(&cmd).unwrap();
+        let request = build_request(&cmd).unwrap().request;
         assert_eq!(
             request,
             ModbusRequest::WriteMultipleCoils {
@@ -785,12 +1078,53 @@ mod tests {
                 values: vec!["10".to_string(), "20".to_string(), "30".to_string()],
             }),
         };
-        let request = build_request(&cmd).unwrap();
+        let request = build_request(&cmd).unwrap().request;
         assert_eq!(
             request,
             ModbusRequest::WriteMultipleRegisters {
                 starting_address: 300,
                 values: vec![10, 20, 30]
+            }
+        );
+    }
+
+    #[test]
+    fn build_register_read_rejects_non_multiple_quantity() {
+        let cmd = Command::Read {
+            operation: ReadOperation::Holding(RegisterReadArgs {
+                address: 100,
+                quantity: 3,
+                value_type: ValueType::F32,
+                word_order: CliWordOrder::Little,
+            }),
+        };
+
+        let result = build_request(&cmd);
+        assert!(result.is_err());
+        assert!(
+            result
+                .err()
+                .is_some_and(|message| message.contains("multiple of 2"))
+        );
+    }
+
+    #[test]
+    fn build_register_read_accepts_wide_value_plan() {
+        let cmd = Command::Read {
+            operation: ReadOperation::Input(RegisterReadArgs {
+                address: 100,
+                quantity: 4,
+                value_type: ValueType::F64,
+                word_order: CliWordOrder::Little,
+            }),
+        };
+
+        let planned = build_request(&cmd).unwrap();
+        assert_eq!(
+            planned.display_plan,
+            DisplayPlan::RegisterRead {
+                value_type: ValueType::F64,
+                word_order: WordOrder::LittleEndian,
             }
         );
     }
@@ -909,6 +1243,43 @@ mod tests {
     }
 
     #[test]
+    fn format_wide_values_decimal_and_hex() {
+        assert_eq!(format_i32(-1, OutputFormat::Hex), "0xFFFFFFFF");
+        assert_eq!(format_u32(4660, OutputFormat::Hex), "0x00001234");
+        assert_eq!(format_f32(1.0, OutputFormat::Hex), "0x3F800000");
+        assert_eq!(format_f64(1.0, OutputFormat::Hex), "0x3FF0000000000000");
+        assert_eq!(format_i32(-1, OutputFormat::Decimal), "-1");
+    }
+
+    #[test]
+    fn formatted_register_values_honors_little_endian_word_order() {
+        let values = formatted_register_values(
+            &[0x0000, 0x3F80],
+            DisplayPlan::RegisterRead {
+                value_type: ValueType::F32,
+                word_order: WordOrder::LittleEndian,
+            },
+            OutputFormat::Hex,
+        );
+
+        assert_eq!(values, Ok(vec!["0x3F800000".to_string()]));
+    }
+
+    #[test]
+    fn word_order_is_accepted_but_ignored_for_u16() {
+        let values = formatted_register_values(
+            &[0x1234, 0x5678],
+            DisplayPlan::RegisterRead {
+                value_type: ValueType::U16,
+                word_order: WordOrder::LittleEndian,
+            },
+            OutputFormat::Hex,
+        );
+
+        assert_eq!(values, Ok(vec!["0x1234".to_string(), "0x5678".to_string()]));
+    }
+
+    #[test]
     fn format_coil_values() {
         assert_eq!(format_coil(true), "1");
         assert_eq!(format_coil(false), "0");
@@ -951,5 +1322,82 @@ mod tests {
             },
             other => panic!("expected write command, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_cli_accepts_as_alias_and_word_order_on_holding() {
+        let cli = Cli::parse_from([
+            "modbus_cli",
+            "read",
+            "holding",
+            "100",
+            "2",
+            "--as",
+            "f32",
+            "--word-order",
+            "little",
+        ]);
+
+        match cli.command {
+            Command::Read { operation } => match operation {
+                ReadOperation::Holding(args) => {
+                    assert_eq!(args.address, 100);
+                    assert_eq!(args.quantity, 2);
+                    assert_eq!(args.value_type, ValueType::F32);
+                    assert_eq!(args.word_order, CliWordOrder::Little);
+                }
+                other => panic!("expected read holding command, got {other:?}"),
+            },
+            other => panic!("expected read command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_cli_accepts_value_type_on_input() {
+        let cli = Cli::parse_from([
+            "modbus_cli",
+            "read",
+            "input",
+            "30001",
+            "4",
+            "--value-type",
+            "u64",
+        ]);
+
+        match cli.command {
+            Command::Read { operation } => match operation {
+                ReadOperation::Input(args) => assert_eq!(args.value_type, ValueType::U64),
+                other => panic!("expected read input command, got {other:?}"),
+            },
+            other => panic!("expected read command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_cli_rejects_wide_value_flags_on_coils_and_discrete() {
+        assert!(
+            Cli::try_parse_from([
+                "modbus_cli",
+                "read",
+                "coils",
+                "0",
+                "8",
+                "--value-type",
+                "f32"
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "modbus_cli",
+                "read",
+                "discrete",
+                "0",
+                "8",
+                "--word-order",
+                "little",
+            ])
+            .is_err()
+        );
     }
 }

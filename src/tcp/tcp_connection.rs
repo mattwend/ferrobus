@@ -159,6 +159,12 @@ impl ModbusTcpConnection {
             Err(_) => return Err(actor_terminated_error()),
         };
 
+        if response_buffer.len() < MBAP_HEADER_LEN {
+            return Err(ModbusError::MalformedResponse(format!(
+                "Modbus TCP frame shorter than MBAP header: {} < {MBAP_HEADER_LEN}",
+                response_buffer.len()
+            )));
+        }
         // The MBAP codec only yields complete frames with a full header and at least one PDU byte.
         let protocol_id = u16::from_be_bytes([response_buffer[2], response_buffer[3]]);
         if protocol_id != 0 {
@@ -185,20 +191,28 @@ impl ModbusTcpConnection {
 
     /// Sends one request using this connection's default unit id.
     ///
+    /// Modbus exception PDUs are surfaced as [`ModbusError::ExceptionResponse`]. Gateway-busy
+    /// exception codes may be retried transparently when this handle has retry enabled.
+    ///
     /// # Errors
     ///
     /// Returns transport, protocol, validation, exception-response, or
     /// request/response mismatch errors.
+    #[must_use = "send_message returns a future whose output reports request success or failure"]
     pub async fn send_message(&self, pdu: &ModbusRequest) -> Result<ModbusResponse, ModbusError> {
         self.send_message_with_unit_id(self.unit_id, pdu).await
     }
 
     /// Sends one request using an explicit unit id.
     ///
+    /// Modbus exception PDUs are surfaced as [`ModbusError::ExceptionResponse`]. Gateway-busy
+    /// exception codes may be retried transparently when this handle has retry enabled.
+    ///
     /// # Errors
     ///
     /// Returns transport, protocol, validation, exception-response, or
     /// request/response mismatch errors.
+    #[must_use = "send_message_with_unit_id returns a future whose output reports request success or failure"]
     pub async fn send_message_with_unit_id(
         &self,
         unit_id: u8,
@@ -517,6 +531,38 @@ mod tests {
             result,
             Err(ModbusError::ReadError(error)) if error.kind() == io::ErrorKind::ConnectionAborted
         ));
+    }
+
+    #[tokio::test]
+    async fn send_once_rejects_short_frame_before_header_indexing() {
+        let (req_tx, mut req_rx) = mpsc::channel(1);
+        let (ctrl_tx, _ctrl_rx) = mpsc::channel(1);
+        let (_connected_tx, connected) = watch::channel(false);
+        let connection = ModbusTcpConnection::from_actor_parts(
+            req_tx,
+            ctrl_tx,
+            1,
+            connected,
+            Duration::from_millis(50),
+            None,
+        );
+        tokio::spawn(async move {
+            if let Some(RequestCommand { reply, .. }) = req_rx.recv().await {
+                assert!(reply.send(Ok(vec![0; MBAP_HEADER_LEN - 1])).is_ok());
+            }
+        });
+
+        let result = connection
+            .send_once(
+                1,
+                &ModbusRequest::ReadHoldingRegisters {
+                    starting_address: 0,
+                    quantity: 1,
+                },
+            )
+            .await;
+
+        assert!(matches!(result, Err(ModbusError::MalformedResponse(_))));
     }
 
     #[tokio::test]

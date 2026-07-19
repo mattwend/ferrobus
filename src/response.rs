@@ -1,27 +1,44 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2025 ferrobus contributors
 
-use std::convert::TryFrom;
-
 use crate::ModbusRequest;
 use crate::error::ModbusError;
 
-fn unpack_bits(response: &[u8], min_len: usize) -> Result<Vec<bool>, ModbusError> {
-    if response.len() < min_len {
+fn byte_count(response: &[u8]) -> Result<usize, ModbusError> {
+    if response.len() < 2 {
         return Err(ModbusError::DeserializationError(format!(
-            "Invalid response: expected at least {} bytes, got {}",
-            min_len,
+            "Invalid response: expected at least 2 bytes, got {}",
             response.len()
         )));
     }
     let byte_count = usize::from(response[1]);
-    if response.len() < 2 + byte_count {
+    let expected_len = 2 + byte_count;
+    if response.len() != expected_len {
         return Err(ModbusError::DeserializationError(format!(
             "Response length {} does not match byte count {}",
             response.len(),
-            2 + byte_count
+            expected_len
         )));
     }
+    Ok(byte_count)
+}
+
+fn require_exact_len(
+    response: &[u8],
+    expected_len: usize,
+    context: &str,
+) -> Result<(), ModbusError> {
+    if response.len() != expected_len {
+        return Err(ModbusError::DeserializationError(format!(
+            "Invalid {context} response: expected {expected_len} bytes, got {}",
+            response.len()
+        )));
+    }
+    Ok(())
+}
+
+fn unpack_bits(response: &[u8]) -> Result<Vec<bool>, ModbusError> {
+    let byte_count = byte_count(response)?;
     let bits = &response[2..2 + byte_count];
     let mut result = Vec::with_capacity(byte_count * 8);
     for byte in bits {
@@ -32,22 +49,8 @@ fn unpack_bits(response: &[u8], min_len: usize) -> Result<Vec<bool>, ModbusError
     Ok(result)
 }
 
-fn parse_registers(response: &[u8], min_len: usize) -> Result<Vec<u16>, ModbusError> {
-    if response.len() < min_len {
-        return Err(ModbusError::DeserializationError(format!(
-            "Invalid response: expected at least {} bytes, got {}",
-            min_len,
-            response.len()
-        )));
-    }
-    let byte_count = usize::from(response[1]);
-    if response.len() < 2 + byte_count {
-        return Err(ModbusError::DeserializationError(format!(
-            "Response length {} does not match byte count {}",
-            response.len(),
-            2 + byte_count
-        )));
-    }
+fn parse_registers(response: &[u8]) -> Result<Vec<u16>, ModbusError> {
+    let byte_count = byte_count(response)?;
     if byte_count % 2 != 0 {
         return Err(ModbusError::DeserializationError(
             "Byte count is not even for register data".to_string(),
@@ -63,7 +66,7 @@ fn parse_registers(response: &[u8], min_len: usize) -> Result<Vec<u16>, ModbusEr
 }
 
 /// Typed Modbus response PDUs.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModbusResponse {
     /// Coil output values returned by a read-coils request.
     ReadCoils {
@@ -114,6 +117,12 @@ pub enum ModbusResponse {
         quantity: u16,
     },
     /// Modbus exception response PDU.
+    ///
+    /// [`crate::tcp::ModbusTcpConnection::send_message`] and
+    /// [`crate::tcp::ModbusTcpConnection::send_message_with_unit_id`] convert this response into
+    /// [`ModbusError::ExceptionResponse`] after decoding so callers can handle exceptions through
+    /// the same error path that retry policy uses. This variant is primarily visible when parsing
+    /// response PDUs directly with [`TryFrom`].
     Exception {
         /// Exception function code, including the high exception bit.
         function: u8,
@@ -147,13 +156,7 @@ impl ModbusResponse {
                 },
                 ModbusResponse::ReadCoils { coils },
             ) => {
-                if coils.len() < *requested as usize {
-                    return Err(ModbusError::RequestResponseMismatch(format!(
-                        "ReadCoils: requested {} coils but got {}",
-                        requested,
-                        coils.len()
-                    )));
-                }
+                validate_bit_count("ReadCoils", *requested, coils.len())?;
                 let trimmed = coils[..*requested as usize].to_vec();
                 Ok(ModbusResponse::ReadCoils { coils: trimmed })
             }
@@ -164,13 +167,7 @@ impl ModbusResponse {
                 },
                 ModbusResponse::ReadDiscreteInputs { inputs },
             ) => {
-                if inputs.len() < *requested as usize {
-                    return Err(ModbusError::RequestResponseMismatch(format!(
-                        "ReadDiscreteInputs: requested {} inputs but got {}",
-                        requested,
-                        inputs.len()
-                    )));
-                }
+                validate_bit_count("ReadDiscreteInputs", *requested, inputs.len())?;
                 let trimmed = inputs[..*requested as usize].to_vec();
                 Ok(ModbusResponse::ReadDiscreteInputs { inputs: trimmed })
             }
@@ -287,6 +284,25 @@ impl ModbusResponse {
     }
 }
 
+fn validate_bit_count(
+    function_name: &str,
+    requested: u16,
+    returned_bits: usize,
+) -> Result<(), ModbusError> {
+    let requested = usize::from(requested);
+    if returned_bits < requested {
+        return Err(ModbusError::RequestResponseMismatch(format!(
+            "{function_name}: requested {requested} bits but got {returned_bits}"
+        )));
+    }
+    if returned_bits > requested + 7 {
+        return Err(ModbusError::RequestResponseMismatch(format!(
+            "{function_name}: requested {requested} bits but got {returned_bits}, more than one packed byte of padding"
+        )));
+    }
+    Ok(())
+}
+
 fn deserialize_modbus_response(response: &[u8]) -> Result<ModbusResponse, ModbusError> {
     if response.is_empty() {
         return Err(ModbusError::DeserializationError(
@@ -297,28 +313,23 @@ fn deserialize_modbus_response(response: &[u8]) -> Result<ModbusResponse, Modbus
     let function_code = response[0];
     match function_code {
         1 => {
-            let coils = unpack_bits(response, 2)?;
+            let coils = unpack_bits(response)?;
             Ok(ModbusResponse::ReadCoils { coils })
         }
         2 => {
-            let inputs = unpack_bits(response, 2)?;
+            let inputs = unpack_bits(response)?;
             Ok(ModbusResponse::ReadDiscreteInputs { inputs })
         }
         3 => {
-            let registers = parse_registers(response, 2)?;
+            let registers = parse_registers(response)?;
             Ok(ModbusResponse::ReadHoldingRegisters { registers })
         }
         4 => {
-            let registers = parse_registers(response, 2)?;
+            let registers = parse_registers(response)?;
             Ok(ModbusResponse::ReadInputRegisters { registers })
         }
         5 => {
-            if response.len() < 5 {
-                return Err(ModbusError::DeserializationError(format!(
-                    "Invalid Write Single Coil response: expected 5 bytes, got {}",
-                    response.len()
-                )));
-            }
+            require_exact_len(response, 5, "Write Single Coil")?;
             let address = u16::from_be_bytes([response[1], response[2]]);
             let coil_value = u16::from_be_bytes([response[3], response[4]]);
             let value = match coil_value {
@@ -333,23 +344,13 @@ fn deserialize_modbus_response(response: &[u8]) -> Result<ModbusResponse, Modbus
             Ok(ModbusResponse::WriteSingleCoil { address, value })
         }
         6 => {
-            if response.len() < 5 {
-                return Err(ModbusError::DeserializationError(format!(
-                    "Invalid Write Single Register response: expected 5 bytes, got {}",
-                    response.len()
-                )));
-            }
+            require_exact_len(response, 5, "Write Single Register")?;
             let address = u16::from_be_bytes([response[1], response[2]]);
             let value = u16::from_be_bytes([response[3], response[4]]);
             Ok(ModbusResponse::WriteSingleRegister { address, value })
         }
         15 => {
-            if response.len() < 5 {
-                return Err(ModbusError::DeserializationError(format!(
-                    "Invalid Write Multiple Coils response: expected 5 bytes, got {}",
-                    response.len()
-                )));
-            }
+            require_exact_len(response, 5, "Write Multiple Coils")?;
             let starting_address = u16::from_be_bytes([response[1], response[2]]);
             let quantity = u16::from_be_bytes([response[3], response[4]]);
             Ok(ModbusResponse::WriteMultipleCoils {
@@ -358,12 +359,7 @@ fn deserialize_modbus_response(response: &[u8]) -> Result<ModbusResponse, Modbus
             })
         }
         16 => {
-            if response.len() < 5 {
-                return Err(ModbusError::DeserializationError(format!(
-                    "Invalid Write Multiple Registers response: expected 5 bytes, got {}",
-                    response.len()
-                )));
-            }
+            require_exact_len(response, 5, "Write Multiple Registers")?;
             let starting_address = u16::from_be_bytes([response[1], response[2]]);
             let quantity = u16::from_be_bytes([response[3], response[4]]);
             Ok(ModbusResponse::WriteMultipleRegisters {
@@ -372,11 +368,7 @@ fn deserialize_modbus_response(response: &[u8]) -> Result<ModbusResponse, Modbus
             })
         }
         fc if fc & 0x80 != 0 => {
-            if response.len() < 2 {
-                return Err(ModbusError::DeserializationError(
-                    "Invalid Exception response length".to_string(),
-                ));
-            }
+            require_exact_len(response, 2, "Exception")?;
             let exception_code = response[1];
             Ok(ModbusResponse::Exception {
                 function: function_code,
@@ -669,6 +661,38 @@ mod tests {
     }
 
     #[test]
+    fn test_align_response_rejects_extra_packed_coil_byte() {
+        let request = ModbusRequest::ReadCoils {
+            starting_address: 0x0000,
+            quantity: 1,
+        };
+        let response = ModbusResponse::ReadCoils {
+            coils: vec![true; 16],
+        };
+        let result = response.align_to_request(&request);
+        assert!(matches!(
+            result,
+            Err(ModbusError::RequestResponseMismatch(_))
+        ));
+    }
+
+    #[test]
+    fn test_align_response_rejects_extra_packed_discrete_input_byte() {
+        let request = ModbusRequest::ReadDiscreteInputs {
+            starting_address: 0x0000,
+            quantity: 1,
+        };
+        let response = ModbusResponse::ReadDiscreteInputs {
+            inputs: vec![true; 16],
+        };
+        let result = response.align_to_request(&request);
+        assert!(matches!(
+            result,
+            Err(ModbusError::RequestResponseMismatch(_))
+        ));
+    }
+
+    #[test]
     fn test_align_response_allows_exception_response() {
         let request = ModbusRequest::ReadCoils {
             starting_address: 0x0000,
@@ -868,6 +892,34 @@ mod tests {
         let response = vec![0x81u8];
         let result = ModbusResponse::try_from(response.as_slice());
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_deserialize_read_coils_rejects_trailing_bytes() {
+        let response = vec![1u8, 1u8, 0x25, 0xFF];
+        let result = ModbusResponse::try_from(response.as_slice());
+        assert!(matches!(result, Err(ModbusError::DeserializationError(_))));
+    }
+
+    #[test]
+    fn test_deserialize_read_holding_registers_rejects_trailing_bytes() {
+        let response = vec![3u8, 2u8, 0x01, 0x02, 0xFF];
+        let result = ModbusResponse::try_from(response.as_slice());
+        assert!(matches!(result, Err(ModbusError::DeserializationError(_))));
+    }
+
+    #[test]
+    fn test_deserialize_write_echo_rejects_trailing_bytes() {
+        let response = vec![6u8, 0x00, 0x10, 0x12, 0x34, 0xFF];
+        let result = ModbusResponse::try_from(response.as_slice());
+        assert!(matches!(result, Err(ModbusError::DeserializationError(_))));
+    }
+
+    #[test]
+    fn test_deserialize_exception_rejects_trailing_bytes() {
+        let response = vec![0x81u8, 0x02, 0xFF];
+        let result = ModbusResponse::try_from(response.as_slice());
+        assert!(matches!(result, Err(ModbusError::DeserializationError(_))));
     }
 
     #[test]

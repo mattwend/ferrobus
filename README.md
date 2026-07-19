@@ -85,6 +85,25 @@ a cancellation in one caller cannot interrupt a partially written Modbus TCP fra
 Use `send_message_with_unit_id` or `with_unit_id(...)` when talking to multiple devices behind one
 Modbus TCP gateway.
 
+## Word order for wide values
+
+Modbus protocol fields, MBAP headers, addresses, quantities, and each individual 16-bit register
+are always encoded big-endian on the wire. `ferrobus::WordOrder` only controls how already-decoded
+consecutive registers are combined into 32-bit and 64-bit application values.
+
+```rust
+use ferrobus::WordOrder;
+
+let registers = [0x0000, 0x3F80];
+let value = WordOrder::LittleEndian.decode_f32(registers);
+assert_eq!(value.to_bits(), 1.0f32.to_bits());
+```
+
+Use `WordOrder::BigEndian` (the default) for most-significant-word-first devices and
+`WordOrder::LittleEndian` for least-significant-word-first devices. Decode helpers are available for
+`u32`, `i32`, `f32`, `u64`, `i64`, and `f64`, including block decode methods that validate register
+counts.
+
 ## Timeouts and retries
 
 `ModbusTcpConnection::connect(...)` uses sensible defaults for connect, write, and response timeouts.
@@ -119,7 +138,10 @@ bounded backlog that applies backpressure to callers. Invalid flow-control setti
 `ModbusTcpFlowControl::serial_gateway()` for RTU gateways that drain one serial bus sequentially.
 Queue wait is bounded by `queue_timeout`; the `response_timeout` clock starts only after the actor
 successfully writes the frame to the socket. A single response timeout fails that transaction,
-quarantines its transaction ID to avoid late-response aliasing, and keeps the TCP socket open.
+quarantines its transaction ID to avoid late-response aliasing, and keeps the TCP socket open. If a
+connection attempt fails while callers are parked on a full request queue, one parked caller may be
+admitted after the actor drains the backlog and can observe one additional failing connect attempt
+before its request fails or its queue deadline elapses.
 
 By default, transient TCP connect/write/read/queue failures and gateway-busy exception responses
 (`0x05`, `0x06`, `0x0A`, `0x0B`) are retried with exponential backoff starting at 500 ms,
@@ -167,6 +189,7 @@ Examples:
 ```bash
 cargo run --features cli --example modbus_cli -- read coils 0 8
 cargo run --features cli --example modbus_cli -- --address 192.168.1.10 read holding 100 4
+cargo run --features cli --example modbus_cli -- read holding 100 2 --as f32 --word-order little
 cargo run --features cli --example modbus_cli -- write coil 12 on
 cargo run --features cli --example modbus_cli -- --output hex write register 200 4660
 cargo run --features cli --example modbus_cli -- write coils 16 1 0 1 1
@@ -178,4 +201,7 @@ The CLI accepts:
 
 - coil values as `1`, `0`, `true`, `false`, `on`, or `off`
 - register output in `decimal` or `hex`
+- holding/input register reads can decode `u32`, `i32`, `f32`, `u64`, `i64`, or `f64` via
+  `--value-type`/`--as`; `--word-order {big,little}` applies only to these wide read values and
+  does not change Modbus wire byte order
 - global connection options such as `--address`, `--port`, `--unit-id`, and `--transaction-id`

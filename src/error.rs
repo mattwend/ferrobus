@@ -100,6 +100,64 @@ pub enum ModbusError {
     ValidationError(String),
 }
 
+impl PartialEq for ModbusError {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::ConnectError(lhs), Self::ConnectError(rhs))
+            | (Self::WriteError(lhs), Self::WriteError(rhs))
+            | (Self::ReadError(lhs), Self::ReadError(rhs)) => io_errors_equal(lhs, rhs),
+            (Self::ConnectTimeout, Self::ConnectTimeout)
+            | (Self::WriteTimeout, Self::WriteTimeout)
+            | (Self::ReadTimeout, Self::ReadTimeout)
+            | (Self::QueueTimeout, Self::QueueTimeout)
+            | (Self::NoFreeTransactionId, Self::NoFreeTransactionId) => true,
+            (Self::MalformedResponse(lhs), Self::MalformedResponse(rhs))
+            | (Self::DeserializationError(lhs), Self::DeserializationError(rhs))
+            | (Self::RequestResponseMismatch(lhs), Self::RequestResponseMismatch(rhs))
+            | (Self::ValidationError(lhs), Self::ValidationError(rhs)) => lhs == rhs,
+            (
+                Self::ExceptionResponse {
+                    function: lhs_function,
+                    code: lhs_code,
+                },
+                Self::ExceptionResponse {
+                    function: rhs_function,
+                    code: rhs_code,
+                },
+            ) => lhs_function == rhs_function && lhs_code == rhs_code,
+            (
+                Self::TransactionIdMismatch {
+                    expected: lhs_expected,
+                    actual: lhs_actual,
+                },
+                Self::TransactionIdMismatch {
+                    expected: rhs_expected,
+                    actual: rhs_actual,
+                },
+            ) => lhs_expected == rhs_expected && lhs_actual == rhs_actual,
+            (
+                Self::ProtocolIdMismatch { actual: lhs_actual },
+                Self::ProtocolIdMismatch { actual: rhs_actual },
+            ) => lhs_actual == rhs_actual,
+            (
+                Self::UnitIdMismatch {
+                    expected: lhs_expected,
+                    actual: lhs_actual,
+                },
+                Self::UnitIdMismatch {
+                    expected: rhs_expected,
+                    actual: rhs_actual,
+                },
+            ) => lhs_expected == rhs_expected && lhs_actual == rhs_actual,
+            _ => false,
+        }
+    }
+}
+
+fn io_errors_equal(lhs: &std::io::Error, rhs: &std::io::Error) -> bool {
+    lhs.kind() == rhs.kind() && lhs.to_string() == rhs.to_string()
+}
+
 impl ModbusError {
     /// Returns `true` if this error represents a transient transport failure
     /// that callers may safely retry (connect, read, or write I/O failures,
@@ -137,6 +195,53 @@ impl ModbusError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn modbus_error_equality_compares_payloads() {
+        assert_eq!(ModbusError::ConnectTimeout, ModbusError::ConnectTimeout);
+        assert_eq!(
+            ModbusError::ValidationError("bad quantity".to_string()),
+            ModbusError::ValidationError("bad quantity".to_string())
+        );
+        assert_ne!(
+            ModbusError::ValidationError("left".to_string()),
+            ModbusError::ValidationError("right".to_string())
+        );
+        assert_eq!(
+            ModbusError::ExceptionResponse {
+                function: 0x83,
+                code: 0x06,
+            },
+            ModbusError::ExceptionResponse {
+                function: 0x83,
+                code: 0x06,
+            }
+        );
+    }
+
+    #[test]
+    fn io_error_equality_compares_kind_and_message() {
+        assert_eq!(
+            ModbusError::ReadError(Arc::new(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "read timed out",
+            ))),
+            ModbusError::ReadError(Arc::new(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "read timed out",
+            )))
+        );
+        assert_ne!(
+            ModbusError::ReadError(Arc::new(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "read timed out",
+            ))),
+            ModbusError::ReadError(Arc::new(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "read timed out",
+            )))
+        );
+    }
 
     #[test]
     fn gateway_busy_exception_codes_are_classified() {

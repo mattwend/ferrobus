@@ -14,6 +14,10 @@ pub struct ModbusTcpFlowControl {
     /// Maximum number of transactions on the wire at once. Must be >= 1.
     pub max_in_flight: usize,
     /// Maximum number of admitted-but-not-yet-on-wire requests buffered in the actor.
+    ///
+    /// This value is used as the actual bounded `mpsc` request-channel capacity. The default is
+    /// `COMMAND_CHANNEL_CAPACITY`, keeping the documented queue depth and channel capacity tied
+    /// to one constant.
     pub max_queue_depth: usize,
     /// Maximum time a request may wait between submission and reaching the wire.
     pub queue_timeout: Duration,
