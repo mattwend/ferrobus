@@ -14,7 +14,7 @@ use tracing::info;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    let connection = ModbusTcpConnection::connect("127.0.0.1", 502, 1).await?;
+    let connection = ModbusTcpConnection::open("127.0.0.1", 502, 1).await?;
     let mut tasks = Vec::new();
 
     for offset in 0..4 {

@@ -10,6 +10,7 @@
 //! - [`ModbusRequest`] for building requests
 //! - [`ModbusResponse`] for parsing responses
 //! - [`tcp::ModbusTcpConnection`] for sending requests over Modbus TCP
+//! - [`tcp::ConnectionStatus`] for observing the connection lifecycle
 
 /// Error types returned by this crate.
 pub mod error;
@@ -28,3 +29,4 @@ mod word_order;
 pub use word_order::{WordOrder, WordOrderError};
 
 pub mod tcp;
+pub use tcp::ConnectionStatus;

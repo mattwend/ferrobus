@@ -17,6 +17,7 @@ use tracing::{debug, trace, warn};
 use crate::tcp::adu::build_modbus_tcp_adu;
 use crate::tcp::codec::{MbapCodec, MbapCodecError};
 use crate::tcp::flow::ModbusTcpFlowControl;
+use crate::tcp::status::ConnectionStatus;
 use crate::tcp::tcp_connection::ModbusTcpConnection;
 use crate::tcp::timeouts::ModbusTcpTimeouts;
 use crate::{ModbusRequest, error::ModbusError};
@@ -70,11 +71,13 @@ pub(crate) struct Actor {
     flow: ModbusTcpFlowControl,
     ctrl_rx: mpsc::Receiver<ControlCommand>,
     req_rx: mpsc::Receiver<RequestCommand>,
-    connected_tx: watch::Sender<bool>,
+    connected_tx: watch::Sender<ConnectionStatus>,
     framed: Option<Framed<TcpStream, MbapCodec>>,
     pending: HashMap<u16, PendingEntry>,
     quarantined: HashMap<u16, Instant>,
     next_tid: u16,
+    /// Counts successful socket establishments; never decremented.
+    generation: u64,
     ctrl_closed: bool,
     req_closed: bool,
 }
@@ -89,7 +92,7 @@ impl Actor {
         transaction_id: u16,
         ctrl_rx: mpsc::Receiver<ControlCommand>,
         req_rx: mpsc::Receiver<RequestCommand>,
-        connected_tx: watch::Sender<bool>,
+        connected_tx: watch::Sender<ConnectionStatus>,
     ) -> Self {
         Self {
             host,
@@ -103,6 +106,7 @@ impl Actor {
             pending: HashMap::new(),
             quarantined: HashMap::new(),
             next_tid: transaction_id,
+            generation: 0,
             ctrl_closed: false,
             req_closed: false,
         }
@@ -171,6 +175,12 @@ impl Actor {
         if self.framed.is_some() {
             return Ok(());
         }
+        // Reject before dialing: a wrapped generation would break the documented
+        // monotonic contract, and no socket must exist that we cannot describe.
+        let next_generation = self
+            .generation
+            .checked_add(1)
+            .ok_or_else(generation_exhausted_error)?;
         let stream = ModbusTcpConnection::connect_stream(
             &self.host,
             self.port,
@@ -178,9 +188,8 @@ impl Actor {
         )
         .await?;
         self.framed = Some(Framed::new(stream, MbapCodec));
-        if self.connected_tx.send(true).is_err() {
-            trace!("no connection-state subscribers to notify of connect");
-        }
+        self.generation = next_generation;
+        self.publish_status(true);
         Ok(())
     }
 
@@ -331,16 +340,42 @@ impl Actor {
         }
     }
 
+    /// Publishes the current connection status, carrying the unchanged generation.
+    ///
+    /// Publication is suppressed when the value is identical to the currently
+    /// observed one, so an idempotent `disconnect` does not wake subscribers
+    /// that were promised the *next transition*.
+    fn publish_status(&self, connected: bool) {
+        let status = ConnectionStatus {
+            connected,
+            generation: self.generation,
+        };
+        let notified = self.connected_tx.send_if_modified(|current| {
+            if *current == status {
+                return false;
+            }
+            *current = status;
+            true
+        });
+        if !notified {
+            trace!(?status, "connection status unchanged; skipping publication");
+        }
+    }
+
     fn teardown(&mut self, reason: Option<ModbusError>) {
         self.framed = None;
-        if self.connected_tx.send(false).is_err() {
-            trace!("no connection-state subscribers to notify of teardown");
-        }
+        self.publish_status(false);
         let error = reason.unwrap_or_else(default_teardown_error);
         for (_, entry) in self.pending.drain() {
             notify_waiter(entry.reply, Err(error.clone()));
         }
     }
+}
+
+fn generation_exhausted_error() -> ModbusError {
+    ModbusError::ConnectError(Arc::new(io::Error::other(
+        "connection generation counter exhausted",
+    )))
 }
 
 fn default_teardown_error() -> ModbusError {
@@ -381,11 +416,12 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::*;
+    use crate::tcp::test_support::{accept_and_hold_server, dead_server_addr};
 
     fn actor_with_seed(seed: u16) -> Actor {
         let (_ctrl_tx, ctrl_rx) = mpsc::channel(1);
         let (_req_tx, req_rx) = mpsc::channel(1);
-        let (connected_tx, _connected_rx) = watch::channel(false);
+        let (connected_tx, _connected_rx) = watch::channel(ConnectionStatus::disconnected());
         Actor::new(
             "127.0.0.1".to_string(),
             502,
@@ -521,7 +557,7 @@ mod tests {
     async fn fail_backlog_drains_queued_requests_after_connect_failure() {
         let (_ctrl_tx, ctrl_rx) = mpsc::channel(1);
         let (req_tx, req_rx) = mpsc::channel(2);
-        let (connected_tx, _connected_rx) = watch::channel(false);
+        let (connected_tx, _connected_rx) = watch::channel(ConnectionStatus::disconnected());
         let mut actor = Actor::new(
             "127.0.0.1".to_string(),
             502,
@@ -583,7 +619,7 @@ mod tests {
 
         let (ctrl_tx, ctrl_rx) = mpsc::channel(1);
         let (req_tx, req_rx) = mpsc::channel(2);
-        let (connected_tx, _connected_rx) = watch::channel(false);
+        let (connected_tx, _connected_rx) = watch::channel(ConnectionStatus::disconnected());
         let actor = Actor::new(
             dead_addr.ip().to_string(),
             dead_addr.port(),
@@ -717,7 +753,7 @@ mod tests {
         });
         let (_ctrl_tx, ctrl_rx) = mpsc::channel(1);
         let (_req_tx, req_rx) = mpsc::channel(1);
-        let (connected_tx, connected_rx) = watch::channel(false);
+        let (connected_tx, connected_rx) = watch::channel(ConnectionStatus::disconnected());
         drop(connected_rx);
         let mut actor = Actor::new(
             addr.ip().to_string(),
@@ -733,6 +769,163 @@ mod tests {
         actor.ensure_connected().await.unwrap();
 
         assert!(actor.framed.is_some());
+    }
+
+    /// The generation counter must move exactly once per successful establishment,
+    /// stay put across a teardown, and advance again on the following reconnect.
+    #[tokio::test]
+    async fn generation_counts_socket_establishments_only() {
+        let addr = accept_and_hold_server().await;
+        let (mut actor, connected_rx) = actor_for_addr(addr);
+
+        assert_eq!(
+            *connected_rx.borrow(),
+            ConnectionStatus {
+                connected: false,
+                generation: 0,
+            }
+        );
+
+        actor.ensure_connected().await.unwrap();
+        assert_eq!(
+            *connected_rx.borrow(),
+            ConnectionStatus {
+                connected: true,
+                generation: 1,
+            }
+        );
+
+        // An idempotent connect must not open a second socket, so the counter holds.
+        actor.ensure_connected().await.unwrap();
+        assert_eq!(connected_rx.borrow().generation, 1);
+
+        actor.teardown(None);
+        assert_eq!(
+            *connected_rx.borrow(),
+            ConnectionStatus {
+                connected: false,
+                generation: 1,
+            }
+        );
+
+        actor.ensure_connected().await.unwrap();
+        assert_eq!(
+            *connected_rx.borrow(),
+            ConnectionStatus {
+                connected: true,
+                generation: 2,
+            }
+        );
+    }
+
+    /// A repeated teardown republishes nothing, so subscribers promised the *next*
+    /// transition are not woken by an idempotent `disconnect`.
+    #[tokio::test]
+    async fn repeated_teardown_does_not_publish_identical_status() {
+        let addr = accept_and_hold_server().await;
+        let (mut actor, mut connected_rx) = actor_for_addr(addr);
+        actor.ensure_connected().await.unwrap();
+        connected_rx.mark_unchanged();
+
+        actor.teardown(None);
+        assert!(connected_rx.has_changed().unwrap());
+        connected_rx.mark_unchanged();
+
+        actor.teardown(None);
+
+        assert!(!connected_rx.has_changed().unwrap());
+        assert_eq!(
+            *connected_rx.borrow(),
+            ConnectionStatus {
+                connected: false,
+                generation: 1,
+            }
+        );
+    }
+
+    /// Suppressing the identical publication must not skip failing pending waiters.
+    #[tokio::test]
+    async fn teardown_without_status_change_still_fails_pending_waiters() {
+        let (mut actor, mut connected_rx) = actor_for_addr("127.0.0.1:1".parse().unwrap());
+        connected_rx.mark_unchanged();
+        let (entry, response) = pending_entry();
+        actor.pending.insert(7, entry);
+
+        actor.teardown(Some(ModbusError::QueueTimeout));
+
+        assert!(!connected_rx.has_changed().unwrap());
+        assert!(actor.pending.is_empty());
+        assert!(matches!(
+            response.await.unwrap(),
+            Err(ModbusError::QueueTimeout)
+        ));
+    }
+
+    /// The generation must never wrap: an exhausted counter rejects the connect attempt
+    /// instead of publishing a value that went backwards.
+    ///
+    /// The address deliberately has no listener: the guard must reject before dialing,
+    /// so a lost guard surfaces as a connect error instead of the exhaustion error.
+    /// (The branch itself is unreachable in practice — it needs ~1.8e19 reconnects —
+    /// but the guard is cheap and this keeps it honest.)
+    #[tokio::test]
+    async fn ensure_connected_rejects_exhausted_generation_without_dialing() {
+        let addr = dead_server_addr().await;
+        let (mut actor, connected_rx) = actor_for_addr(addr);
+        actor.generation = u64::MAX;
+
+        let error = actor.ensure_connected().await.unwrap_err();
+
+        assert_eq!(error, generation_exhausted_error());
+        assert!(actor.framed.is_none());
+        assert_eq!(actor.generation, u64::MAX);
+        assert!(!connected_rx.borrow().connected);
+    }
+
+    /// A connect attempt that fails must leave the generation where it was, so callers
+    /// never mistake a failed dial for a replaced socket.
+    ///
+    /// The published status alone cannot show this — a failed dial publishes nothing —
+    /// so the internal counter is asserted directly, and the following successful
+    /// connect must land on generation 1 rather than 2.
+    #[tokio::test]
+    async fn failed_connect_leaves_generation_unchanged() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let (mut actor, connected_rx) = actor_for_addr(addr);
+        actor.timeouts.connect_timeout = Duration::from_millis(200);
+
+        assert!(actor.ensure_connected().await.is_err());
+
+        assert!(actor.framed.is_none());
+        assert_eq!(actor.generation, 0);
+        assert_eq!(
+            *connected_rx.borrow(),
+            ConnectionStatus {
+                connected: false,
+                generation: 0,
+            }
+        );
+
+        // Re-bind the same address and let the retry succeed: the establishment that
+        // follows a failure is the *first* one, not the second.
+        let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+        tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+
+        actor.ensure_connected().await.unwrap();
+
+        assert_eq!(actor.generation, 1);
+        assert_eq!(
+            *connected_rx.borrow(),
+            ConnectionStatus {
+                connected: true,
+                generation: 1,
+            }
+        );
     }
 
     /// When every transaction id is already pending, a new request must be rejected
@@ -834,10 +1027,15 @@ mod tests {
         assert!(matches!(error, ModbusError::WriteError(_)));
     }
 
-    fn connected_actor_with_stream(stream: TcpStream) -> (Actor, watch::Receiver<bool>) {
+    fn connected_actor_with_stream(
+        stream: TcpStream,
+    ) -> (Actor, watch::Receiver<ConnectionStatus>) {
         let (_ctrl_tx, ctrl_rx) = mpsc::channel(1);
         let (_req_tx, req_rx) = mpsc::channel(1);
-        let (connected_tx, connected_rx) = watch::channel(true);
+        let (connected_tx, connected_rx) = watch::channel(ConnectionStatus {
+            connected: true,
+            generation: 1,
+        });
         let mut actor = Actor::new(
             "127.0.0.1".to_string(),
             502,
@@ -853,6 +1051,24 @@ mod tests {
             connected_tx,
         );
         actor.framed = Some(Framed::new(stream, MbapCodec));
+        actor.generation = 1;
+        (actor, connected_rx)
+    }
+
+    fn actor_for_addr(addr: std::net::SocketAddr) -> (Actor, watch::Receiver<ConnectionStatus>) {
+        let (_ctrl_tx, ctrl_rx) = mpsc::channel(1);
+        let (_req_tx, req_rx) = mpsc::channel(1);
+        let (connected_tx, connected_rx) = watch::channel(ConnectionStatus::disconnected());
+        let actor = Actor::new(
+            addr.ip().to_string(),
+            addr.port(),
+            ModbusTcpTimeouts::default(),
+            ModbusTcpFlowControl::default(),
+            0,
+            ctrl_rx,
+            req_rx,
+            connected_tx,
+        );
         (actor, connected_rx)
     }
 
@@ -944,7 +1160,7 @@ mod tests {
         ));
         assert!(actor.pending.is_empty());
         assert!(actor.framed.is_none());
-        assert!(!*connected_rx.borrow());
+        assert!(!connected_rx.borrow().connected);
 
         assert_next_request_reconnects(&mut actor).await;
     }
@@ -988,7 +1204,7 @@ mod tests {
         ));
         assert!(actor.pending.is_empty());
         assert!(actor.framed.is_none());
-        assert!(!*connected_rx.borrow());
+        assert!(!connected_rx.borrow().connected);
 
         assert_next_request_reconnects(&mut actor).await;
     }

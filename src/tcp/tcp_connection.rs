@@ -16,6 +16,7 @@ use crate::tcp::actor::{ControlCommand, RequestCommand};
 use crate::tcp::frame::MBAP_HEADER_LEN;
 use crate::tcp::retry::{ModbusTcpRetry, retry_transient};
 use crate::tcp::socket::ModbusTcpSocket;
+use crate::tcp::status::ConnectionStatus;
 #[cfg(test)]
 use crate::tcp::timeouts::ModbusTcpTimeouts;
 use crate::{ModbusRequest, ModbusResponse, error::ModbusError};
@@ -24,7 +25,7 @@ use crate::{ModbusRequest, ModbusResponse, error::ModbusError};
 ///
 /// Construct a handle with [`ModbusTcpSocket::connect`] when custom timeouts,
 /// flow control, retry, or an initial transaction-id seed are needed. Use
-/// [`ModbusTcpConnection::connect`] for the default configuration shortcut. Both
+/// [`ModbusTcpConnection::open`] for the default configuration shortcut. Both
 /// paths spawn the background actor and eagerly open the first TCP connection
 /// before returning this live handle.
 ///
@@ -35,12 +36,18 @@ use crate::{ModbusRequest, ModbusResponse, error::ModbusError};
 /// bounded by flow-control settings; response timeout starts when the actor
 /// writes the request on the socket. Use [`Self::with_unit_id`] to derive another
 /// live handle that shares the same actor with a different default unit id.
+///
+/// The connection lifecycle is driven from this handle: [`Self::connect`] and
+/// [`Self::disconnect`] open and close the actor's socket without replacing the
+/// actor, and [`Self::status`] / [`Self::watch_status`] report the current
+/// [`ConnectionStatus`], including a generation counter that identifies the
+/// socket currently in use.
 #[derive(Clone, Debug)]
 pub struct ModbusTcpConnection {
     req_tx: mpsc::Sender<RequestCommand>,
-    pub(crate) ctrl_tx: mpsc::Sender<ControlCommand>,
+    ctrl_tx: mpsc::Sender<ControlCommand>,
     unit_id: u8,
-    connected: watch::Receiver<bool>,
+    connected: watch::Receiver<ConnectionStatus>,
     queue_timeout: Duration,
     retry: Option<ModbusTcpRetry>,
 }
@@ -50,7 +57,7 @@ impl ModbusTcpConnection {
         req_tx: mpsc::Sender<RequestCommand>,
         ctrl_tx: mpsc::Sender<ControlCommand>,
         unit_id: u8,
-        connected: watch::Receiver<bool>,
+        connected: watch::Receiver<ConnectionStatus>,
         queue_timeout: Duration,
         retry: Option<ModbusTcpRetry>,
     ) -> Self {
@@ -64,18 +71,21 @@ impl ModbusTcpConnection {
         }
     }
 
-    /// Connects to a Modbus TCP server with default construction settings.
+    /// Opens a connection to a Modbus TCP server with default construction settings.
     ///
     /// `host` may be a DNS name or numeric IP address. `port` is the TCP port,
     /// and `unit_id` is the default Modbus unit id used by the returned live
     /// handle. This is a shortcut for configuring a [`ModbusTcpSocket`] with
     /// defaults and awaiting [`ModbusTcpSocket::connect`].
     ///
+    /// This associated function was named `connect` before `0.2.0`; that name
+    /// now belongs to the live-handle method [`Self::connect`].
+    ///
     /// # Errors
     ///
     /// Returns validation, connection, timeout, or actor-termination errors from
     /// [`ModbusTcpSocket::connect`].
-    pub async fn connect(
+    pub async fn open(
         host: impl Into<String>,
         port: u16,
         unit_id: u8,
@@ -113,11 +123,57 @@ impl ModbusTcpConnection {
         Ok(stream)
     }
 
+    /// Opens the TCP session for this handle's actor if one is not already open.
+    ///
+    /// The method waits until the actor has processed the connect command. It is
+    /// idempotent: if a socket is already open the actor acknowledges
+    /// immediately without dialing again, leaving
+    /// [`ConnectionStatus::generation`] unchanged. A successful dial increments
+    /// the generation by one.
+    ///
+    /// Unlike [`Self::open`], this reuses the existing background actor. No
+    /// second actor is spawned and every clone of this handle, including those
+    /// from [`Self::with_unit_id`], observes the reopened socket.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ModbusError::ConnectError`] or [`ModbusError::ConnectTimeout`]
+    /// if the socket cannot be opened, or a transport error if the actor has
+    /// already terminated.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use ferrobus::tcp::ModbusTcpConnection;
+    ///
+    /// # async fn run() -> Result<(), ferrobus::ModbusError> {
+    /// let connection = ModbusTcpConnection::open("127.0.0.1", 502, 1).await?;
+    /// let before = connection.status().generation;
+    /// connection.disconnect().await;
+    ///
+    /// // Reopen the same actor's socket: the generation advances by one, so any
+    /// // device state negotiated over the previous socket must be re-negotiated.
+    /// connection.connect().await?;
+    /// let after = connection.status().generation;
+    /// println!("socket replaced: generation {before} -> {after}");
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn connect(&self) -> Result<(), ModbusError> {
+        let (ack, reply) = oneshot::channel();
+        self.ctrl_tx
+            .send(ControlCommand::Connect { ack })
+            .await
+            .map_err(|_| actor_terminated_error())?;
+        reply.await.map_err(|_| actor_terminated_error())?
+    }
+
     /// Closes the current TCP session if one is open.
     ///
     /// The method waits until the actor has processed the disconnect command,
     /// making subsequent `is_connected` reads observe the cleared state unless
-    /// another handle reconnects afterward.
+    /// another handle reconnects afterward. A teardown never changes
+    /// [`ConnectionStatus::generation`].
     pub async fn disconnect(&self) {
         let (ack, processed) = oneshot::channel();
         if let Err(error) = self.ctrl_tx.send(ControlCommand::Disconnect { ack }).await {
@@ -129,10 +185,84 @@ impl ModbusTcpConnection {
         }
     }
 
+    /// Returns the current connection status of this handle's actor.
+    ///
+    /// This is a snapshot of the value most recently published by the actor.
+    /// Cache [`ConnectionStatus::generation`] alongside any device state
+    /// negotiated over the connection and re-negotiate when it changes: a moved
+    /// generation means the socket was replaced and the peer may have rebooted.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use ferrobus::tcp::ModbusTcpConnection;
+    ///
+    /// # async fn run() -> Result<(), ferrobus::ModbusError> {
+    /// let connection = ModbusTcpConnection::open("127.0.0.1", 502, 1).await?;
+    /// let mut negotiated_at = connection.status().generation;
+    ///
+    /// // ... later, before trusting negotiated device state ...
+    /// let current = connection.status();
+    /// if current.generation != negotiated_at {
+    ///     // The socket was replaced; re-negotiate before resuming traffic and
+    ///     // record the generation the fresh state belongs to.
+    ///     negotiated_at = current.generation;
+    /// }
+    /// # let _ = negotiated_at;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn status(&self) -> ConnectionStatus {
+        *self.connected.borrow()
+    }
+
+    /// Subscribes to connection status changes.
+    ///
+    /// The returned receiver starts with the current status already marked as
+    /// seen, so the first
+    /// [`changed`](tokio::sync::watch::Receiver::changed) resolves on the next
+    /// transition. The actor publishes on every socket establishment and every
+    /// teardown, so a drop and the following reconnect are two distinct
+    /// changes. A subscriber that only samples after both still sees a changed
+    /// generation. Publications that would repeat the current status are
+    /// suppressed, so an idempotent [`Self::disconnect`] does not resolve
+    /// `changed`.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use ferrobus::tcp::ModbusTcpConnection;
+    ///
+    /// # async fn run() -> Result<(), ferrobus::ModbusError> {
+    /// let connection = ModbusTcpConnection::open("127.0.0.1", 502, 1).await?;
+    /// let mut status = connection.watch_status();
+    ///
+    /// tokio::spawn(async move {
+    ///     while status.changed().await.is_ok() {
+    ///         let current = *status.borrow_and_update();
+    ///         println!(
+    ///             "connected={} generation={}",
+    ///             current.connected, current.generation
+    ///         );
+    ///     }
+    /// });
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn watch_status(&self) -> watch::Receiver<ConnectionStatus> {
+        let mut status = self.connected.clone();
+        status.mark_unchanged();
+        status
+    }
+
     /// Returns whether this handle currently owns an open TCP stream.
+    ///
+    /// Equivalent to [`Self::status`]`().connected`.
     #[allow(clippy::unused_async)]
     pub async fn is_connected(&self) -> bool {
-        *self.connected.borrow()
+        self.status().connected
     }
 
     async fn send_once(
@@ -245,20 +375,11 @@ pub(crate) fn actor_terminated_error() -> ModbusError {
 }
 
 #[cfg(test)]
-#[allow(clippy::panic, clippy::unwrap_used)]
+#[allow(clippy::panic, clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::tcp::test_support::accept_and_hold_server;
     use tokio::net::TcpListener;
-
-    async fn accept_and_hold_server() -> std::net::SocketAddr {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            let (_stream, _) = listener.accept().await.unwrap();
-            std::future::pending::<()>().await;
-        });
-        addr
-    }
 
     fn spawn_actor_with_timeouts(
         host: impl Into<String>,
@@ -271,16 +392,6 @@ mod tests {
             .with_initial_transaction_id(transaction_id)
             .with_timeouts(timeouts)
             .spawn_actor()
-    }
-
-    async fn warm_up_actor(connection: &ModbusTcpConnection) -> Result<(), ModbusError> {
-        let (ack, reply) = oneshot::channel();
-        connection
-            .ctrl_tx
-            .send(ControlCommand::Connect { ack })
-            .await
-            .map_err(|_| actor_terminated_error())?;
-        reply.await.map_err(|_| actor_terminated_error())?
     }
 
     #[tokio::test]
@@ -352,7 +463,7 @@ mod tests {
             ModbusTcpTimeouts::default(),
         );
         let clone = connection.clone();
-        warm_up_actor(&connection).await.unwrap();
+        connection.connect().await.unwrap();
         assert!(connection.is_connected().await);
 
         drop(connection);
@@ -368,7 +479,7 @@ mod tests {
     async fn with_unit_id_keeps_retry_policy_and_overrides_unit() {
         let (req_tx, _req_rx) = mpsc::channel(1);
         let (ctrl_tx, _ctrl_rx) = mpsc::channel(1);
-        let (_connected_tx, connected) = watch::channel(false);
+        let (_connected_tx, connected) = watch::channel(ConnectionStatus::disconnected());
         let connection = ModbusTcpConnection::from_actor_parts(
             req_tx,
             ctrl_tx,
@@ -386,7 +497,7 @@ mod tests {
     async fn send_once_backpressures_on_full_request_channel() {
         let (req_tx, _req_rx) = mpsc::channel(1);
         let (ctrl_tx, _ctrl_rx) = mpsc::channel(1);
-        let (_connected_tx, connected) = watch::channel(false);
+        let (_connected_tx, connected) = watch::channel(ConnectionStatus::disconnected());
         let (reply, _response) = oneshot::channel();
         req_tx
             .try_send(RequestCommand {
@@ -426,7 +537,7 @@ mod tests {
     fn handle_with_dead_actor() -> ModbusTcpConnection {
         let (req_tx, req_rx) = mpsc::channel(1);
         let (ctrl_tx, ctrl_rx) = mpsc::channel(1);
-        let (_connected_tx, connected) = watch::channel(false);
+        let (_connected_tx, connected) = watch::channel(ConnectionStatus::disconnected());
         drop(req_rx);
         drop(ctrl_rx);
         ModbusTcpConnection::from_actor_parts(
@@ -478,7 +589,7 @@ mod tests {
     async fn disconnect_returns_when_actor_drops_ack() {
         let (req_tx, _req_rx) = mpsc::channel(1);
         let (ctrl_tx, mut ctrl_rx) = mpsc::channel(1);
-        let (_connected_tx, connected) = watch::channel(false);
+        let (_connected_tx, connected) = watch::channel(ConnectionStatus::disconnected());
         let connection = ModbusTcpConnection::from_actor_parts(
             req_tx,
             ctrl_tx,
@@ -502,7 +613,7 @@ mod tests {
     async fn send_once_reports_dropped_response_waiter() {
         let (req_tx, mut req_rx) = mpsc::channel(1);
         let (ctrl_tx, _ctrl_rx) = mpsc::channel(1);
-        let (_connected_tx, connected) = watch::channel(false);
+        let (_connected_tx, connected) = watch::channel(ConnectionStatus::disconnected());
         let connection = ModbusTcpConnection::from_actor_parts(
             req_tx,
             ctrl_tx,
@@ -537,7 +648,7 @@ mod tests {
     async fn send_once_rejects_short_frame_before_header_indexing() {
         let (req_tx, mut req_rx) = mpsc::channel(1);
         let (ctrl_tx, _ctrl_rx) = mpsc::channel(1);
-        let (_connected_tx, connected) = watch::channel(false);
+        let (_connected_tx, connected) = watch::channel(ConnectionStatus::disconnected());
         let connection = ModbusTcpConnection::from_actor_parts(
             req_tx,
             ctrl_tx,
@@ -596,9 +707,281 @@ mod tests {
             ModbusTcpTimeouts::default(),
         );
 
-        warm_up_actor(&connection).await.unwrap();
-        warm_up_actor(&connection).await.unwrap();
+        connection.connect().await.unwrap();
+        connection.connect().await.unwrap();
 
+        assert!(connection.is_connected().await);
+    }
+
+    /// A live handle must be able to open its own actor's socket, and doing so twice
+    /// must not dial again or move the generation.
+    #[tokio::test]
+    async fn handle_connect_opens_socket_and_is_idempotent() {
+        let addr = accept_and_hold_server().await;
+        let (connection, _actor_task) = spawn_actor_with_timeouts(
+            addr.ip().to_string(),
+            addr.port(),
+            1,
+            0,
+            ModbusTcpTimeouts::default(),
+        );
+        assert_eq!(
+            connection.status(),
+            ConnectionStatus {
+                connected: false,
+                generation: 0,
+            }
+        );
+
+        connection.connect().await.unwrap();
+        assert_eq!(
+            connection.status(),
+            ConnectionStatus {
+                connected: true,
+                generation: 1,
+            }
+        );
+
+        connection.connect().await.unwrap();
+        assert_eq!(
+            connection.status(),
+            ConnectionStatus {
+                connected: true,
+                generation: 1,
+            }
+        );
+    }
+
+    /// An unreachable peer must surface a connect error and leave the generation alone.
+    ///
+    /// The failed attempt publishes nothing, so `disconnected` on its own proves little:
+    /// the check that matters is the *following* successful connect landing on
+    /// generation 1. A counter bumped before the dial would show up here as 2.
+    #[tokio::test]
+    async fn handle_connect_reports_unreachable_peer_without_bumping_generation() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead_addr = listener.local_addr().unwrap();
+        drop(listener);
+        let (connection, _actor_task) = spawn_actor_with_timeouts(
+            dead_addr.ip().to_string(),
+            dead_addr.port(),
+            1,
+            0,
+            ModbusTcpTimeouts {
+                connect_timeout: Duration::from_millis(200),
+                ..ModbusTcpTimeouts::default()
+            },
+        );
+
+        let result = connection.connect().await;
+
+        assert!(matches!(
+            result,
+            Err(ModbusError::ConnectError(_) | ModbusError::ConnectTimeout)
+        ));
+        assert_eq!(
+            connection.status(),
+            ConnectionStatus {
+                connected: false,
+                generation: 0,
+            }
+        );
+
+        // Re-bind the same address so the retry succeeds against the same actor.
+        let listener = TcpListener::bind(dead_addr).await.unwrap();
+        tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+
+        connection.connect().await.unwrap();
+
+        assert_eq!(
+            connection.status(),
+            ConnectionStatus {
+                connected: true,
+                generation: 1,
+            }
+        );
+    }
+
+    /// Connecting through a handle whose actor already stopped must report the
+    /// terminated actor instead of hanging on the closed control channel.
+    #[tokio::test]
+    async fn handle_connect_reports_terminated_actor() {
+        let connection = handle_with_dead_actor();
+
+        let result = connection.connect().await;
+
+        assert!(matches!(
+            result,
+            Err(ModbusError::ReadError(error)) if error.kind() == io::ErrorKind::ConnectionAborted
+        ));
+    }
+
+    /// If the actor drops the connect acknowledgement without replying, the caller must
+    /// see a terminated-actor error rather than waiting forever.
+    #[tokio::test]
+    async fn handle_connect_reports_dropped_ack() {
+        let (req_tx, _req_rx) = mpsc::channel(1);
+        let (ctrl_tx, mut ctrl_rx) = mpsc::channel(1);
+        let (_connected_tx, connected) = watch::channel(ConnectionStatus::disconnected());
+        let connection = ModbusTcpConnection::from_actor_parts(
+            req_tx,
+            ctrl_tx,
+            1,
+            connected,
+            Duration::from_millis(50),
+            None,
+        );
+        tokio::spawn(async move {
+            if let Some(ControlCommand::Connect { ack }) = ctrl_rx.recv().await {
+                drop(ack);
+            }
+        });
+
+        let result = connection.connect().await;
+
+        assert!(matches!(
+            result,
+            Err(ModbusError::ReadError(error)) if error.kind() == io::ErrorKind::ConnectionAborted
+        ));
+    }
+
+    /// A subscriber must observe the drop and the following reconnect as two distinct
+    /// changes, and the generation must identify the replacement socket. Reopening the
+    /// socket must reuse the same actor, so the generation continues rather than restarts.
+    ///
+    /// Both `changed` awaits are bounded: a missing publication must fail the test
+    /// rather than hang CI forever.
+    #[tokio::test]
+    async fn watch_status_observes_drop_and_reconnect_as_distinct_changes() {
+        let addr = accept_and_hold_server().await;
+        let connection = ModbusTcpSocket::new(addr.ip().to_string(), addr.port(), 1)
+            .connect()
+            .await
+            .unwrap();
+        let mut status = connection.watch_status();
+
+        connection.disconnect().await;
+        timeout(Duration::from_millis(500), status.changed())
+            .await
+            .expect("teardown must publish a status change")
+            .unwrap();
+        assert_eq!(
+            *status.borrow_and_update(),
+            ConnectionStatus {
+                connected: false,
+                generation: 1,
+            }
+        );
+
+        connection.connect().await.unwrap();
+        timeout(Duration::from_millis(500), status.changed())
+            .await
+            .expect("reconnect must publish a status change")
+            .unwrap();
+        assert_eq!(
+            *status.borrow_and_update(),
+            ConnectionStatus {
+                connected: true,
+                generation: 2,
+            }
+        );
+    }
+
+    /// A subscriber that samples only before and after a full drop/reconnect cycle sees
+    /// `connected: true` both times, but a changed generation — the property a
+    /// `watch<bool>` collapses away.
+    #[tokio::test]
+    async fn watch_status_exposes_reconnect_to_a_late_sampler() {
+        let addr = accept_and_hold_server().await;
+        let connection = ModbusTcpSocket::new(addr.ip().to_string(), addr.port(), 1)
+            .connect()
+            .await
+            .unwrap();
+        let status = connection.watch_status();
+        let before = *status.borrow();
+
+        connection.disconnect().await;
+        connection.connect().await.unwrap();
+        connection.disconnect().await;
+        connection.connect().await.unwrap();
+
+        let after = *status.borrow();
+        assert_eq!(
+            before,
+            ConnectionStatus {
+                connected: true,
+                generation: 1,
+            }
+        );
+        assert_eq!(
+            after,
+            ConnectionStatus {
+                connected: true,
+                generation: 3,
+            }
+        );
+    }
+
+    /// A redundant `disconnect` must not fabricate a transition for subscribers.
+    #[tokio::test]
+    async fn watch_status_ignores_redundant_disconnect() {
+        let addr = accept_and_hold_server().await;
+        let connection = ModbusTcpSocket::new(addr.ip().to_string(), addr.port(), 1)
+            .connect()
+            .await
+            .unwrap();
+        let mut status = connection.watch_status();
+
+        connection.disconnect().await;
+        status.changed().await.unwrap();
+        let after_first = *status.borrow_and_update();
+
+        connection.disconnect().await;
+
+        assert!(
+            timeout(Duration::from_millis(50), status.changed())
+                .await
+                .is_err()
+        );
+        assert_eq!(*status.borrow(), after_first);
+    }
+
+    /// A fresh subscription must start with the current value marked as seen, so
+    /// `changed` only resolves on an actual transition.
+    #[tokio::test]
+    async fn watch_status_starts_with_current_value_marked_seen() {
+        let addr = accept_and_hold_server().await;
+        let connection = ModbusTcpSocket::new(addr.ip().to_string(), addr.port(), 1)
+            .connect()
+            .await
+            .unwrap();
+        let mut status = connection.watch_status();
+
+        assert!(
+            timeout(Duration::from_millis(50), status.changed())
+                .await
+                .is_err()
+        );
+    }
+
+    /// Clones and unit-id derivations share one actor, hence one generation counter.
+    #[tokio::test]
+    async fn clones_share_one_generation_counter() {
+        let addr = accept_and_hold_server().await;
+        let connection = ModbusTcpSocket::new(addr.ip().to_string(), addr.port(), 1)
+            .connect()
+            .await
+            .unwrap();
+        let sibling = connection.with_unit_id(7);
+
+        connection.disconnect().await;
+        sibling.connect().await.unwrap();
+
+        assert_eq!(connection.status(), sibling.status());
+        assert_eq!(connection.status().generation, 2);
         assert!(connection.is_connected().await);
     }
 }

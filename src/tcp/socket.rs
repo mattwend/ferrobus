@@ -3,14 +3,15 @@
 
 //! Configurable Modbus TCP socket phase.
 
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
 use crate::error::ModbusError;
-use crate::tcp::actor::{Actor, ControlCommand, RequestCommand, control_channel_capacity};
+use crate::tcp::actor::{Actor, RequestCommand, control_channel_capacity};
 use crate::tcp::flow::ModbusTcpFlowControl;
 use crate::tcp::retry::ModbusTcpRetry;
-use crate::tcp::tcp_connection::{ModbusTcpConnection, actor_terminated_error};
+use crate::tcp::status::ConnectionStatus;
+use crate::tcp::tcp_connection::ModbusTcpConnection;
 use crate::tcp::timeouts::ModbusTcpTimeouts;
 
 /// Configurable Modbus TCP connection phase.
@@ -101,9 +102,11 @@ impl ModbusTcpSocket {
     /// Spawns the actor, eagerly opens the first TCP connection, and returns a live handle.
     ///
     /// Flow control is validated before channels are allocated. On success, the
-    /// actor is spawned and the existing actor control path is used to perform
-    /// an eager warm-up connect before the live [`ModbusTcpConnection`] is
-    /// returned.
+    /// actor is spawned and [`ModbusTcpConnection::connect`] performs an eager
+    /// warm-up connect before the live [`ModbusTcpConnection`] is returned. The
+    /// returned handle therefore reports
+    /// [`ConnectionStatus`](crate::tcp::ConnectionStatus) `{ connected: true,
+    /// generation: 1 }`.
     ///
     /// # Errors
     ///
@@ -115,20 +118,14 @@ impl ModbusTcpSocket {
     pub async fn connect(self) -> Result<ModbusTcpConnection, ModbusError> {
         self.flow_control.validate()?;
         let (connection, _actor_task) = self.spawn_actor();
-        let (ack, reply) = oneshot::channel();
-        connection
-            .ctrl_tx
-            .send(ControlCommand::Connect { ack })
-            .await
-            .map_err(|_| actor_terminated_error())?;
-        reply.await.map_err(|_| actor_terminated_error())??;
+        connection.connect().await?;
         Ok(connection)
     }
 
     pub(crate) fn spawn_actor(self) -> (ModbusTcpConnection, JoinHandle<()>) {
         let (req_tx, req_rx) = mpsc::channel::<RequestCommand>(self.flow_control.max_queue_depth);
         let (ctrl_tx, ctrl_rx) = mpsc::channel(control_channel_capacity());
-        let (connected_tx, connected) = watch::channel(false);
+        let (connected_tx, connected) = watch::channel(ConnectionStatus::disconnected());
         let actor = Actor::new(
             self.host,
             self.port,
