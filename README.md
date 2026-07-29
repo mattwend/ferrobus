@@ -20,6 +20,8 @@ Small Rust Modbus library with typed request/response PDUs and a reusable Modbus
 - Modbus TCP transport with:
   - two-phase `ModbusTcpSocket` → `ModbusTcpConnection` construction
   - eager, fallible first TCP connect followed by lazy reconnect after transport failures
+  - connection lifecycle on the live handle: `connect`, `disconnect`, and a subscribable
+    `ConnectionStatus` with a monotonic generation counter
   - reusable actor-owned connections with bounded request-channel backpressure
   - configurable in-flight window for slow gateway-backed buses
   - retry of transient I/O failures and gateway-busy exception responses
@@ -41,6 +43,14 @@ Add the crate to your project:
 ferrobus = "0.1.0"
 ```
 
+## Breaking changes
+
+- The convenience constructor `ModbusTcpConnection::connect(host, port, unit_id)` is renamed to
+  `ModbusTcpConnection::open(host, port, unit_id)`. The `connect` name now belongs to the
+  live-handle method `ModbusTcpConnection::connect(&self)`, which reopens the socket of the actor a
+  handle already owns. Existing call sites can either be renamed to `open(...)` or replaced with
+  the equivalent `ModbusTcpSocket::new(host, port, unit_id).connect().await`.
+
 ## Library usage
 
 Create a typed request and send it over Modbus TCP:
@@ -51,7 +61,7 @@ use ferrobus::{ModbusRequest, ModbusResponse};
 
 #[tokio::main]
 async fn main() -> Result<(), ferrobus::ModbusError> {
-    let connection = ModbusTcpConnection::connect("127.0.0.1", 502, 1).await?;
+    let connection = ModbusTcpConnection::open("127.0.0.1", 502, 1).await?;
 
     let response = connection
         .send_message(&ModbusRequest::ReadHoldingRegisters {
@@ -73,7 +83,7 @@ async fn main() -> Result<(), ferrobus::ModbusError> {
 }
 ```
 
-The TCP client accepts host names or numeric IP addresses. `ModbusTcpConnection::connect(...)`
+The TCP client accepts host names or numeric IP addresses. `ModbusTcpConnection::open(...)`
 is async and fallible: it opens the first TCP socket eagerly, then the live actor handle retries
 short-lived I/O failures and reconnects lazily after transport teardown. Internally, cloned
 handles send commands over a bounded channel to one actor task that owns the socket and MBAP codec;
@@ -84,6 +94,89 @@ a cancellation in one caller cannot interrupt a partially written Modbus TCP fra
 
 Use `send_message_with_unit_id` or `with_unit_id(...)` when talking to multiple devices behind one
 Modbus TCP gateway.
+
+## Connection lifecycle
+
+The live `ModbusTcpConnection` handle owns the connection lifecycle. It is a handle to one
+background actor that owns the socket; clones and `with_unit_id(...)` derivations share that actor.
+
+- `connect().await` opens the actor's socket. It is idempotent: if a socket is already open, the
+  actor acknowledges without dialing again. It reuses the existing actor, so no second actor is
+  spawned.
+- `disconnect().await` drops the current socket and fails pending requests, but keeps the actor
+  alive.
+- `status()` returns a `ConnectionStatus` snapshot; `watch_status()` returns a
+  `tokio::sync::watch::Receiver<ConnectionStatus>` so callers can await transitions instead of
+  polling. `is_connected().await` remains available as `status().connected`.
+
+Reconnection is on-demand, not a background loop. Any read/write/EOF failure tears the socket down;
+the next request to reach the actor opens a fresh one. There is no reconnect timer, task, or
+backoff inside the actor: reconnect *policy* stays with the caller, and `ModbusTcpRetry` covers
+same-call retry.
+
+### Generation contract
+
+`ConnectionStatus::generation` counts successful socket establishments on one actor:
+
+| event | status |
+| --- | --- |
+| before the first connect | `{ connected: false, generation: 0 }` |
+| after the first successful connect | `{ connected: true, generation: 1 }` |
+| after a teardown | `{ connected: false, generation: 1 }` |
+| after a failed connect attempt | unchanged |
+| after the next successful connect | `{ connected: true, generation: 2 }` |
+
+The counter never decreases. A changed `generation` therefore means the socket was replaced,
+regardless of how many drop/reconnect cycles happened in between and regardless of when the
+observer sampled — a `bool` connection flag collapses `true → false → true` and cannot express
+this. The counter is per actor: a handle from a new `ModbusTcpSocket::connect()` starts its own
+count at `1`.
+
+If your application negotiates device state over the connection (word order, scaling calibration,
+arming a device-side watchdog), cache the generation alongside that state and re-negotiate when it
+moves — the device may have rebooted underneath you:
+
+```rust,no_run
+use ferrobus::tcp::ModbusTcpConnection;
+
+struct Session {
+    connection: ModbusTcpConnection,
+    negotiated_at: u64,
+}
+
+impl Session {
+    async fn ensure_negotiated(&mut self) -> Result<(), ferrobus::ModbusError> {
+        let status = self.connection.status();
+        if !status.connected {
+            self.connection.connect().await?;
+        }
+        let generation = self.connection.status().generation;
+        if generation != self.negotiated_at {
+            // the socket was replaced: re-run device negotiation here
+            self.negotiated_at = generation;
+        }
+        Ok(())
+    }
+}
+```
+
+Do not wrap the handle in `Mutex<Option<ModbusTcpConnection>>` and discard it on the first I/O
+error. Dropping the handle stops requests from ever reaching the actor, which is exactly what
+defeats its on-demand reconnect. Keep the handle and watch the generation instead.
+
+To react to transitions instead of polling:
+
+```rust,no_run
+use ferrobus::tcp::ModbusTcpConnection;
+
+# async fn run(connection: ModbusTcpConnection) {
+let mut status = connection.watch_status();
+while status.changed().await.is_ok() {
+    let current = *status.borrow_and_update();
+    println!("connected={} generation={}", current.connected, current.generation);
+}
+# }
+```
 
 ## Word order for wide values
 
@@ -106,7 +199,7 @@ counts.
 
 ## Timeouts and retries
 
-`ModbusTcpConnection::connect(...)` uses sensible defaults for connect, write, and response timeouts.
+`ModbusTcpConnection::open(...)` uses sensible defaults for connect, write, and response timeouts.
 The write timeout covers both sending the frame and flushing the socket. If you need custom limits,
 configure a `ModbusTcpSocket` before calling `connect().await`.
 

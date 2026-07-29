@@ -22,7 +22,8 @@ mod support;
 
 use ferrobus::ModbusError;
 use ferrobus::tcp::{
-    ModbusTcpConnection, ModbusTcpFlowControl, ModbusTcpRetry, ModbusTcpSocket, ModbusTcpTimeouts,
+    ConnectionStatus, ModbusTcpConnection, ModbusTcpFlowControl, ModbusTcpRetry, ModbusTcpSocket,
+    ModbusTcpTimeouts,
 };
 use ferrobus::{ModbusRequest, ModbusResponse};
 
@@ -101,7 +102,7 @@ async fn send_read_coils_success() {
     })
     .await;
 
-    let conn = ModbusTcpConnection::connect(addr.ip().to_string(), addr.port(), 1)
+    let conn = ModbusTcpConnection::open(addr.ip().to_string(), addr.port(), 1)
         .await
         .unwrap();
 
@@ -137,7 +138,7 @@ async fn send_write_single_register_success() {
     })
     .await;
 
-    let conn = ModbusTcpConnection::connect(addr.ip().to_string(), addr.port(), 1)
+    let conn = ModbusTcpConnection::open(addr.ip().to_string(), addr.port(), 1)
         .await
         .unwrap();
 
@@ -201,7 +202,7 @@ async fn concurrent_in_flight_requests_are_matched_out_of_order() {
         stream.write_all(&first_response).await.unwrap();
     });
 
-    let conn = ModbusTcpConnection::connect(addr.ip().to_string(), addr.port(), 1)
+    let conn = ModbusTcpConnection::open(addr.ip().to_string(), addr.port(), 1)
         .await
         .unwrap();
 
@@ -390,7 +391,7 @@ async fn server_sends_invalid_mbap_length() {
         second_stream.write_all(&response).await.unwrap();
     });
 
-    let conn = ModbusTcpConnection::connect(addr.ip().to_string(), addr.port(), 1)
+    let conn = ModbusTcpConnection::open(addr.ip().to_string(), addr.port(), 1)
         .await
         .unwrap();
 
@@ -421,7 +422,7 @@ async fn send_messages_across_multiple_unit_ids_on_one_connection() {
     })
     .await;
 
-    let conn = ModbusTcpConnection::connect(addr.ip().to_string(), addr.port(), 1)
+    let conn = ModbusTcpConnection::open(addr.ip().to_string(), addr.port(), 1)
         .await
         .unwrap();
 
@@ -457,7 +458,7 @@ async fn send_message_returns_exception_response_as_typed_error() {
     })
     .await;
 
-    let conn = ModbusTcpConnection::connect(addr.ip().to_string(), addr.port(), 1)
+    let conn = ModbusTcpConnection::open(addr.ip().to_string(), addr.port(), 1)
         .await
         .unwrap();
 
@@ -490,7 +491,7 @@ async fn send_message_returns_protocol_id_mismatch_as_typed_error() {
     })
     .await;
 
-    let conn = ModbusTcpConnection::connect(addr.ip().to_string(), addr.port(), 1)
+    let conn = ModbusTcpConnection::open(addr.ip().to_string(), addr.port(), 1)
         .await
         .unwrap();
 
@@ -521,7 +522,7 @@ async fn send_message_returns_unit_id_mismatch_as_typed_error() {
     })
     .await;
 
-    let conn = ModbusTcpConnection::connect(addr.ip().to_string(), addr.port(), 1)
+    let conn = ModbusTcpConnection::open(addr.ip().to_string(), addr.port(), 1)
         .await
         .unwrap();
 
@@ -604,6 +605,14 @@ async fn stray_response_with_unknown_tid_is_ignored() {
     );
 }
 
+/// A dead reader must drain the pending request and let the same-call retry reconnect,
+/// and that replacement socket must be observable as a generation change so callers can
+/// invalidate device state negotiated over the old one. The observer samples only before
+/// and after the whole cycle — the property a `watch<bool>` would collapse away.
+///
+/// The retry that triggers the reconnect comes from the *default* retry policy on
+/// `ModbusTcpSocket` (500 ms initial delay); disabling retry would make the first send
+/// fail instead of reconnecting.
 #[tokio::test]
 async fn reader_death_drains_pending_and_next_call_reconnects() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -620,6 +629,8 @@ async fn reader_death_drains_pending_and_next_call_reconnects() {
         let response =
             make_read_coils_response(request.transaction_id, request.unit_id, &[true, false]);
         stream.write_all(&response).await.unwrap();
+        // Hold the replacement socket open so the final status is observed as connected.
+        std::future::pending::<()>().await;
     });
 
     let conn = ModbusTcpSocket::new(addr.ip().to_string(), addr.port(), 1)
@@ -632,18 +643,96 @@ async fn reader_death_drains_pending_and_next_call_reconnects() {
         .connect()
         .await
         .unwrap();
+    let status = conn.watch_status();
+    let before = *status.borrow();
+    assert_eq!(
+        before,
+        ConnectionStatus {
+            connected: true,
+            generation: 1,
+        }
+    );
     let request = ModbusRequest::ReadCoils {
         starting_address: 0x0000,
         quantity: 2,
     };
 
     let response = conn.send_message(&request).await.unwrap();
+
     assert_eq!(
         response,
         ModbusResponse::ReadCoils {
             coils: vec![true, false]
         }
     );
+    assert_eq!(
+        *status.borrow(),
+        ConnectionStatus {
+            connected: true,
+            generation: 2,
+        }
+    );
+}
+
+/// A live handle must reconnect its own actor after an explicit disconnect and keep
+/// serving requests over the replacement socket.
+#[tokio::test]
+async fn live_handle_reconnects_after_explicit_disconnect() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                while let Ok(request) = read_request_frame(&mut stream).await {
+                    let response = make_read_coils_response(
+                        request.transaction_id,
+                        request.unit_id,
+                        &[true, false],
+                    );
+                    if stream.write_all(&response).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+
+    let conn = ModbusTcpSocket::new(addr.ip().to_string(), addr.port(), 1)
+        .with_initial_transaction_id(0)
+        .connect()
+        .await
+        .unwrap();
+    assert_eq!(conn.status().generation, 1);
+
+    conn.disconnect().await;
+    assert!(!conn.is_connected().await);
+
+    conn.connect().await.unwrap();
+    assert_eq!(
+        conn.status(),
+        ConnectionStatus {
+            connected: true,
+            generation: 2,
+        }
+    );
+
+    let response = conn
+        .send_message(&ModbusRequest::ReadCoils {
+            starting_address: 0x0000,
+            quantity: 2,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response,
+        ModbusResponse::ReadCoils {
+            coils: vec![true, false]
+        }
+    );
+    // Serving the request must not have replaced the socket again.
+    assert_eq!(conn.status().generation, 2);
 }
 
 #[tokio::test]
