@@ -20,6 +20,8 @@ Small Rust Modbus library with typed request/response PDUs and a reusable Modbus
 - Modbus TCP transport with:
   - two-phase `ModbusTcpSocket` → `ModbusTcpConnection` construction
   - eager, fallible first TCP connect followed by lazy reconnect after transport failures
+  - `ModbusTcpSocket::spawn` for a live handle built without dialing, when the caller decides
+    when the first connect happens
   - connection lifecycle on the live handle: `connect`, `disconnect`, and a subscribable
     `ConnectionStatus` with a monotonic generation counter
   - reusable actor-owned connections with bounded request-channel backpressure

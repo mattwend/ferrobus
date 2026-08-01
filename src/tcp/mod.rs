@@ -7,7 +7,11 @@
 //! [`ModbusTcpSocket`] stores configurable settings without opening a network
 //! connection, then [`ModbusTcpSocket::connect`] validates those settings,
 //! eagerly opens the first TCP connection, and returns a live
-//! [`ModbusTcpConnection`] actor handle. [`ModbusTcpConnection::open`] is the
+//! [`ModbusTcpConnection`] actor handle. [`ModbusTcpSocket::spawn`] is the
+//! variant for callers that need the handle before the peer is reachable: it
+//! validates and spawns without dialing, leaving the first connect to the actor
+//! or to an explicit [`ModbusTcpConnection::connect`].
+//! [`ModbusTcpConnection::open`] is the
 //! default-configuration shortcut. Internal submodules keep ADU/MBAP frame
 //! construction, actor-based socket ownership, MBAP codec framing, and
 //! retry/timeout configuration separated by concern.

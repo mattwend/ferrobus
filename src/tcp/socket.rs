@@ -24,7 +24,8 @@ use crate::tcp::timeouts::ModbusTcpTimeouts;
 /// [`Self::with_initial_transaction_id`] when a diagnostic caller needs a custom
 /// MBAP transaction-id seed. Call [`ModbusTcpSocket::connect`] to validate flow
 /// control, spawn the actor, eagerly open the first TCP connection, consume the
-/// socket, and receive a live [`ModbusTcpConnection`].
+/// socket, and receive a live [`ModbusTcpConnection`]. Use [`ModbusTcpSocket::spawn`]
+/// when the handle must exist before the peer is reachable.
 #[derive(Clone, Debug)]
 pub struct ModbusTcpSocket {
     host: String,
@@ -116,9 +117,33 @@ impl ModbusTcpSocket {
     /// opened, or a transport error if the actor terminates before acknowledging
     /// the warm-up command.
     pub async fn connect(self) -> Result<ModbusTcpConnection, ModbusError> {
+        let connection = self.spawn()?;
+        connection.connect().await?;
+        Ok(connection)
+    }
+
+    /// Spawns the actor and returns a live handle without opening a TCP connection.
+    ///
+    /// Flow control is validated before channels are allocated, and the actor is
+    /// spawned on the current Tokio runtime, so this must be called from within a
+    /// runtime context. No dial is attempted: `host` is not resolved and the
+    /// returned handle reports
+    /// [`ConnectionStatus`](crate::tcp::ConnectionStatus) `{ connected: false,
+    /// generation: 0 }`.
+    ///
+    /// The socket is opened by the actor's on-demand connect when the first
+    /// request is dispatched, or eagerly by [`ModbusTcpConnection::connect`].
+    /// Use this instead of [`Self::connect`] when handle construction must be
+    /// infallible with respect to reachability — a supervised transport that is
+    /// built before its lifecycle decides when to dial, for example.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ModbusError::ValidationError`] if flow-control settings are
+    /// invalid.
+    pub fn spawn(self) -> Result<ModbusTcpConnection, ModbusError> {
         self.flow_control.validate()?;
         let (connection, _actor_task) = self.spawn_actor();
-        connection.connect().await?;
         Ok(connection)
     }
 
@@ -224,6 +249,62 @@ mod tests {
             .unwrap();
 
         assert!(connection.is_connected().await);
+    }
+
+    /// A spawned handle must be usable before the peer exists: no dial is attempted,
+    /// and the status reports the pre-connect state the generation contract starts from.
+    #[tokio::test]
+    async fn spawn_returns_a_live_handle_without_dialing() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let connection = ModbusTcpSocket::new(addr.ip().to_string(), addr.port(), 1)
+            .spawn()
+            .unwrap();
+
+        assert_eq!(connection.status(), ConnectionStatus::disconnected());
+        assert!(!connection.is_connected().await);
+    }
+
+    /// The socket a spawned handle never dialed is opened by the first explicit connect,
+    /// which is the same actor path a reconnect takes.
+    #[tokio::test]
+    async fn a_spawned_handle_connects_through_its_own_actor() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+
+        let connection = ModbusTcpSocket::new(addr.ip().to_string(), addr.port(), 1)
+            .spawn()
+            .unwrap();
+        connection.connect().await.unwrap();
+
+        assert_eq!(
+            connection.status(),
+            ConnectionStatus {
+                connected: true,
+                generation: 1,
+            }
+        );
+    }
+
+    /// Invalid flow control is a construction bug and must be rejected before any
+    /// channel or task exists, on both construction paths.
+    #[test]
+    fn spawn_validates_flow_control() {
+        let flow_control = ModbusTcpFlowControl {
+            max_in_flight: 0,
+            ..ModbusTcpFlowControl::default()
+        };
+
+        let result = ModbusTcpSocket::new("127.0.0.1", 502, 1)
+            .with_flow_control(flow_control)
+            .spawn();
+
+        assert!(matches!(result, Err(ModbusError::ValidationError(_))));
     }
 
     #[tokio::test]
