@@ -102,7 +102,8 @@ async fn send_read_coils_success() {
     })
     .await;
 
-    let conn = ModbusTcpConnection::open(addr.ip().to_string(), addr.port(), 1)
+    let conn = ModbusTcpSocket::new(addr.ip().to_string(), addr.port(), 1)
+        .connect()
         .await
         .unwrap();
 
@@ -138,7 +139,8 @@ async fn send_write_single_register_success() {
     })
     .await;
 
-    let conn = ModbusTcpConnection::open(addr.ip().to_string(), addr.port(), 1)
+    let conn = ModbusTcpSocket::new(addr.ip().to_string(), addr.port(), 1)
+        .connect()
         .await
         .unwrap();
 
@@ -202,7 +204,8 @@ async fn concurrent_in_flight_requests_are_matched_out_of_order() {
         stream.write_all(&first_response).await.unwrap();
     });
 
-    let conn = ModbusTcpConnection::open(addr.ip().to_string(), addr.port(), 1)
+    let conn = ModbusTcpSocket::new(addr.ip().to_string(), addr.port(), 1)
+        .connect()
         .await
         .unwrap();
 
@@ -391,7 +394,8 @@ async fn server_sends_invalid_mbap_length() {
         second_stream.write_all(&response).await.unwrap();
     });
 
-    let conn = ModbusTcpConnection::open(addr.ip().to_string(), addr.port(), 1)
+    let conn = ModbusTcpSocket::new(addr.ip().to_string(), addr.port(), 1)
+        .connect()
         .await
         .unwrap();
 
@@ -422,7 +426,8 @@ async fn send_messages_across_multiple_unit_ids_on_one_connection() {
     })
     .await;
 
-    let conn = ModbusTcpConnection::open(addr.ip().to_string(), addr.port(), 1)
+    let conn = ModbusTcpSocket::new(addr.ip().to_string(), addr.port(), 1)
+        .connect()
         .await
         .unwrap();
 
@@ -458,7 +463,8 @@ async fn send_message_returns_exception_response_as_typed_error() {
     })
     .await;
 
-    let conn = ModbusTcpConnection::open(addr.ip().to_string(), addr.port(), 1)
+    let conn = ModbusTcpSocket::new(addr.ip().to_string(), addr.port(), 1)
+        .connect()
         .await
         .unwrap();
 
@@ -491,7 +497,8 @@ async fn send_message_returns_protocol_id_mismatch_as_typed_error() {
     })
     .await;
 
-    let conn = ModbusTcpConnection::open(addr.ip().to_string(), addr.port(), 1)
+    let conn = ModbusTcpSocket::new(addr.ip().to_string(), addr.port(), 1)
+        .connect()
         .await
         .unwrap();
 
@@ -522,7 +529,8 @@ async fn send_message_returns_unit_id_mismatch_as_typed_error() {
     })
     .await;
 
-    let conn = ModbusTcpConnection::open(addr.ip().to_string(), addr.port(), 1)
+    let conn = ModbusTcpSocket::new(addr.ip().to_string(), addr.port(), 1)
+        .connect()
         .await
         .unwrap();
 

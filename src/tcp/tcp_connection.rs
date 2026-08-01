@@ -15,6 +15,7 @@ use tracing::debug;
 use crate::tcp::actor::{ControlCommand, RequestCommand};
 use crate::tcp::frame::MBAP_HEADER_LEN;
 use crate::tcp::retry::{ModbusTcpRetry, retry_transient};
+#[cfg(test)]
 use crate::tcp::socket::ModbusTcpSocket;
 use crate::tcp::status::ConnectionStatus;
 #[cfg(test)]
@@ -23,16 +24,24 @@ use crate::{ModbusRequest, ModbusResponse, error::ModbusError};
 
 /// Live Modbus TCP client handle.
 ///
-/// Construct a handle with [`ModbusTcpSocket::connect`] when custom timeouts,
-/// flow control, retry, or an initial transaction-id seed are needed. Use
-/// [`ModbusTcpConnection::open`] for the default configuration shortcut. Both
-/// paths spawn the background actor and eagerly open the first TCP connection
-/// before returning this live handle, so they fail when the peer is unreachable.
-/// [`ModbusTcpSocket::spawn`] returns the same live handle without dialing, for a
-/// caller that must own the handle before its peer is reachable; that handle
-/// reports [`ConnectionStatus`] `{ connected: false, generation: 0 }` until the
-/// socket is opened by [`Self::connect`] or by the actor's on-demand connect on
-/// the first request.
+/// This is a handle to a live background actor, not a guarantee that a TCP
+/// socket is currently open: a handle whose actor has never dialed, or whose
+/// socket was torn down, is still valid and usable.
+///
+/// Every handle is constructed through [`ModbusTcpSocket`](crate::tcp::ModbusTcpSocket),
+/// which stores construction-time settings and offers two consuming paths that
+/// differ only in when the first TCP connection is opened.
+/// [`ModbusTcpSocket::connect`](crate::tcp::ModbusTcpSocket::connect) spawns the
+/// actor and eagerly opens the first socket, so it fails when the peer is
+/// unreachable and the freshly spawned actor is then dropped with the handle
+/// that was never returned.
+/// [`ModbusTcpSocket::spawn`](crate::tcp::ModbusTcpSocket::spawn) returns the
+/// same live handle without dialing, for a caller that must own the handle
+/// before its peer is reachable; that handle reports [`ConnectionStatus`]
+/// `{ connected: false, generation: 0 }` until the socket is opened by
+/// [`Self::connect`] or by the actor's on-demand connect on the first request.
+/// A caller that must retain the actor across an initial connection failure has
+/// to take the `spawn` path.
 ///
 /// Clones are lightweight command senders to a single background actor that owns
 /// the TCP socket, pending response map, and transaction-id counter. The actor
@@ -76,28 +85,6 @@ impl ModbusTcpConnection {
         }
     }
 
-    /// Opens a connection to a Modbus TCP server with default construction settings.
-    ///
-    /// `host` may be a DNS name or numeric IP address. `port` is the TCP port,
-    /// and `unit_id` is the default Modbus unit id used by the returned live
-    /// handle. This is a shortcut for configuring a [`ModbusTcpSocket`] with
-    /// defaults and awaiting [`ModbusTcpSocket::connect`].
-    ///
-    /// This associated function was named `connect` before `0.2.0`; that name
-    /// now belongs to the live-handle method [`Self::connect`].
-    ///
-    /// # Errors
-    ///
-    /// Returns validation, connection, timeout, or actor-termination errors from
-    /// [`ModbusTcpSocket::connect`].
-    pub async fn open(
-        host: impl Into<String>,
-        port: u16,
-        unit_id: u8,
-    ) -> Result<Self, ModbusError> {
-        ModbusTcpSocket::new(host, port, unit_id).connect().await
-    }
-
     /// Returns a new handle with a different default unit id.
     ///
     /// The returned handle shares the same background actor, TCP session,
@@ -136,9 +123,10 @@ impl ModbusTcpConnection {
     /// [`ConnectionStatus::generation`] unchanged. A successful dial increments
     /// the generation by one.
     ///
-    /// Unlike [`Self::open`], this reuses the existing background actor. No
-    /// second actor is spawned and every clone of this handle, including those
-    /// from [`Self::with_unit_id`], observes the reopened socket.
+    /// Unlike [`ModbusTcpSocket::connect`](crate::tcp::ModbusTcpSocket::connect),
+    /// this reuses the existing background actor. No second actor is spawned and
+    /// every clone of this handle, including those from [`Self::with_unit_id`],
+    /// observes the reopened socket.
     ///
     /// # Errors
     ///
@@ -149,10 +137,10 @@ impl ModbusTcpConnection {
     /// # Examples
     ///
     /// ```no_run
-    /// use ferrobus::tcp::ModbusTcpConnection;
+    /// use ferrobus::tcp::ModbusTcpSocket;
     ///
     /// # async fn run() -> Result<(), ferrobus::ModbusError> {
-    /// let connection = ModbusTcpConnection::open("127.0.0.1", 502, 1).await?;
+    /// let connection = ModbusTcpSocket::new("127.0.0.1", 502, 1).connect().await?;
     /// let before = connection.status().generation;
     /// connection.disconnect().await;
     ///
@@ -200,10 +188,10 @@ impl ModbusTcpConnection {
     /// # Examples
     ///
     /// ```no_run
-    /// use ferrobus::tcp::ModbusTcpConnection;
+    /// use ferrobus::tcp::ModbusTcpSocket;
     ///
     /// # async fn run() -> Result<(), ferrobus::ModbusError> {
-    /// let connection = ModbusTcpConnection::open("127.0.0.1", 502, 1).await?;
+    /// let connection = ModbusTcpSocket::new("127.0.0.1", 502, 1).connect().await?;
     /// let mut negotiated_at = connection.status().generation;
     ///
     /// // ... later, before trusting negotiated device state ...
@@ -237,10 +225,10 @@ impl ModbusTcpConnection {
     /// # Examples
     ///
     /// ```no_run
-    /// use ferrobus::tcp::ModbusTcpConnection;
+    /// use ferrobus::tcp::ModbusTcpSocket;
     ///
     /// # async fn run() -> Result<(), ferrobus::ModbusError> {
-    /// let connection = ModbusTcpConnection::open("127.0.0.1", 502, 1).await?;
+    /// let connection = ModbusTcpSocket::new("127.0.0.1", 502, 1).spawn()?;
     /// let mut status = connection.watch_status();
     ///
     /// tokio::spawn(async move {

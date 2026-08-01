@@ -9,12 +9,12 @@
 use std::error::Error;
 
 use ferrobus::ModbusRequest;
-use ferrobus::tcp::ModbusTcpConnection;
+use ferrobus::tcp::ModbusTcpSocket;
 use tracing::info;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    let connection = ModbusTcpConnection::open("127.0.0.1", 502, 1).await?;
+    let connection = ModbusTcpSocket::new("127.0.0.1", 502, 1).connect().await?;
     let mut tasks = Vec::new();
 
     for offset in 0..4 {
