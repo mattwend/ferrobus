@@ -237,6 +237,8 @@ mod tests {
         assert_eq!(socket.retry, None);
     }
 
+    /// The eager path must return a handle whose first socket is already open, which is
+    /// the generation the connection contract counts from.
     #[tokio::test]
     async fn connect_success_returns_connected_handle() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -251,6 +253,13 @@ mod tests {
             .await
             .unwrap();
 
+        assert_eq!(
+            connection.status(),
+            ConnectionStatus {
+                connected: true,
+                generation: 1,
+            }
+        );
         assert!(connection.is_connected().await);
     }
 
@@ -275,6 +284,18 @@ mod tests {
         );
         assert_eq!(connection.status(), ConnectionStatus::disconnected());
         assert!(!connection.is_connected().await);
+    }
+
+    /// `spawn` must not resolve the host either: a handle for a name that cannot be
+    /// resolved is still constructed, so name resolution is deferred to the first dial
+    /// along with the connect itself.
+    #[tokio::test]
+    async fn spawn_does_not_resolve_the_host() {
+        let connection = ModbusTcpSocket::new("host.invalid", 502, 1)
+            .spawn()
+            .unwrap();
+
+        assert_eq!(connection.status(), ConnectionStatus::disconnected());
     }
 
     /// The socket a spawned handle never dialed is opened by the first explicit connect,
