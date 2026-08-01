@@ -22,12 +22,25 @@ use crate::tcp::timeouts::ModbusTcpTimeouts;
 /// deadlines, [`Self::with_flow_control`] for in-flight and queue limits,
 /// [`Self::with_retry`] for same-call send retry, and
 /// [`Self::with_initial_transaction_id`] when a diagnostic caller needs a custom
-/// MBAP transaction-id seed. Both construction paths consume the socket, validate
-/// flow control, spawn the actor, and return a live [`ModbusTcpConnection`]; they
-/// differ only in when the first TCP connection is opened.
-/// [`ModbusTcpSocket::connect`] opens it eagerly and fails if it cannot, while
-/// [`ModbusTcpSocket::spawn`] opens none, so the handle can exist before the peer
-/// is reachable.
+/// MBAP transaction-id seed.
+///
+/// This is the only public way to construct a [`ModbusTcpConnection`]. Both
+/// construction paths consume the socket, validate flow control, spawn the
+/// actor, and return a live handle; they differ only in when the first TCP
+/// connection is opened. [`ModbusTcpSocket::connect`] opens it eagerly and fails
+/// if it cannot, while [`ModbusTcpSocket::spawn`] opens none, so the handle can
+/// exist before the peer is reachable. The eager path is defined as the
+/// composition of the other two:
+///
+/// ```no_run
+/// use ferrobus::tcp::ModbusTcpSocket;
+///
+/// # async fn run(socket: ModbusTcpSocket) -> Result<(), ferrobus::ModbusError> {
+/// let connection = socket.spawn()?;
+/// connection.connect().await?;
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Clone, Debug)]
 pub struct ModbusTcpSocket {
     host: String,
@@ -112,6 +125,12 @@ impl ModbusTcpSocket {
     /// [`ConnectionStatus`](crate::tcp::ConnectionStatus) `{ connected: true,
     /// generation: 1 }`.
     ///
+    /// This is the eager construction path and the normal choice. Because the
+    /// handle is only returned on success, a failed initial dial also discards
+    /// the actor that was just spawned. A caller that must retain the actor and
+    /// retry through it has to use [`Self::spawn`] followed by
+    /// [`ModbusTcpConnection::connect`] instead.
+    ///
     /// # Errors
     ///
     /// Returns [`ModbusError::ValidationError`] if flow-control settings are
@@ -119,6 +138,19 @@ impl ModbusTcpSocket {
     /// [`ModbusError::ConnectTimeout`] if the first TCP connection cannot be
     /// opened, or a transport error if the actor terminates before acknowledging
     /// the warm-up command.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use ferrobus::tcp::ModbusTcpSocket;
+    ///
+    /// # async fn run() -> Result<(), ferrobus::ModbusError> {
+    /// let connection = ModbusTcpSocket::new("127.0.0.1", 502, 1)
+    ///     .connect()
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn connect(self) -> Result<ModbusTcpConnection, ModbusError> {
         let connection = self.spawn()?;
         connection.connect().await?;
@@ -144,6 +176,21 @@ impl ModbusTcpSocket {
     ///
     /// Returns [`ModbusError::ValidationError`] if flow-control settings are
     /// invalid.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use ferrobus::tcp::ModbusTcpSocket;
+    ///
+    /// # async fn run() -> Result<(), ferrobus::ModbusError> {
+    /// let connection = ModbusTcpSocket::new("127.0.0.1", 502, 1).spawn()?;
+    /// let mut status = connection.watch_status();
+    ///
+    /// // Later, when lifecycle policy permits dialing:
+    /// connection.connect().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn spawn(self) -> Result<ModbusTcpConnection, ModbusError> {
         self.flow_control.validate()?;
         let (connection, _actor_task) = self.spawn_actor();
