@@ -45,6 +45,8 @@ Add the crate to your project:
 ferrobus = "0.1.0"
 ```
 
+Releases and breaking changes are recorded in [CHANGELOG.md](CHANGELOG.md).
+
 ## Library usage
 
 Create a typed request and send it over Modbus TCP:
