@@ -27,7 +27,12 @@ use crate::{ModbusRequest, ModbusResponse, error::ModbusError};
 /// flow control, retry, or an initial transaction-id seed are needed. Use
 /// [`ModbusTcpConnection::open`] for the default configuration shortcut. Both
 /// paths spawn the background actor and eagerly open the first TCP connection
-/// before returning this live handle.
+/// before returning this live handle, so they fail when the peer is unreachable.
+/// [`ModbusTcpSocket::spawn`] returns the same live handle without dialing, for a
+/// caller that must own the handle before its peer is reachable; that handle
+/// reports [`ConnectionStatus`] `{ connected: false, generation: 0 }` until the
+/// socket is opened by [`Self::connect`] or by the actor's on-demand connect on
+/// the first request.
 ///
 /// Clones are lightweight command senders to a single background actor that owns
 /// the TCP socket, pending response map, and transaction-id counter. The actor

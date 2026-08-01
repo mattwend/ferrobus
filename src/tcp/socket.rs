@@ -22,10 +22,12 @@ use crate::tcp::timeouts::ModbusTcpTimeouts;
 /// deadlines, [`Self::with_flow_control`] for in-flight and queue limits,
 /// [`Self::with_retry`] for same-call send retry, and
 /// [`Self::with_initial_transaction_id`] when a diagnostic caller needs a custom
-/// MBAP transaction-id seed. Call [`ModbusTcpSocket::connect`] to validate flow
-/// control, spawn the actor, eagerly open the first TCP connection, consume the
-/// socket, and receive a live [`ModbusTcpConnection`]. Use [`ModbusTcpSocket::spawn`]
-/// when the handle must exist before the peer is reachable.
+/// MBAP transaction-id seed. Both construction paths consume the socket, validate
+/// flow control, spawn the actor, and return a live [`ModbusTcpConnection`]; they
+/// differ only in when the first TCP connection is opened.
+/// [`ModbusTcpSocket::connect`] opens it eagerly and fails if it cannot, while
+/// [`ModbusTcpSocket::spawn`] opens none, so the handle can exist before the peer
+/// is reachable.
 #[derive(Clone, Debug)]
 pub struct ModbusTcpSocket {
     host: String,
@@ -41,7 +43,8 @@ impl ModbusTcpSocket {
     /// Creates a configurable socket with default construction settings.
     ///
     /// `host` may be a DNS name or numeric IP address and is not resolved until
-    /// [`Self::connect`] is awaited. `port` is the TCP port used for every actor
+    /// the actor dials, which is the eager connect of [`Self::connect`] or the
+    /// first connect after [`Self::spawn`]. `port` is the TCP port used for every actor
     /// dial, and `unit_id` is the default Modbus unit id used by the live
     /// connection. The initial transaction-id seed defaults to `1`; timeouts,
     /// flow control, and retry use their documented defaults.
@@ -61,7 +64,7 @@ impl ModbusTcpSocket {
     /// Overrides the connect, write, and response timeouts used by the actor.
     ///
     /// `timeouts` is stored on the configurable socket and handed to the actor
-    /// when [`Self::connect`] is awaited. Returns the updated socket.
+    /// when it is spawned. Returns the updated socket.
     #[must_use]
     pub fn with_timeouts(mut self, timeouts: ModbusTcpTimeouts) -> Self {
         self.timeouts = timeouts;
@@ -71,8 +74,8 @@ impl ModbusTcpSocket {
     /// Overrides the actor flow-control settings.
     ///
     /// `flow_control` configures queue depth, in-flight request capacity, queue
-    /// timeout, and quarantine lifetime. It is validated when [`Self::connect`]
-    /// is awaited. Returns the updated socket.
+    /// timeout, and quarantine lifetime. It is validated when the actor is
+    /// spawned, before any channel is allocated. Returns the updated socket.
     #[must_use]
     pub fn with_flow_control(mut self, flow_control: ModbusTcpFlowControl) -> Self {
         self.flow_control = flow_control;
@@ -253,6 +256,8 @@ mod tests {
 
     /// A spawned handle must be usable before the peer exists: no dial is attempted,
     /// and the status reports the pre-connect state the generation contract starts from.
+    /// A reachable peer is offered so the absence of a dial is observed rather than
+    /// inferred from a status a background connect could still race.
     #[tokio::test]
     async fn spawn_returns_a_live_handle_without_dialing() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -262,6 +267,12 @@ mod tests {
             .spawn()
             .unwrap();
 
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), listener.accept())
+                .await
+                .is_err(),
+            "spawn must not dial the peer"
+        );
         assert_eq!(connection.status(), ConnectionStatus::disconnected());
         assert!(!connection.is_connected().await);
     }
