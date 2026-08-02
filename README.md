@@ -268,6 +268,14 @@ connection attempt fails while callers are parked on a full request queue, one p
 admitted after the actor drains the backlog and can observe one additional failing connect attempt
 before its request fails or its queue deadline elapses.
 
+Cancellation is honoured before transmission, not only on the wire: a caller that drops its
+`send_message` future — because its own deadline elapsed or its task was cancelled — releases a
+request that has not yet been written, and the actor discards it instead of sending it. Nothing that
+no caller is waiting for reaches the device, so a cancelled write cannot execute behind the caller's
+back and turn its retry into a duplicate. A request already on the wire cannot be recalled; its
+transaction id is quarantined instead, so a late response is discarded rather than aliased onto a
+later request.
+
 By default, transient TCP connect/write/read/queue failures and gateway-busy exception responses
 (`0x05`, `0x06`, `0x0A`, `0x0B`) are retried with exponential backoff starting at 500 ms,
 multiplied by 1.5, with jitter, and bounded only by `max_elapsed` (2 s). Set

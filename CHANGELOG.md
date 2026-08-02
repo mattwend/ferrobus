@@ -51,6 +51,11 @@ While the crate is below `1.0.0`, breaking changes are released in minor version
 ### Fixed
 
 - Reject malformed padding in Modbus responses instead of accepting the frame.
+- Queued requests whose caller stopped waiting (dropped future, elapsed caller
+  deadline, cancelled task) are now discarded instead of transmitted. Previously
+  cancellation was only observed for requests already on the wire, so a caller
+  that gave up while its request was queued could still have it executed by the
+  device — a duplicate-write hazard once the caller retried.
 
 ## [0.1.0] - 2026-06-21
 
