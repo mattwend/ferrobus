@@ -22,6 +22,10 @@ pub struct ModbusTcpFlowControl {
     /// Maximum time a request may wait between submission and reaching the wire.
     pub queue_timeout: Duration,
     /// Time a timed-out/cancelled transaction id remains reserved.
+    ///
+    /// A response timeout fails only that transaction and keeps the TCP socket open. Its
+    /// transaction id is quarantined for this duration rather than reused immediately, so a
+    /// late response cannot be aliased onto a later request that reused the id.
     pub quarantine_ttl: Duration,
 }
 

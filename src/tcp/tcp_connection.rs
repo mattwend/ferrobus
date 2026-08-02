@@ -45,11 +45,22 @@ use crate::{ModbusRequest, ModbusResponse, error::ModbusError};
 ///
 /// Clones are lightweight command senders to a single background actor that owns
 /// the TCP socket, pending response map, and transaction-id counter. The actor
-/// reconnects lazily after transport teardown, applies bounded in-flight flow
-/// control, and uses a bounded request channel as backpressure. Queue wait is
-/// bounded by flow-control settings; response timeout starts when the actor
-/// writes the request on the socket. Use [`Self::with_unit_id`] to derive another
-/// live handle that shares the same actor with a different default unit id.
+/// applies bounded in-flight flow control and uses a bounded request channel as
+/// backpressure. Queue wait is bounded by flow-control settings; response timeout
+/// starts when the actor writes the request on the socket. Use
+/// [`Self::with_unit_id`] to derive another live handle that shares the same actor
+/// with a different default unit id.
+///
+/// Reconnection is on-demand, not a background loop. Any read/write/EOF failure
+/// tears the socket down, and the next request to reach the actor opens a fresh
+/// one. There is no reconnect timer, task, or backoff inside the actor: reconnect
+/// *policy* stays with the caller, and [`ModbusTcpRetry`](crate::tcp::ModbusTcpRetry)
+/// covers same-call retry.
+///
+/// Do not wrap this handle in `Mutex<Option<ModbusTcpConnection>>` and discard it
+/// on the first I/O error. Dropping the handle stops requests from ever reaching
+/// the actor, which is exactly what defeats its on-demand reconnect. Keep the
+/// handle and watch [`ConnectionStatus::generation`] instead.
 ///
 /// The connection lifecycle is driven from this handle: [`Self::connect`] and
 /// [`Self::disconnect`] open and close the actor's socket without replacing the
@@ -317,6 +328,9 @@ impl ModbusTcpConnection {
     /// Modbus exception PDUs are surfaced as [`ModbusError::ExceptionResponse`]. Gateway-busy
     /// exception codes may be retried transparently when this handle has retry enabled.
     ///
+    /// Dropping the returned future cancels the request if the actor has not written it yet;
+    /// once written, it may still be executed by the device.
+    ///
     /// # Errors
     ///
     /// Returns transport, protocol, validation, exception-response, or
@@ -330,6 +344,9 @@ impl ModbusTcpConnection {
     ///
     /// Modbus exception PDUs are surfaced as [`ModbusError::ExceptionResponse`]. Gateway-busy
     /// exception codes may be retried transparently when this handle has retry enabled.
+    ///
+    /// Dropping the returned future cancels the request if the actor has not written it yet;
+    /// once written, it may still be executed by the device.
     ///
     /// # Errors
     ///

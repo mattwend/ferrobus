@@ -138,10 +138,8 @@ background actor that owns the socket; clones and `with_unit_id(...)` derivation
   `tokio::sync::watch::Receiver<ConnectionStatus>` so callers can await transitions instead of
   polling. `is_connected().await` remains available as `status().connected`.
 
-Reconnection is on-demand, not a background loop. Any read/write/EOF failure tears the socket down;
-the next request to reach the actor opens a fresh one. There is no reconnect timer, task, or
-backoff inside the actor: reconnect *policy* stays with the caller, and `ModbusTcpRetry` covers
-same-call retry.
+Reconnection is on-demand: any read/write/EOF failure tears the socket down, and the next request
+to reach the actor opens a fresh one.
 
 ### Generation contract
 
@@ -155,13 +153,8 @@ same-call retry.
 | after a failed connect attempt | unchanged |
 | after the next successful connect | `{ connected: true, generation: 2 }` |
 
-The counter never decreases. A changed `generation` therefore means the socket was replaced,
-regardless of how many drop/reconnect cycles happened in between and regardless of when the
-observer sampled — a `bool` connection flag collapses `true → false → true` and cannot express
-this. The counter is per actor: a handle from a new `ModbusTcpSocket::connect()` starts its own
-count at `1`. A handle from `ModbusTcpSocket::spawn()` starts at `{ connected: false,
-generation: 0 }`; one from `ModbusTcpSocket::connect().await` is returned at
-`{ connected: true, generation: 1 }`.
+The counter never decreases, so a changed `generation` means the socket was replaced — a `bool`
+connection flag collapses `true → false → true` and cannot express this.
 
 If your application negotiates device state over the connection (word order, scaling calibration,
 arming a device-side watchdog), cache the generation alongside that state and re-negotiate when it
@@ -190,10 +183,6 @@ impl Session {
     }
 }
 ```
-
-Do not wrap the handle in `Mutex<Option<ModbusTcpConnection>>` and discard it on the first I/O
-error. Dropping the handle stops requests from ever reaching the actor, which is exactly what
-defeats its on-demand reconnect. Keep the handle and watch the generation instead.
 
 To react to transitions instead of polling:
 
@@ -255,26 +244,10 @@ let connection = ModbusTcpSocket::new("localhost", 502, 1)
     .await?;
 ```
 
-Flow control is actor-owned and validated before any channel or task is allocated, when the
-socket is consumed by either `connect().await` or `spawn()`. `ModbusTcpFlowControl::max_in_flight`
-caps requests on the wire, and `max_queue_depth` is the bounded backlog that applies backpressure
-to callers. Invalid flow-control settings return `ModbusError::ValidationError` from both paths;
-use `ModbusTcpFlowControl::serial_gateway()` for RTU gateways that drain one serial bus
-sequentially.
-Queue wait is bounded by `queue_timeout`; the `response_timeout` clock starts only after the actor
-successfully writes the frame to the socket. A single response timeout fails that transaction,
-quarantines its transaction ID to avoid late-response aliasing, and keeps the TCP socket open. If a
-connection attempt fails while callers are parked on a full request queue, one parked caller may be
-admitted after the actor drains the backlog and can observe one additional failing connect attempt
-before its request fails or its queue deadline elapses.
-
-Cancellation is honoured before transmission, not only on the wire: a caller that drops its
-`send_message` future — because its own deadline elapsed or its task was cancelled — releases a
-request that has not yet been written, and the actor discards it instead of sending it. Nothing that
-no caller is waiting for reaches the device, so a cancelled write cannot execute behind the caller's
-back and turn its retry into a duplicate. A request already on the wire cannot be recalled; its
-transaction id is quarantined instead, so a late response is discarded rather than aliased onto a
-later request.
+`ModbusTcpFlowControl::max_in_flight` caps requests on the wire, and `max_queue_depth` is the
+bounded backlog that applies backpressure to callers. Invalid flow-control settings return
+`ModbusError::ValidationError` from both construction paths; use
+`ModbusTcpFlowControl::serial_gateway()` for RTU gateways that drain one serial bus sequentially.
 
 By default, transient TCP connect/write/read/queue failures and gateway-busy exception responses
 (`0x05`, `0x06`, `0x0A`, `0x0B`) are retried with exponential backoff starting at 500 ms,
