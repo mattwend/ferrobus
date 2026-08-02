@@ -15,6 +15,9 @@ While the crate is below `1.0.0`, breaking changes are released in minor version
 
 ### Added
 
+- `ModbusTcpConnection::read_holding_registers`, `write_single_register`, and
+  `write_multiple_registers` convenience methods for callers that only need the
+  typed payload from the common request shapes.
 - `ferrobus::WordOrder` for decoding consecutive registers into `u32`, `i32`,
   `f32`, `u64`, `i64`, and `f64`, including block decode helpers that validate
   register counts. Modbus wire byte order is unaffected: word order only controls

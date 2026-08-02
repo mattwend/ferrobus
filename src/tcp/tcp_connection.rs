@@ -323,6 +323,80 @@ impl ModbusTcpConnection {
         response.align_to_request(pdu)
     }
 
+    /// Reads holding registers using this connection's default unit id.
+    ///
+    /// This is a typed convenience wrapper around [`Self::send_message`]. The lower-level method
+    /// aligns every response to the request through [`ModbusResponse::align_to_request`], so a
+    /// successful response can only be [`ModbusResponse::ReadHoldingRegisters`].
+    ///
+    /// # Errors
+    ///
+    /// Returns transport, protocol, validation, exception-response, or
+    /// request/response mismatch errors.
+    #[must_use = "read_holding_registers returns a future whose output reports request success or failure"]
+    pub async fn read_holding_registers(
+        &self,
+        starting_address: u16,
+        quantity: u16,
+    ) -> Result<Vec<u16>, ModbusError> {
+        let request = ModbusRequest::ReadHoldingRegisters {
+            starting_address,
+            quantity,
+        };
+
+        match self.send_message(&request).await? {
+            ModbusResponse::ReadHoldingRegisters { registers } => Ok(registers),
+            response => Err(unexpected_response("read_holding_registers", &response)),
+        }
+    }
+
+    /// Writes one holding register using this connection's default unit id.
+    ///
+    /// This is a typed convenience wrapper around [`Self::send_message`]. The lower-level method
+    /// aligns every response to the request through [`ModbusResponse::align_to_request`], so a
+    /// successful response can only be [`ModbusResponse::WriteSingleRegister`].
+    ///
+    /// # Errors
+    ///
+    /// Returns transport, protocol, validation, exception-response, or
+    /// request/response mismatch errors.
+    #[must_use = "write_single_register returns a future whose output reports request success or failure"]
+    pub async fn write_single_register(&self, address: u16, value: u16) -> Result<(), ModbusError> {
+        let request = ModbusRequest::WriteSingleRegister { address, value };
+
+        match self.send_message(&request).await? {
+            ModbusResponse::WriteSingleRegister { .. } => Ok(()),
+            response => Err(unexpected_response("write_single_register", &response)),
+        }
+    }
+
+    /// Writes consecutive holding registers using this connection's default unit id.
+    ///
+    /// This is a typed convenience wrapper around [`Self::send_message`]. The lower-level method
+    /// aligns every response to the request through [`ModbusResponse::align_to_request`], so a
+    /// successful response can only be [`ModbusResponse::WriteMultipleRegisters`].
+    ///
+    /// # Errors
+    ///
+    /// Returns transport, protocol, validation, exception-response, or
+    /// request/response mismatch errors.
+    #[must_use = "write_multiple_registers returns a future whose output reports request success or failure"]
+    pub async fn write_multiple_registers(
+        &self,
+        starting_address: u16,
+        values: &[u16],
+    ) -> Result<(), ModbusError> {
+        let request = ModbusRequest::WriteMultipleRegisters {
+            starting_address,
+            values: values.to_vec(),
+        };
+
+        match self.send_message(&request).await? {
+            ModbusResponse::WriteMultipleRegisters { .. } => Ok(()),
+            response => Err(unexpected_response("write_multiple_registers", &response)),
+        }
+    }
+
     /// Sends one request using this connection's default unit id.
     ///
     /// Modbus exception PDUs are surfaced as [`ModbusError::ExceptionResponse`]. Gateway-busy
@@ -375,6 +449,12 @@ impl ModbusTcpConnection {
             }
         }
     }
+}
+
+fn unexpected_response(operation: &str, response: &ModbusResponse) -> ModbusError {
+    ModbusError::RequestResponseMismatch(format!(
+        "unexpected response for {operation}: {response:?}"
+    ))
 }
 
 pub(crate) fn actor_terminated_error() -> ModbusError {

@@ -88,6 +88,110 @@ fn make_write_single_register_response(tid: u16, unit_id: u8, address: u16, valu
     build_tcp_response_frame(tid, unit_id, &pdu)
 }
 
+fn make_read_holding_registers_response(tid: u16, unit_id: u8, registers: &[u16]) -> Vec<u8> {
+    let mut pdu = Vec::with_capacity(2 + registers.len() * 2);
+    pdu.push(3u8);
+    pdu.push((registers.len() * 2) as u8);
+    for register in registers {
+        pdu.extend_from_slice(&register.to_be_bytes());
+    }
+    build_tcp_response_frame(tid, unit_id, &pdu)
+}
+
+fn make_write_multiple_registers_response(
+    tid: u16,
+    unit_id: u8,
+    starting_address: u16,
+    quantity: u16,
+) -> Vec<u8> {
+    let pdu = vec![
+        16u8,
+        (starting_address >> 8) as u8,
+        starting_address as u8,
+        (quantity >> 8) as u8,
+        quantity as u8,
+    ];
+    build_tcp_response_frame(tid, unit_id, &pdu)
+}
+
+#[tokio::test]
+async fn convenience_read_holding_registers_returns_payload() {
+    let addr = spawn_mock_server(|mut stream| async move {
+        let request = read_request_frame(&mut stream).await.unwrap();
+        assert_eq!(request.unit_id, 1);
+        assert_eq!(request.pdu, [3, 0, 16, 0, 2]);
+
+        let response = make_read_holding_registers_response(
+            request.transaction_id,
+            request.unit_id,
+            &[0x1122, 0x3344],
+        );
+        stream.write_all(&response).await.unwrap();
+    })
+    .await;
+
+    let conn = ModbusTcpSocket::new(addr.ip().to_string(), addr.port(), 1)
+        .connect()
+        .await
+        .unwrap();
+
+    let registers = conn.read_holding_registers(0x0010, 2).await.unwrap();
+
+    assert_eq!(registers, vec![0x1122, 0x3344]);
+}
+
+#[tokio::test]
+async fn convenience_write_single_register_accepts_echo() {
+    let addr = spawn_mock_server(|mut stream| async move {
+        let request = read_request_frame(&mut stream).await.unwrap();
+        assert_eq!(request.unit_id, 1);
+        assert_eq!(request.pdu, [6, 0, 16, 18, 52]);
+
+        let response = make_write_single_register_response(
+            request.transaction_id,
+            request.unit_id,
+            0x0010,
+            0x1234,
+        );
+        stream.write_all(&response).await.unwrap();
+    })
+    .await;
+
+    let conn = ModbusTcpSocket::new(addr.ip().to_string(), addr.port(), 1)
+        .connect()
+        .await
+        .unwrap();
+
+    conn.write_single_register(0x0010, 0x1234).await.unwrap();
+}
+
+#[tokio::test]
+async fn convenience_write_multiple_registers_accepts_echo() {
+    let addr = spawn_mock_server(|mut stream| async move {
+        let request = read_request_frame(&mut stream).await.unwrap();
+        assert_eq!(request.unit_id, 1);
+        assert_eq!(request.pdu, [16, 0, 32, 0, 2, 4, 17, 34, 51, 68]);
+
+        let response = make_write_multiple_registers_response(
+            request.transaction_id,
+            request.unit_id,
+            0x0020,
+            2,
+        );
+        stream.write_all(&response).await.unwrap();
+    })
+    .await;
+
+    let conn = ModbusTcpSocket::new(addr.ip().to_string(), addr.port(), 1)
+        .connect()
+        .await
+        .unwrap();
+
+    conn.write_multiple_registers(0x0020, &[0x1122, 0x3344])
+        .await
+        .unwrap();
+}
+
 #[tokio::test]
 async fn send_read_coils_success() {
     let addr = spawn_mock_server(|mut stream| async move {
