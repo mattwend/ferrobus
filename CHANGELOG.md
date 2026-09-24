@@ -35,6 +35,13 @@ While the crate is below `1.0.0`, breaking changes are released in minor version
   peer is reachable. It validates, spawns the actor, and returns without
   resolving the host or dialing; the returned handle reports
   `{ connected: false, generation: 0 }`.
+- `ModbusTcpServer`, `BoundModbusTcpServer`, and `ModbusTcpServerTimeouts`.
+- `server::ModbusServer`, `InMemoryStore`, and `StoreError`.
+- `RequestParseError` and `ModbusRequest::try_from(&[u8])`.
+- `FunctionCode`, `InvalidFunctionCode`, and `ExceptionCode`.
+- `ModbusResponse::serialize`.
+- `ModbusError::BindError`.
+- Server and custom-server examples that build with default features.
 
 ### Changed
 
@@ -44,6 +51,10 @@ While the crate is below `1.0.0`, breaking changes are released in minor version
 - **Breaking:** `ModbusTcpConnection::connect` is now the live-handle method
   `connect(&self)`, which opens the socket of the actor a handle already owns. It
   is idempotent and never spawns a second actor.
+- **Breaking:** `ModbusResponse::Exception` and `ModbusError::ExceptionResponse`
+  now carry `function_code: FunctionCode` and `code: ExceptionCode` instead of
+  raw `u8` fields. Pattern-match the typed values and use
+  `u8::from(function_code)` when the raw function code is needed.
 
 ### Removed
 

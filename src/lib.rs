@@ -11,6 +11,7 @@
 //! - [`ModbusResponse`] for parsing responses
 //! - [`tcp::ModbusTcpConnection`] for sending requests over Modbus TCP
 //! - [`tcp::ConnectionStatus`] for observing the connection lifecycle
+//! - [`server::ModbusServer`] and [`tcp::ModbusTcpServer`] for serving Modbus TCP
 
 /// Error types returned by this crate.
 pub mod error;

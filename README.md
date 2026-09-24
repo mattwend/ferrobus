@@ -3,7 +3,7 @@
 [![CI](https://github.com/mattwend/ferrobus/actions/workflows/ci.yml/badge.svg)](https://github.com/mattwend/ferrobus/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/mattwend/ferrobus/branch/v0.x.x/graph/badge.svg)](https://codecov.io/gh/mattwend/ferrobus)
 
-Small Rust Modbus library with typed request/response PDUs and a reusable Modbus TCP transport.
+Small Rust Modbus library with typed request/response PDUs and reusable Modbus TCP client and server transports.
 
 ## Features
 
@@ -17,7 +17,7 @@ Small Rust Modbus library with typed request/response PDUs and a reusable Modbus
   - write single register
   - write multiple coils
   - write multiple registers
-- Modbus TCP transport with:
+- Modbus TCP client transport with:
   - two-phase `ModbusTcpSocket` → `ModbusTcpConnection` construction
   - eager, fallible first TCP connect followed by lazy reconnect after transport failures
   - `ModbusTcpSocket::spawn` for a live handle built without dialing, when the caller decides
@@ -30,11 +30,13 @@ Small Rust Modbus library with typed request/response PDUs and a reusable Modbus
   - per-phase timeouts for connect, write, queue wait, and on-wire response wait
   - request/response validation for transaction ID, protocol ID, unit ID, and echoed payloads
 - Support for talking to multiple unit IDs through one Modbus TCP connection handle
+- Modbus TCP server support with `ModbusTcpServer`, the `ModbusServer` trait, and a cloneable `InMemoryStore`
 - Optional CLI example behind the `cli` feature
 
 ## Prerequisites
 
 - Rust 1.85 or newer (MSRV), matching the crate's Rust 2024 edition.
+- `cargo-deny` for repository QA (`cargo install cargo-deny`).
 
 ## Installation
 
@@ -42,7 +44,7 @@ Add the crate to your project:
 
 ```toml
 [dependencies]
-ferrobus = "0.1.0"
+ferrobus = "0.2.0"
 ```
 
 Releases and breaking changes are recorded in [CHANGELOG.md](CHANGELOG.md).
@@ -197,6 +199,31 @@ while status.changed().await.is_ok() {
 }
 # }
 ```
+
+## Server usage
+
+Serve the built-in in-memory store over Modbus TCP:
+
+```rust
+use ferrobus::server::InMemoryStore;
+use ferrobus::tcp::ModbusTcpServer;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let store = InMemoryStore::new(100, 100, 100, 100)?;
+    store.set_holding(0, 42)?;
+
+    ModbusTcpServer::new(store)
+        .bind("127.0.0.1:5502".parse()?)
+        .await?
+        .serve()
+        .await?;
+
+    Ok(())
+}
+```
+
+Custom backends implement `server::ModbusServer`; see `examples/custom_server.rs`.
 
 ## Word order for wide values
 

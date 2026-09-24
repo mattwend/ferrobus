@@ -172,6 +172,13 @@ pub enum ExceptionCode {
     /// Gateway target device did not respond.
     GatewayTargetDeviceFailedToRespond,
     /// Unknown exception byte preserved for forward compatibility.
+    ///
+    /// This variant exists for wire values outside the set above; it is not a
+    /// general-purpose wrapper. Constructing it with a byte that *is* known, such
+    /// as `Unknown(0x01)`, does not round-trip: `u8::from` yields `0x01`, but
+    /// `ExceptionCode::from(0x01)` maps back to
+    /// [`IllegalFunction`](Self::IllegalFunction). Use
+    /// `ExceptionCode::from(byte)` to build a code from a raw byte.
     Unknown(u8),
 }
 
@@ -1590,6 +1597,19 @@ mod tests {
             }
         );
         assert_eq!(unknown.serialize().unwrap(), vec![0x83, 0x09]);
+    }
+
+    #[test]
+    fn exception_code_round_trips_every_known_byte() {
+        for byte in 0u8..=u8::MAX {
+            let code = ExceptionCode::from(byte);
+            assert_eq!(u8::from(code), byte, "byte 0x{byte:02X}");
+        }
+        // `Unknown` is only for bytes outside the known set: hand-constructing it
+        // with a known byte is the documented non-round-tripping case.
+        assert_eq!(u8::from(ExceptionCode::Unknown(0x01)), 0x01);
+        assert_eq!(ExceptionCode::from(0x01), ExceptionCode::IllegalFunction);
+        assert_ne!(ExceptionCode::from(0x01), ExceptionCode::Unknown(0x01));
     }
 
     #[test]

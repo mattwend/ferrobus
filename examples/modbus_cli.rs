@@ -16,6 +16,12 @@ use ferrobus::WordOrder;
 use ferrobus::tcp::ModbusTcpSocket;
 use ferrobus::{ExceptionCode, FunctionCode};
 
+// ---------------------------------------------------------------------------
+// CLI definition
+// ---------------------------------------------------------------------------
+// Server quickstart: run `cargo run --example server` in one shell, then run
+// this example with `cargo run --example modbus_cli --features cli -- read holding --address 0 --quantity 4`.
+
 #[derive(Parser, Debug)]
 #[command(name = "modbus_cli")]
 #[command(about = "Modbus TCP client for the ferrobus library")]
