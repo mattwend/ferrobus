@@ -317,8 +317,15 @@ impl ModbusTcpConnection {
 
         let pdu_bytes = &response_buffer[MBAP_HEADER_LEN..];
         let response = ModbusResponse::try_from(pdu_bytes)?;
-        if let ModbusResponse::Exception { function, code } = response {
-            return Err(ModbusError::ExceptionResponse { function, code });
+        if let ModbusResponse::Exception {
+            function_code,
+            code,
+        } = response
+        {
+            return Err(ModbusError::ExceptionResponse {
+                function_code,
+                code,
+            });
         }
         response.align_to_request(pdu)
     }

@@ -20,11 +20,11 @@ use tokio::sync::Mutex;
 
 mod support;
 
-use ferrobus::ModbusError;
 use ferrobus::tcp::{
     ConnectionStatus, ModbusTcpConnection, ModbusTcpFlowControl, ModbusTcpRetry, ModbusTcpSocket,
     ModbusTcpTimeouts,
 };
+use ferrobus::{ExceptionCode, FunctionCode, ModbusError};
 use ferrobus::{ModbusRequest, ModbusResponse};
 
 use support::{
@@ -579,9 +579,12 @@ async fn send_message_returns_exception_response_as_typed_error() {
 
     let error = conn.send_message(&request).await.unwrap_err();
     match error {
-        ModbusError::ExceptionResponse { function, code } => {
-            assert_eq!(function, 0x81);
-            assert_eq!(code, 0x02);
+        ModbusError::ExceptionResponse {
+            function_code,
+            code,
+        } => {
+            assert_eq!(function_code, FunctionCode::try_from(0x01).unwrap());
+            assert_eq!(code, ExceptionCode::IllegalDataAddress);
         }
         other => panic!("Expected ExceptionResponse, got {other:?}"),
     }
@@ -1104,7 +1107,10 @@ async fn gateway_busy_exception_does_not_retry_when_disabled() {
 
     assert!(matches!(
         error,
-        ModbusError::ExceptionResponse { code: 0x0B, .. }
+        ModbusError::ExceptionResponse {
+            code: ExceptionCode::GatewayTargetDeviceFailedToRespond,
+            ..
+        }
     ));
     assert_eq!(requests.load(Ordering::SeqCst), 1);
 }

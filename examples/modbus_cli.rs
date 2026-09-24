@@ -14,10 +14,7 @@ use ferrobus::ModbusRequest;
 use ferrobus::ModbusResponse;
 use ferrobus::WordOrder;
 use ferrobus::tcp::ModbusTcpSocket;
-
-// ---------------------------------------------------------------------------
-// CLI definition
-// ---------------------------------------------------------------------------
+use ferrobus::{ExceptionCode, FunctionCode};
 
 #[derive(Parser, Debug)]
 #[command(name = "modbus_cli")]
@@ -534,21 +531,9 @@ fn format_coil(value: bool) -> &'static str {
 }
 
 /// Formats exception responses for operators diagnosing bad addresses or unsupported functions.
-fn format_exception(function: u8, code: u8) -> String {
-    let func = function_display_name(function & 0x7F);
-    let exception_name = match code {
-        0x01 => "IllegalFunction",
-        0x02 => "IllegalDataAddress",
-        0x03 => "IllegalDataValue",
-        0x04 => "ServerFailure",
-        0x05 => "Acknowledge",
-        0x06 => "ServerBusy",
-        0x08 => "MemoryParityError",
-        0x0A => "GatewayPathUnavailable",
-        0x0B => "GatewayTargetDeviceFailedToRespond",
-        _ => "Unknown",
-    };
-    format!("Exception: {func}, code={code} ({exception_name})")
+fn format_exception(function_code: FunctionCode, code: ExceptionCode) -> String {
+    let func = function_display_name(u8::from(function_code));
+    format!("Exception: {func}, code={code}")
 }
 
 // ---------------------------------------------------------------------------
@@ -764,8 +749,11 @@ fn print_response(
                 starting_address, quantity
             );
         }
-        ModbusResponse::Exception { function, code } => {
-            eprintln!("{}", format_exception(function, code));
+        ModbusResponse::Exception {
+            function_code,
+            code,
+        } => {
+            eprintln!("{}", format_exception(function_code, code));
         }
     }
 
@@ -817,7 +805,10 @@ fn format_error(error: &ModbusError, host: &str, port: u16) -> String {
                  Verify the unit ID and function are supported."
             )
         }
-        ModbusError::ExceptionResponse { function, code } => format_exception(*function, *code),
+        ModbusError::ExceptionResponse {
+            function_code,
+            code,
+        } => format_exception(*function_code, *code),
         other => format!("Error: {other}"),
     }
 }
@@ -864,9 +855,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 process::exit(1);
             }
         }
-        Err(ModbusError::ExceptionResponse { function, code }) => {
+        Err(ModbusError::ExceptionResponse {
+            function_code,
+            code,
+        }) => {
             eprintln!("Request: {}", describe_request(&request));
-            eprintln!("{}", format_exception(function, code));
+            eprintln!("{}", format_exception(function_code, code));
             process::exit(1);
         }
         Err(error) => {

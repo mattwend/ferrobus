@@ -5,6 +5,8 @@ use std::sync::Arc;
 
 use thiserror::Error;
 
+use crate::{ExceptionCode, FunctionCode};
+
 /// Custom error type for the Modbus library.
 ///
 /// Transport I/O variants store their original [`std::io::Error`] behind an
@@ -51,12 +53,12 @@ pub enum ModbusError {
     DeserializationError(String),
 
     /// A slave returned a Modbus exception response.
-    #[error("Modbus exception response: function {function:#04x}, code {code:#04x}")]
+    #[error("Modbus exception response: function {function_code}, code {code}")]
     ExceptionResponse {
-        /// Exception function code, including the high exception bit.
-        function: u8,
+        /// Raw request function code without the high exception bit.
+        function_code: FunctionCode,
         /// Modbus exception code.
-        code: u8,
+        code: ExceptionCode,
     },
 
     /// The response transaction identifier did not match the request.
@@ -117,11 +119,11 @@ impl PartialEq for ModbusError {
             | (Self::ValidationError(lhs), Self::ValidationError(rhs)) => lhs == rhs,
             (
                 Self::ExceptionResponse {
-                    function: lhs_function,
+                    function_code: lhs_function,
                     code: lhs_code,
                 },
                 Self::ExceptionResponse {
-                    function: rhs_function,
+                    function_code: rhs_function,
                     code: rhs_code,
                 },
             ) => lhs_function == rhs_function && lhs_code == rhs_code,
@@ -187,12 +189,20 @@ impl ModbusError {
     pub fn is_gateway_busy(&self) -> bool {
         matches!(
             self,
-            Self::ExceptionResponse { code, .. } if matches!(code, 0x05 | 0x06 | 0x0A | 0x0B)
+            Self::ExceptionResponse { code, .. }
+                if matches!(
+                    code,
+                    ExceptionCode::Acknowledge
+                        | ExceptionCode::ServerDeviceBusy
+                        | ExceptionCode::GatewayPathUnavailable
+                        | ExceptionCode::GatewayTargetDeviceFailedToRespond
+                )
         )
     }
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -209,12 +219,12 @@ mod tests {
         );
         assert_eq!(
             ModbusError::ExceptionResponse {
-                function: 0x83,
-                code: 0x06,
+                function_code: FunctionCode::try_from(0x03).unwrap(),
+                code: ExceptionCode::ServerDeviceBusy,
             },
             ModbusError::ExceptionResponse {
-                function: 0x83,
-                code: 0x06,
+                function_code: FunctionCode::try_from(0x03).unwrap(),
+                code: ExceptionCode::ServerDeviceBusy,
             }
         );
     }
@@ -245,10 +255,15 @@ mod tests {
 
     #[test]
     fn gateway_busy_exception_codes_are_classified() {
-        for code in [0x05, 0x06, 0x0A, 0x0B] {
+        for code in [
+            ExceptionCode::Acknowledge,
+            ExceptionCode::ServerDeviceBusy,
+            ExceptionCode::GatewayPathUnavailable,
+            ExceptionCode::GatewayTargetDeviceFailedToRespond,
+        ] {
             assert!(
                 ModbusError::ExceptionResponse {
-                    function: 0x83,
+                    function_code: FunctionCode::try_from(0x03).unwrap(),
                     code
                 }
                 .is_gateway_busy()
@@ -256,8 +271,8 @@ mod tests {
         }
         assert!(
             !ModbusError::ExceptionResponse {
-                function: 0x83,
-                code: 0x02
+                function_code: FunctionCode::try_from(0x03).unwrap(),
+                code: ExceptionCode::IllegalDataAddress
             }
             .is_gateway_busy()
         );

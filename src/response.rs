@@ -1,8 +1,14 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2025 ferrobus contributors
 
+use std::fmt;
+
 use crate::ModbusRequest;
 use crate::error::ModbusError;
+use crate::limits::{
+    MAX_READ_COILS, MAX_READ_DISCRETE_INPUTS, MAX_READ_HOLDING_REGISTERS, MAX_READ_INPUT_REGISTERS,
+    MAX_WRITE_MULTIPLE_COILS, MAX_WRITE_MULTIPLE_REGISTERS,
+};
 
 fn byte_count(response: &[u8]) -> Result<usize, ModbusError> {
     if response.len() < 2 {
@@ -37,16 +43,44 @@ fn require_exact_len(
     Ok(())
 }
 
-fn unpack_bits(response: &[u8]) -> Result<Vec<bool>, ModbusError> {
-    let byte_count = byte_count(response)?;
-    let bits = &response[2..2 + byte_count];
-    let mut result = Vec::with_capacity(byte_count * 8);
+/// Packs bits LSB-first into Modbus coil/discrete-input payload bytes.
+///
+/// Shared by the request and response codecs; the inverse is
+/// [`unpack_bits_payload`].
+pub(crate) fn pack_bits_payload(bits: &[bool]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(bits.len().div_ceil(8));
+    let mut current = 0u8;
+    let mut bit_index = 0u8;
+    for bit in bits {
+        if *bit {
+            current |= 1 << bit_index;
+        }
+        bit_index += 1;
+        if bit_index == 8 {
+            bytes.push(current);
+            current = 0;
+            bit_index = 0;
+        }
+    }
+    if bit_index > 0 {
+        bytes.push(current);
+    }
+    bytes
+}
+
+pub(crate) fn unpack_bits_payload(bits: &[u8]) -> Vec<bool> {
+    let mut result = Vec::with_capacity(bits.len() * 8);
     for byte in bits {
         for bit in 0..8 {
             result.push((byte >> bit) & 1 == 1);
         }
     }
-    Ok(result)
+    result
+}
+
+fn unpack_bits(response: &[u8]) -> Result<Vec<bool>, ModbusError> {
+    let byte_count = byte_count(response)?;
+    Ok(unpack_bits_payload(&response[2..2 + byte_count]))
 }
 
 fn parse_registers(response: &[u8]) -> Result<Vec<u16>, ModbusError> {
@@ -63,6 +97,131 @@ fn parse_registers(response: &[u8]) -> Result<Vec<u16>, ModbusError> {
         registers.push(u16::from_be_bytes([response[offset], response[offset + 1]]));
     }
     Ok(registers)
+}
+
+/// Error returned when a raw byte is not a valid Modbus request function code.
+#[derive(Debug, thiserror::Error, Clone, Copy, PartialEq, Eq)]
+#[error("invalid function code 0x{0:02X}: expected 0x01..=0x7F")]
+pub struct InvalidFunctionCode(u8);
+
+/// Raw Modbus request function code carried by exception responses.
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FunctionCode(u8);
+
+pub(crate) const SYNTHETIC_ZERO_FUNCTION: FunctionCode = FunctionCode(0);
+
+impl FunctionCode {
+    pub(crate) fn normalize_for_exception(raw: u8) -> Self {
+        let low = raw & 0x7F;
+        if low == 0 {
+            SYNTHETIC_ZERO_FUNCTION
+        } else {
+            Self(low)
+        }
+    }
+}
+
+impl TryFrom<u8> for FunctionCode {
+    type Error = InvalidFunctionCode;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        if (0x01..=0x7F).contains(&value) {
+            Ok(Self(value))
+        } else {
+            Err(InvalidFunctionCode(value))
+        }
+    }
+}
+
+impl From<FunctionCode> for u8 {
+    fn from(value: FunctionCode) -> Self {
+        value.0
+    }
+}
+
+impl fmt::Display for FunctionCode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "0x{:02X}", self.0)
+    }
+}
+
+/// Modbus exception code values, preserving unknown wire values.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExceptionCode {
+    /// Function code is not supported by the server.
+    IllegalFunction,
+    /// Requested data address is not available.
+    IllegalDataAddress,
+    /// Request value is structurally invalid for the function.
+    IllegalDataValue,
+    /// Server failed while processing a valid request.
+    ServerDeviceFailure,
+    /// Server accepted a long-running request.
+    Acknowledge,
+    /// Server is busy and the client may retry later.
+    ServerDeviceBusy,
+    /// Server detected a memory parity error.
+    MemoryParityError,
+    /// Gateway path is unavailable.
+    GatewayPathUnavailable,
+    /// Gateway target device did not respond.
+    GatewayTargetDeviceFailedToRespond,
+    /// Unknown exception byte preserved for forward compatibility.
+    Unknown(u8),
+}
+
+impl From<u8> for ExceptionCode {
+    fn from(value: u8) -> Self {
+        match value {
+            0x01 => Self::IllegalFunction,
+            0x02 => Self::IllegalDataAddress,
+            0x03 => Self::IllegalDataValue,
+            0x04 => Self::ServerDeviceFailure,
+            0x05 => Self::Acknowledge,
+            0x06 => Self::ServerDeviceBusy,
+            0x08 => Self::MemoryParityError,
+            0x0A => Self::GatewayPathUnavailable,
+            0x0B => Self::GatewayTargetDeviceFailedToRespond,
+            other => Self::Unknown(other),
+        }
+    }
+}
+
+impl From<ExceptionCode> for u8 {
+    fn from(value: ExceptionCode) -> Self {
+        match value {
+            ExceptionCode::IllegalFunction => 0x01,
+            ExceptionCode::IllegalDataAddress => 0x02,
+            ExceptionCode::IllegalDataValue => 0x03,
+            ExceptionCode::ServerDeviceFailure => 0x04,
+            ExceptionCode::Acknowledge => 0x05,
+            ExceptionCode::ServerDeviceBusy => 0x06,
+            ExceptionCode::MemoryParityError => 0x08,
+            ExceptionCode::GatewayPathUnavailable => 0x0A,
+            ExceptionCode::GatewayTargetDeviceFailedToRespond => 0x0B,
+            ExceptionCode::Unknown(raw) => raw,
+        }
+    }
+}
+
+impl fmt::Display for ExceptionCode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self {
+            Self::IllegalFunction => "IllegalFunction",
+            Self::IllegalDataAddress => "IllegalDataAddress",
+            Self::IllegalDataValue => "IllegalDataValue",
+            Self::ServerDeviceFailure => "ServerDeviceFailure",
+            Self::Acknowledge => "Acknowledge",
+            Self::ServerDeviceBusy => "ServerDeviceBusy",
+            Self::MemoryParityError => "MemoryParityError",
+            Self::GatewayPathUnavailable => "GatewayPathUnavailable",
+            Self::GatewayTargetDeviceFailedToRespond => "GatewayTargetDeviceFailedToRespond",
+            Self::Unknown(_) => "Unknown",
+        };
+        write!(formatter, "{name}(0x{:02X})", u8::from(*self))
+    }
 }
 
 /// Typed Modbus response PDUs.
@@ -124,14 +283,23 @@ pub enum ModbusResponse {
     /// the same error path that retry policy uses. This variant is primarily visible when parsing
     /// response PDUs directly with [`TryFrom`].
     Exception {
-        /// Exception function code, including the high exception bit.
-        function: u8,
+        /// Raw request function code without the high exception bit.
+        function_code: FunctionCode,
         /// Modbus exception code.
-        code: u8,
+        code: ExceptionCode,
     },
 }
 
 impl ModbusResponse {
+    /// Serializes the response into a Modbus PDU.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ModbusError::ValidationError`] when the response violates Modbus limits.
+    pub fn serialize(&self) -> Result<Vec<u8>, ModbusError> {
+        serialize_modbus_response(self)
+    }
+
     /// Aligns this response with the request that produced it.
     ///
     /// # Arguments
@@ -284,6 +452,137 @@ impl ModbusResponse {
     }
 }
 
+fn validate_len(name: &str, len: usize, limit: u16) -> Result<u16, ModbusError> {
+    let quantity = u16::try_from(len).map_err(|_| {
+        ModbusError::ValidationError(format!("{name} quantity must be 0-{limit}, got {len}"))
+    })?;
+    if quantity > limit {
+        return Err(ModbusError::ValidationError(format!(
+            "{name} quantity must be 0-{limit}, got {quantity}"
+        )));
+    }
+    Ok(quantity)
+}
+
+fn validate_ack_quantity(name: &str, quantity: u16, limit: u16) -> Result<(), ModbusError> {
+    if quantity == 0 || quantity > limit {
+        return Err(ModbusError::ValidationError(format!(
+            "{name} quantity must be 1-{limit}, got {quantity}"
+        )));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
+fn serialize_modbus_response(response: &ModbusResponse) -> Result<Vec<u8>, ModbusError> {
+    let mut pdu = Vec::new();
+    match response {
+        ModbusResponse::ReadCoils { coils } => {
+            validate_len("ReadCoils", coils.len(), MAX_READ_COILS)?;
+            let payload = pack_bits_payload(coils);
+            let byte_count = u8::try_from(payload.len()).map_err(|_| {
+                ModbusError::ValidationError(format!(
+                    "ReadCoils byte count must fit in u8, got {}",
+                    payload.len()
+                ))
+            })?;
+            pdu.push(0x01);
+            pdu.push(byte_count);
+            pdu.extend_from_slice(&payload);
+        }
+        ModbusResponse::ReadDiscreteInputs { inputs } => {
+            validate_len("ReadDiscreteInputs", inputs.len(), MAX_READ_DISCRETE_INPUTS)?;
+            let payload = pack_bits_payload(inputs);
+            let byte_count = u8::try_from(payload.len()).map_err(|_| {
+                ModbusError::ValidationError(format!(
+                    "ReadDiscreteInputs byte count must fit in u8, got {}",
+                    payload.len()
+                ))
+            })?;
+            pdu.push(0x02);
+            pdu.push(byte_count);
+            pdu.extend_from_slice(&payload);
+        }
+        ModbusResponse::ReadHoldingRegisters { registers } => {
+            validate_len(
+                "ReadHoldingRegisters",
+                registers.len(),
+                MAX_READ_HOLDING_REGISTERS,
+            )?;
+            let byte_count = u8::try_from(registers.len() * 2).map_err(|_| {
+                ModbusError::ValidationError(format!(
+                    "ReadHoldingRegisters byte count must fit in u8, got {}",
+                    registers.len() * 2
+                ))
+            })?;
+            pdu.push(0x03);
+            pdu.push(byte_count);
+            for register in registers {
+                pdu.extend_from_slice(&register.to_be_bytes());
+            }
+        }
+        ModbusResponse::ReadInputRegisters { registers } => {
+            validate_len(
+                "ReadInputRegisters",
+                registers.len(),
+                MAX_READ_INPUT_REGISTERS,
+            )?;
+            let byte_count = u8::try_from(registers.len() * 2).map_err(|_| {
+                ModbusError::ValidationError(format!(
+                    "ReadInputRegisters byte count must fit in u8, got {}",
+                    registers.len() * 2
+                ))
+            })?;
+            pdu.push(0x04);
+            pdu.push(byte_count);
+            for register in registers {
+                pdu.extend_from_slice(&register.to_be_bytes());
+            }
+        }
+        ModbusResponse::WriteSingleCoil { address, value } => {
+            pdu.push(0x05);
+            pdu.extend_from_slice(&address.to_be_bytes());
+            let raw = if *value { 0xFF00u16 } else { 0x0000u16 };
+            pdu.extend_from_slice(&raw.to_be_bytes());
+        }
+        ModbusResponse::WriteSingleRegister { address, value } => {
+            pdu.push(0x06);
+            pdu.extend_from_slice(&address.to_be_bytes());
+            pdu.extend_from_slice(&value.to_be_bytes());
+        }
+        ModbusResponse::WriteMultipleCoils {
+            starting_address,
+            quantity,
+        } => {
+            validate_ack_quantity("WriteMultipleCoils", *quantity, MAX_WRITE_MULTIPLE_COILS)?;
+            pdu.push(0x0F);
+            pdu.extend_from_slice(&starting_address.to_be_bytes());
+            pdu.extend_from_slice(&quantity.to_be_bytes());
+        }
+        ModbusResponse::WriteMultipleRegisters {
+            starting_address,
+            quantity,
+        } => {
+            validate_ack_quantity(
+                "WriteMultipleRegisters",
+                *quantity,
+                MAX_WRITE_MULTIPLE_REGISTERS,
+            )?;
+            pdu.push(0x10);
+            pdu.extend_from_slice(&starting_address.to_be_bytes());
+            pdu.extend_from_slice(&quantity.to_be_bytes());
+        }
+        ModbusResponse::Exception {
+            function_code,
+            code,
+        } => {
+            pdu.push(u8::from(*function_code) | 0x80);
+            pdu.push(u8::from(*code));
+        }
+    }
+    Ok(pdu)
+}
+
 fn validate_bit_count(
     function_name: &str,
     requested: u16,
@@ -369,10 +668,9 @@ fn deserialize_modbus_response(response: &[u8]) -> Result<ModbusResponse, Modbus
         }
         fc if fc & 0x80 != 0 => {
             require_exact_len(response, 2, "Exception")?;
-            let exception_code = response[1];
             Ok(ModbusResponse::Exception {
-                function: function_code,
-                code: exception_code,
+                function_code: FunctionCode::normalize_for_exception(function_code),
+                code: ExceptionCode::from(response[1]),
             })
         }
         _ => Err(ModbusError::DeserializationError(format!(
@@ -401,6 +699,64 @@ impl TryFrom<Vec<u8>> for ModbusResponse {
 #[allow(clippy::panic, clippy::uninlined_format_args, clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pack_bits_payload_empty() {
+        let bytes = pack_bits_payload(&[]);
+        assert!(bytes.is_empty());
+    }
+
+    #[test]
+    fn pack_bits_payload_single_coil() {
+        let bytes = pack_bits_payload(&[true]);
+        assert_eq!(bytes, &[0x01]);
+    }
+
+    #[test]
+    fn pack_bits_payload_exactly_eight() {
+        let coils = vec![true, false, true, false, true, false, true, false];
+        let bytes = pack_bits_payload(&coils);
+        assert_eq!(bytes.len(), 1);
+        assert_eq!(bytes[0], 0x55);
+    }
+
+    #[test]
+    fn pack_bits_payload_nine_bits() {
+        let coils = vec![true; 9];
+        let bytes = pack_bits_payload(&coils);
+        assert_eq!(bytes.len(), 2);
+        assert_eq!(bytes[0], 0xFF);
+        assert_eq!(bytes[1], 0x01);
+    }
+
+    #[test]
+    fn pack_bits_payload_alternating() {
+        let bytes = pack_bits_payload(&[
+            true, false, true, false, true, false, true, false, true, false,
+        ]);
+        assert_eq!(bytes.len(), 2);
+        assert_eq!(bytes[0], 0x55);
+        assert_eq!(bytes[1], 0x01);
+    }
+
+    #[test]
+    fn pack_bits_payload_all_false() {
+        let bytes = pack_bits_payload(&[false, false, false, false]);
+        assert_eq!(bytes, &[0x00]);
+    }
+
+    #[test]
+    fn pack_bits_payload_round_trips_through_unpack_bits_payload() {
+        // The request and response codecs share one packer/unpacker pair; this
+        // pins the two halves against each other.
+        let bits = vec![
+            true, false, true, true, false, false, false, true, true, false,
+        ];
+        let packed = pack_bits_payload(&bits);
+        let mut unpacked = unpack_bits_payload(&packed);
+        unpacked.truncate(bits.len());
+        assert_eq!(unpacked, bits);
+    }
 
     #[test]
     fn test_deserialize_read_coils() {
@@ -526,8 +882,8 @@ mod tests {
         assert_eq!(
             result,
             ModbusResponse::Exception {
-                function: 0x81,
-                code: 0x02
+                function_code: FunctionCode::try_from(0x01).unwrap(),
+                code: ExceptionCode::IllegalDataAddress
             }
         );
     }
@@ -699,15 +1055,15 @@ mod tests {
             quantity: 10,
         };
         let response = ModbusResponse::Exception {
-            function: 0x81,
-            code: 0x02,
+            function_code: FunctionCode::try_from(0x01).unwrap(),
+            code: ExceptionCode::IllegalDataAddress,
         };
         let result = response.align_to_request(&request).unwrap();
         assert_eq!(
             result,
             ModbusResponse::Exception {
-                function: 0x81,
-                code: 0x02
+                function_code: FunctionCode::try_from(0x01).unwrap(),
+                code: ExceptionCode::IllegalDataAddress
             }
         );
     }
@@ -1211,5 +1567,96 @@ mod tests {
         };
         let cloned = response.clone();
         assert_eq!(response, cloned);
+    }
+
+    #[test]
+    fn typed_exception_codes_round_trip() {
+        assert!(FunctionCode::try_from(0x01).is_ok());
+        assert!(FunctionCode::try_from(0x7F).is_ok());
+        assert!(FunctionCode::try_from(0x00).is_err());
+        assert!(FunctionCode::try_from(0x80).is_err());
+        assert!(FunctionCode::try_from(0xFF).is_err());
+
+        let response = ModbusResponse::Exception {
+            function_code: FunctionCode::try_from(0x03).unwrap(),
+            code: ExceptionCode::IllegalDataValue,
+        };
+        let bytes = response.serialize().unwrap();
+        assert_eq!(bytes, vec![0x83, 0x03]);
+        assert_eq!(
+            ModbusResponse::try_from(bytes.as_slice()).unwrap(),
+            response
+        );
+
+        let unknown = ModbusResponse::try_from([0x83, 0x09].as_slice()).unwrap();
+        assert_eq!(
+            unknown,
+            ModbusResponse::Exception {
+                function_code: FunctionCode::try_from(0x03).unwrap(),
+                code: ExceptionCode::Unknown(0x09),
+            }
+        );
+        assert_eq!(unknown.serialize().unwrap(), vec![0x83, 0x09]);
+    }
+
+    #[test]
+    fn serialize_response_fixtures() {
+        let fixtures = [
+            (
+                ModbusResponse::ReadCoils {
+                    coils: vec![true, false, true],
+                },
+                vec![0x01, 0x01, 0x05],
+            ),
+            (
+                ModbusResponse::ReadDiscreteInputs {
+                    inputs: vec![false, true, false, true],
+                },
+                vec![0x02, 0x01, 0x0A],
+            ),
+            (
+                ModbusResponse::ReadHoldingRegisters {
+                    registers: vec![0x1234, 0x5678],
+                },
+                vec![0x03, 0x04, 0x12, 0x34, 0x56, 0x78],
+            ),
+            (
+                ModbusResponse::ReadInputRegisters {
+                    registers: vec![0x1234],
+                },
+                vec![0x04, 0x02, 0x12, 0x34],
+            ),
+            (
+                ModbusResponse::WriteSingleCoil {
+                    address: 0x0010,
+                    value: true,
+                },
+                vec![0x05, 0x00, 0x10, 0xFF, 0x00],
+            ),
+            (
+                ModbusResponse::WriteSingleRegister {
+                    address: 0x0010,
+                    value: 0x1234,
+                },
+                vec![0x06, 0x00, 0x10, 0x12, 0x34],
+            ),
+            (
+                ModbusResponse::WriteMultipleCoils {
+                    starting_address: 0x0010,
+                    quantity: 3,
+                },
+                vec![0x0F, 0x00, 0x10, 0x00, 0x03],
+            ),
+            (
+                ModbusResponse::WriteMultipleRegisters {
+                    starting_address: 0x0010,
+                    quantity: 2,
+                },
+                vec![0x10, 0x00, 0x10, 0x00, 0x02],
+            ),
+        ];
+        for (response, expected) in fixtures {
+            assert_eq!(response.serialize().unwrap(), expected);
+        }
     }
 }

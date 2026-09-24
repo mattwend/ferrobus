@@ -2,14 +2,56 @@
 // Copyright (c) 2025 ferrobus contributors
 
 use crate::error::ModbusError;
+use crate::limits::{
+    MAX_READ_COILS, MAX_READ_DISCRETE_INPUTS, MAX_READ_HOLDING_REGISTERS, MAX_READ_INPUT_REGISTERS,
+    MAX_WRITE_MULTIPLE_COILS, MAX_WRITE_MULTIPLE_REGISTERS,
+};
+use crate::response::{pack_bits_payload, unpack_bits_payload};
 
-const MAX_READ_COILS: u16 = 0x07D0;
-const MAX_READ_DISCRETE_INPUTS: u16 = 0x07D0;
-const MAX_READ_HOLDING_REGISTERS: u16 = 0x007D;
-const MAX_READ_INPUT_REGISTERS: u16 = 0x007D;
-const MAX_WRITE_MULTIPLE_COILS: u16 = 0x07B0;
-const MAX_WRITE_MULTIPLE_REGISTERS: u16 = 0x007B;
 const MAX_REQUEST_PDU_LEN: usize = 252;
+
+/// Errors returned when parsing a Modbus request PDU from bytes.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum RequestParseError {
+    /// The first byte is not one of the supported request function codes.
+    #[error("unknown function code 0x{0:02X}")]
+    UnknownFunctionCode(u8),
+    /// The PDU ended before all required bytes were present.
+    #[error("PDU truncated: need {expected} bytes, got {actual}")]
+    Truncated {
+        /// Minimum required byte length.
+        expected: usize,
+        /// Actual byte length supplied by the caller.
+        actual: usize,
+    },
+    /// The PDU contains surplus bytes or disagrees with a declared length.
+    #[error("PDU length mismatch: expected {expected} bytes, got {actual}")]
+    LengthMismatch {
+        /// Exact expected byte length.
+        expected: usize,
+        /// Actual byte length supplied by the caller.
+        actual: usize,
+    },
+    /// The Modbus byte-count field does not match the request quantity.
+    #[error("declared byte count {declared} does not match quantity {quantity}")]
+    ByteCountMismatch {
+        /// Byte count declared by the request PDU.
+        declared: u8,
+        /// Quantity declared by the request PDU.
+        quantity: u16,
+    },
+    /// A quantity was zero or above the protocol limit for the function.
+    #[error("quantity {quantity} is outside protocol range 1..={limit}")]
+    QuantityOutOfRange {
+        /// Quantity declared by the request PDU.
+        quantity: u16,
+        /// Protocol-defined maximum for the function.
+        limit: u16,
+    },
+    /// A write-single-coil value was neither the Modbus ON nor OFF sentinel.
+    #[error("invalid coil value 0x{0:04X}: must be 0xFF00 or 0x0000")]
+    InvalidCoilValue(u16),
+}
 
 /// Typed Modbus request PDUs.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -118,27 +160,19 @@ impl ModbusRequest {
         self.validate()?;
         serialize_modbus_request(self)
     }
-}
 
-fn pack_coils(coils: &[bool]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(coils.len().div_ceil(8));
-    let mut current_byte = 0;
-    let mut bit_index = 0;
-    for &coil in coils {
-        if coil {
-            current_byte |= 1 << bit_index;
-        }
-        bit_index += 1;
-        if bit_index == 8 {
-            bytes.push(current_byte);
-            current_byte = 0;
-            bit_index = 0;
+    pub(crate) fn function_code(&self) -> u8 {
+        match self {
+            ModbusRequest::ReadCoils { .. } => 0x01,
+            ModbusRequest::ReadDiscreteInputs { .. } => 0x02,
+            ModbusRequest::ReadHoldingRegisters { .. } => 0x03,
+            ModbusRequest::ReadInputRegisters { .. } => 0x04,
+            ModbusRequest::WriteSingleCoil { .. } => 0x05,
+            ModbusRequest::WriteSingleRegister { .. } => 0x06,
+            ModbusRequest::WriteMultipleCoils { .. } => 0x0F,
+            ModbusRequest::WriteMultipleRegisters { .. } => 0x10,
         }
     }
-    if bit_index > 0 {
-        bytes.push(current_byte);
-    }
-    bytes
 }
 
 fn validate_quantity(name: &str, quantity: u16, max: u16) -> Result<(), ModbusError> {
@@ -156,6 +190,151 @@ fn validate_values_len(name: &str, len: usize, max: u16) -> Result<u16, ModbusEr
     })?;
     validate_quantity(name, quantity, max)?;
     Ok(quantity)
+}
+
+fn parse_u16(bytes: &[u8], offset: usize) -> u16 {
+    u16::from_be_bytes([bytes[offset], bytes[offset + 1]])
+}
+
+fn require_min_len(pdu: &[u8], expected: usize) -> Result<(), RequestParseError> {
+    if pdu.len() < expected {
+        return Err(RequestParseError::Truncated {
+            expected,
+            actual: pdu.len(),
+        });
+    }
+    Ok(())
+}
+
+fn require_exact_len(pdu: &[u8], expected: usize) -> Result<(), RequestParseError> {
+    require_min_len(pdu, expected)?;
+    if pdu.len() > expected {
+        return Err(RequestParseError::LengthMismatch {
+            expected,
+            actual: pdu.len(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_parsed_quantity(quantity: u16, limit: u16) -> Result<(), RequestParseError> {
+    if quantity == 0 || quantity > limit {
+        return Err(RequestParseError::QuantityOutOfRange { quantity, limit });
+    }
+    Ok(())
+}
+
+fn parse_read_request(
+    pdu: &[u8],
+    limit: u16,
+    build: impl FnOnce(u16, u16) -> ModbusRequest,
+) -> Result<ModbusRequest, RequestParseError> {
+    require_exact_len(pdu, 5)?;
+    let starting_address = parse_u16(pdu, 1);
+    let quantity = parse_u16(pdu, 3);
+    validate_parsed_quantity(quantity, limit)?;
+    Ok(build(starting_address, quantity))
+}
+
+fn parse_multi_write_header(pdu: &[u8]) -> Result<(u16, u16, u8), RequestParseError> {
+    require_min_len(pdu, 6)?;
+    let starting_address = parse_u16(pdu, 1);
+    let quantity = parse_u16(pdu, 3);
+    let declared = pdu[5];
+    Ok((starting_address, quantity, declared))
+}
+
+impl TryFrom<&[u8]> for ModbusRequest {
+    type Error = RequestParseError;
+
+    fn try_from(pdu: &[u8]) -> Result<Self, Self::Error> {
+        require_min_len(pdu, 1)?;
+        match pdu[0] {
+            0x01 => parse_read_request(pdu, MAX_READ_COILS, |starting_address, quantity| {
+                ModbusRequest::ReadCoils {
+                    starting_address,
+                    quantity,
+                }
+            }),
+            0x02 => parse_read_request(
+                pdu,
+                MAX_READ_DISCRETE_INPUTS,
+                |starting_address, quantity| ModbusRequest::ReadDiscreteInputs {
+                    starting_address,
+                    quantity,
+                },
+            ),
+            0x03 => parse_read_request(
+                pdu,
+                MAX_READ_HOLDING_REGISTERS,
+                |starting_address, quantity| ModbusRequest::ReadHoldingRegisters {
+                    starting_address,
+                    quantity,
+                },
+            ),
+            0x04 => parse_read_request(
+                pdu,
+                MAX_READ_INPUT_REGISTERS,
+                |starting_address, quantity| ModbusRequest::ReadInputRegisters {
+                    starting_address,
+                    quantity,
+                },
+            ),
+            0x05 => {
+                require_exact_len(pdu, 5)?;
+                let address = parse_u16(pdu, 1);
+                let raw_value = parse_u16(pdu, 3);
+                let value = match raw_value {
+                    0xFF00 => true,
+                    0x0000 => false,
+                    other => return Err(RequestParseError::InvalidCoilValue(other)),
+                };
+                Ok(ModbusRequest::WriteSingleCoil { address, value })
+            }
+            0x06 => {
+                require_exact_len(pdu, 5)?;
+                Ok(ModbusRequest::WriteSingleRegister {
+                    address: parse_u16(pdu, 1),
+                    value: parse_u16(pdu, 3),
+                })
+            }
+            0x0F => {
+                let (starting_address, quantity, declared) = parse_multi_write_header(pdu)?;
+                validate_parsed_quantity(quantity, MAX_WRITE_MULTIPLE_COILS)?;
+                let expected_count = (usize::from(quantity) + 7) / 8;
+                if usize::from(declared) != expected_count {
+                    return Err(RequestParseError::ByteCountMismatch { declared, quantity });
+                }
+                let expected_len = 6 + expected_count;
+                require_exact_len(pdu, expected_len)?;
+                let mut values = unpack_bits_payload(&pdu[6..]);
+                values.truncate(usize::from(quantity));
+                Ok(ModbusRequest::WriteMultipleCoils {
+                    starting_address,
+                    values,
+                })
+            }
+            0x10 => {
+                let (starting_address, quantity, declared) = parse_multi_write_header(pdu)?;
+                validate_parsed_quantity(quantity, MAX_WRITE_MULTIPLE_REGISTERS)?;
+                let expected_count = usize::from(quantity) * 2;
+                if usize::from(declared) != expected_count {
+                    return Err(RequestParseError::ByteCountMismatch { declared, quantity });
+                }
+                let expected_len = 6 + expected_count;
+                require_exact_len(pdu, expected_len)?;
+                let mut values = Vec::with_capacity(usize::from(quantity));
+                for chunk in pdu[6..].chunks_exact(2) {
+                    values.push(u16::from_be_bytes([chunk[0], chunk[1]]));
+                }
+                Ok(ModbusRequest::WriteMultipleRegisters {
+                    starting_address,
+                    values,
+                })
+            }
+            other => Err(RequestParseError::UnknownFunctionCode(other)),
+        }
+    }
 }
 
 fn serialize_modbus_request(pdu: &ModbusRequest) -> Result<Vec<u8>, ModbusError> {
@@ -220,7 +399,7 @@ fn serialize_modbus_request(pdu: &ModbusRequest) -> Result<Vec<u8>, ModbusError>
             })?;
             frame.extend_from_slice(&starting_address.to_be_bytes());
             frame.extend_from_slice(&quantity.to_be_bytes());
-            let coil_bytes = pack_coils(values);
+            let coil_bytes = pack_bits_payload(values);
             let coil_byte_count = u8::try_from(coil_bytes.len()).map_err(|_| {
                 ModbusError::ValidationError(format!(
                     "WriteMultipleCoils byte count must fit in u8, got {}",
@@ -377,45 +556,6 @@ mod tests {
     }
 
     #[test]
-    fn test_pack_coils_empty() {
-        let bytes = pack_coils(&[]);
-        assert!(bytes.is_empty());
-    }
-
-    #[test]
-    fn test_pack_coils_single_coil() {
-        let bytes = pack_coils(&[true]);
-        assert_eq!(bytes, &[0x01]);
-    }
-
-    #[test]
-    fn test_pack_coils_exactly_eight() {
-        let coils = vec![true, false, true, false, true, false, true, false];
-        let bytes = pack_coils(&coils);
-        assert_eq!(bytes.len(), 1);
-        assert_eq!(bytes[0], 0x55);
-    }
-
-    #[test]
-    fn test_pack_coils_nine_bits() {
-        let coils = vec![true; 9];
-        let bytes = pack_coils(&coils);
-        assert_eq!(bytes.len(), 2);
-        assert_eq!(bytes[0], 0xFF);
-        assert_eq!(bytes[1], 0x01);
-    }
-
-    #[test]
-    fn test_pack_coils_alternating() {
-        let bytes = pack_coils(&[
-            true, false, true, false, true, false, true, false, true, false,
-        ]);
-        assert_eq!(bytes.len(), 2);
-        assert_eq!(bytes[0], 0x55);
-        assert_eq!(bytes[1], 0x01);
-    }
-
-    #[test]
     fn test_write_multiple_coils_exactly_8_coils() {
         let coils = vec![true, false, true, false, true, false, true, false];
         let pdu = ModbusRequest::WriteMultipleCoils {
@@ -438,12 +578,6 @@ mod tests {
         assert_eq!(result[5], 2);
         assert_eq!(result[6], 0xFF);
         assert_eq!(result[7], 0x01);
-    }
-
-    #[test]
-    fn test_pack_coils_all_false() {
-        let bytes = pack_coils(&[false, false, false, false]);
-        assert_eq!(bytes, &[0x00]);
     }
 
     #[test]
@@ -645,5 +779,106 @@ mod tests {
         };
         let result = pdu.serialize();
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_all_supported_request_functions() {
+        let fixtures = [
+            (
+                vec![0x01, 0x00, 0x10, 0x00, 0x02],
+                ModbusRequest::ReadCoils {
+                    starting_address: 0x0010,
+                    quantity: 2,
+                },
+            ),
+            (
+                vec![0x02, 0x00, 0x10, 0x00, 0x02],
+                ModbusRequest::ReadDiscreteInputs {
+                    starting_address: 0x0010,
+                    quantity: 2,
+                },
+            ),
+            (
+                vec![0x03, 0x00, 0x10, 0x00, 0x02],
+                ModbusRequest::ReadHoldingRegisters {
+                    starting_address: 0x0010,
+                    quantity: 2,
+                },
+            ),
+            (
+                vec![0x04, 0x00, 0x10, 0x00, 0x02],
+                ModbusRequest::ReadInputRegisters {
+                    starting_address: 0x0010,
+                    quantity: 2,
+                },
+            ),
+            (
+                vec![0x05, 0x00, 0x10, 0xFF, 0x00],
+                ModbusRequest::WriteSingleCoil {
+                    address: 0x0010,
+                    value: true,
+                },
+            ),
+            (
+                vec![0x06, 0x00, 0x10, 0x12, 0x34],
+                ModbusRequest::WriteSingleRegister {
+                    address: 0x0010,
+                    value: 0x1234,
+                },
+            ),
+            (
+                vec![0x0F, 0x00, 0x10, 0x00, 0x03, 0x01, 0x05],
+                ModbusRequest::WriteMultipleCoils {
+                    starting_address: 0x0010,
+                    values: vec![true, false, true],
+                },
+            ),
+            (
+                vec![0x10, 0x00, 0x10, 0x00, 0x02, 0x04, 0x12, 0x34, 0x56, 0x78],
+                ModbusRequest::WriteMultipleRegisters {
+                    starting_address: 0x0010,
+                    values: vec![0x1234, 0x5678],
+                },
+            ),
+        ];
+        for (bytes, expected) in fixtures {
+            assert_eq!(ModbusRequest::try_from(bytes.as_slice()).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn parse_request_reports_structured_errors() {
+        assert_eq!(
+            ModbusRequest::try_from([0x07].as_slice()).unwrap_err(),
+            RequestParseError::UnknownFunctionCode(0x07)
+        );
+        assert!(matches!(
+            ModbusRequest::try_from([].as_slice()),
+            Err(RequestParseError::Truncated { .. })
+        ));
+        assert!(matches!(
+            ModbusRequest::try_from([0x01, 0x00].as_slice()),
+            Err(RequestParseError::Truncated { .. })
+        ));
+        assert_eq!(
+            ModbusRequest::try_from([0x05, 0, 0, 0x12, 0x34].as_slice()).unwrap_err(),
+            RequestParseError::InvalidCoilValue(0x1234)
+        );
+        assert!(matches!(
+            ModbusRequest::try_from([0x01, 0, 0, 0, 1, 0].as_slice()),
+            Err(RequestParseError::LengthMismatch { .. })
+        ));
+        assert!(matches!(
+            ModbusRequest::try_from([0x03, 0, 0, 0, 0].as_slice()),
+            Err(RequestParseError::QuantityOutOfRange { .. })
+        ));
+        assert!(matches!(
+            ModbusRequest::try_from([0x0F, 0, 0, 0, 9, 1, 0].as_slice()),
+            Err(RequestParseError::ByteCountMismatch { .. })
+        ));
+        assert!(matches!(
+            ModbusRequest::try_from([0x10, 0, 0, 0, 2, 4, 0].as_slice()),
+            Err(RequestParseError::Truncated { .. })
+        ));
     }
 }

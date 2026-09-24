@@ -16,13 +16,15 @@
 pub mod error;
 pub use error::ModbusError;
 
+mod limits;
+
 /// Typed Modbus request PDUs and serialization.
 mod request;
-pub use request::ModbusRequest;
+pub use request::{ModbusRequest, RequestParseError};
 
 /// Typed Modbus response PDUs and deserialization.
 mod response;
-pub use response::ModbusResponse;
+pub use response::{ExceptionCode, FunctionCode, InvalidFunctionCode, ModbusResponse};
 
 /// Multi-register word-order helpers for wide scalar values.
 mod word_order;
