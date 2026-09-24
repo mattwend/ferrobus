@@ -7,8 +7,11 @@ use crate::ModbusRequest;
 use crate::error::ModbusError;
 use crate::limits::{
     MAX_READ_COILS, MAX_READ_DISCRETE_INPUTS, MAX_READ_HOLDING_REGISTERS, MAX_READ_INPUT_REGISTERS,
-    MAX_WRITE_MULTIPLE_COILS, MAX_WRITE_MULTIPLE_REGISTERS,
+    MAX_WRITE_MULTIPLE_COILS, MAX_WRITE_MULTIPLE_REGISTERS, READ_COILS, READ_DISCRETE_INPUTS,
+    READ_HOLDING_REGISTERS, READ_INPUT_REGISTERS, WRITE_MULTIPLE_COILS, WRITE_MULTIPLE_REGISTERS,
+    WRITE_SINGLE_COIL, WRITE_SINGLE_REGISTER,
 };
+use crate::request::RequestEcho;
 
 fn byte_count(response: &[u8]) -> Result<usize, ModbusError> {
     if response.len() < 2 {
@@ -313,40 +316,32 @@ impl ModbusResponse {
     /// # Returns
     ///
     /// Returns the validated response, trimming bit-packed read results to the requested count.
-    #[allow(clippy::too_many_lines)]
     pub fn align_to_request(self, request: &ModbusRequest) -> Result<ModbusResponse, ModbusError> {
-        match (request, &self) {
+        self.align_to_echo(request.echo())
+    }
+
+    /// Aligns this response with the scalar fields of the request that produced it.
+    ///
+    /// Alignment only ever looks at the function code, address, and quantity, so
+    /// callers that already dropped the request payload (the server dispatch) can
+    /// validate a response without retaining or cloning it.
+    #[allow(clippy::too_many_lines)]
+    pub(crate) fn align_to_echo(self, echo: RequestEcho) -> Result<ModbusResponse, ModbusError> {
+        let requested = echo.quantity;
+        match (echo.function_code, &self) {
             (_, ModbusResponse::Exception { .. }) => Ok(self),
-            (
-                ModbusRequest::ReadCoils {
-                    quantity: requested,
-                    ..
-                },
-                ModbusResponse::ReadCoils { coils },
-            ) => {
-                validate_bit_count("ReadCoils", *requested, coils.len())?;
-                let trimmed = coils[..*requested as usize].to_vec();
+            (READ_COILS, ModbusResponse::ReadCoils { coils }) => {
+                validate_bit_count("ReadCoils", requested, coils.len())?;
+                let trimmed = coils[..requested as usize].to_vec();
                 Ok(ModbusResponse::ReadCoils { coils: trimmed })
             }
-            (
-                ModbusRequest::ReadDiscreteInputs {
-                    quantity: requested,
-                    ..
-                },
-                ModbusResponse::ReadDiscreteInputs { inputs },
-            ) => {
-                validate_bit_count("ReadDiscreteInputs", *requested, inputs.len())?;
-                let trimmed = inputs[..*requested as usize].to_vec();
+            (READ_DISCRETE_INPUTS, ModbusResponse::ReadDiscreteInputs { inputs }) => {
+                validate_bit_count("ReadDiscreteInputs", requested, inputs.len())?;
+                let trimmed = inputs[..requested as usize].to_vec();
                 Ok(ModbusResponse::ReadDiscreteInputs { inputs: trimmed })
             }
-            (
-                ModbusRequest::ReadHoldingRegisters {
-                    quantity: requested,
-                    ..
-                },
-                ModbusResponse::ReadHoldingRegisters { registers },
-            ) => {
-                if registers.len() != *requested as usize {
+            (READ_HOLDING_REGISTERS, ModbusResponse::ReadHoldingRegisters { registers }) => {
+                if registers.len() != requested as usize {
                     return Err(ModbusError::RequestResponseMismatch(format!(
                         "ReadHoldingRegisters: requested {} registers but got {}",
                         requested,
@@ -355,14 +350,8 @@ impl ModbusResponse {
                 }
                 Ok(self)
             }
-            (
-                ModbusRequest::ReadInputRegisters {
-                    quantity: requested,
-                    ..
-                },
-                ModbusResponse::ReadInputRegisters { registers },
-            ) => {
-                if registers.len() != *requested as usize {
+            (READ_INPUT_REGISTERS, ModbusResponse::ReadInputRegisters { registers }) => {
+                if registers.len() != requested as usize {
                     return Err(ModbusError::RequestResponseMismatch(format!(
                         "ReadInputRegisters: requested {} registers but got {}",
                         requested,
@@ -372,13 +361,15 @@ impl ModbusResponse {
                 Ok(self)
             }
             (
-                ModbusRequest::WriteSingleCoil { address, value },
+                WRITE_SINGLE_COIL,
                 ModbusResponse::WriteSingleCoil {
                     address: response_address,
                     value: response_value,
                 },
             ) => {
-                if address != response_address || value != response_value {
+                let address = echo.address;
+                let value = echo.coil_value();
+                if address != *response_address || value != *response_value {
                     return Err(ModbusError::RequestResponseMismatch(format!(
                         "WriteSingleCoil: wrote address {address} value {value} but server echoed address {response_address} value {response_value}"
                     )));
@@ -386,13 +377,15 @@ impl ModbusResponse {
                 Ok(self)
             }
             (
-                ModbusRequest::WriteSingleRegister { address, value },
+                WRITE_SINGLE_REGISTER,
                 ModbusResponse::WriteSingleRegister {
                     address: response_address,
                     value: response_value,
                 },
             ) => {
-                if address != response_address || value != response_value {
+                let address = echo.address;
+                let value = requested;
+                if address != *response_address || value != *response_value {
                     return Err(ModbusError::RequestResponseMismatch(format!(
                         "WriteSingleRegister: wrote address {address} value {value} but server echoed address {response_address} value {response_value}"
                     )));
@@ -400,53 +393,37 @@ impl ModbusResponse {
                 Ok(self)
             }
             (
-                ModbusRequest::WriteMultipleCoils {
-                    starting_address,
-                    values,
-                },
+                WRITE_MULTIPLE_COILS,
                 ModbusResponse::WriteMultipleCoils {
                     starting_address: response_address,
                     quantity: resp_qty,
                 },
             ) => {
-                let qty = u16::try_from(values.len()).map_err(|_| {
-                    ModbusError::RequestResponseMismatch(format!(
-                        "WriteMultipleCoils: request quantity does not fit in u16: {}",
-                        values.len()
-                    ))
-                })?;
-                if starting_address != response_address || qty != *resp_qty {
+                let starting_address = echo.address;
+                if starting_address != *response_address || requested != *resp_qty {
                     return Err(ModbusError::RequestResponseMismatch(format!(
-                        "WriteMultipleCoils: wrote address {starting_address} quantity {qty} but server acknowledged address {response_address} quantity {resp_qty}",
+                        "WriteMultipleCoils: wrote address {starting_address} quantity {requested} but server acknowledged address {response_address} quantity {resp_qty}",
                     )));
                 }
                 Ok(self)
             }
             (
-                ModbusRequest::WriteMultipleRegisters {
-                    starting_address,
-                    values,
-                },
+                WRITE_MULTIPLE_REGISTERS,
                 ModbusResponse::WriteMultipleRegisters {
                     starting_address: response_address,
                     quantity: resp_qty,
                 },
             ) => {
-                let qty = u16::try_from(values.len()).map_err(|_| {
-                    ModbusError::RequestResponseMismatch(format!(
-                        "WriteMultipleRegisters: request quantity does not fit in u16: {}",
-                        values.len()
-                    ))
-                })?;
-                if starting_address != response_address || qty != *resp_qty {
+                let starting_address = echo.address;
+                if starting_address != *response_address || requested != *resp_qty {
                     return Err(ModbusError::RequestResponseMismatch(format!(
-                        "WriteMultipleRegisters: wrote address {starting_address} quantity {qty} but server acknowledged address {response_address} quantity {resp_qty}",
+                        "WriteMultipleRegisters: wrote address {starting_address} quantity {requested} but server acknowledged address {response_address} quantity {resp_qty}",
                     )));
                 }
                 Ok(self)
             }
-            _ => Err(ModbusError::RequestResponseMismatch(format!(
-                "Request/response mismatch: got {self:?} for {request:?}"
+            (function_code, response) => Err(ModbusError::RequestResponseMismatch(format!(
+                "Request/response mismatch: got {response:?} for request function code 0x{function_code:02X}"
             ))),
         }
     }
@@ -486,7 +463,7 @@ fn serialize_modbus_response(response: &ModbusResponse) -> Result<Vec<u8>, Modbu
                     payload.len()
                 ))
             })?;
-            pdu.push(0x01);
+            pdu.push(READ_COILS);
             pdu.push(byte_count);
             pdu.extend_from_slice(&payload);
         }
@@ -499,7 +476,7 @@ fn serialize_modbus_response(response: &ModbusResponse) -> Result<Vec<u8>, Modbu
                     payload.len()
                 ))
             })?;
-            pdu.push(0x02);
+            pdu.push(READ_DISCRETE_INPUTS);
             pdu.push(byte_count);
             pdu.extend_from_slice(&payload);
         }
@@ -515,7 +492,7 @@ fn serialize_modbus_response(response: &ModbusResponse) -> Result<Vec<u8>, Modbu
                     registers.len() * 2
                 ))
             })?;
-            pdu.push(0x03);
+            pdu.push(READ_HOLDING_REGISTERS);
             pdu.push(byte_count);
             for register in registers {
                 pdu.extend_from_slice(&register.to_be_bytes());
@@ -533,20 +510,20 @@ fn serialize_modbus_response(response: &ModbusResponse) -> Result<Vec<u8>, Modbu
                     registers.len() * 2
                 ))
             })?;
-            pdu.push(0x04);
+            pdu.push(READ_INPUT_REGISTERS);
             pdu.push(byte_count);
             for register in registers {
                 pdu.extend_from_slice(&register.to_be_bytes());
             }
         }
         ModbusResponse::WriteSingleCoil { address, value } => {
-            pdu.push(0x05);
+            pdu.push(WRITE_SINGLE_COIL);
             pdu.extend_from_slice(&address.to_be_bytes());
             let raw = if *value { 0xFF00u16 } else { 0x0000u16 };
             pdu.extend_from_slice(&raw.to_be_bytes());
         }
         ModbusResponse::WriteSingleRegister { address, value } => {
-            pdu.push(0x06);
+            pdu.push(WRITE_SINGLE_REGISTER);
             pdu.extend_from_slice(&address.to_be_bytes());
             pdu.extend_from_slice(&value.to_be_bytes());
         }
@@ -555,7 +532,7 @@ fn serialize_modbus_response(response: &ModbusResponse) -> Result<Vec<u8>, Modbu
             quantity,
         } => {
             validate_ack_quantity("WriteMultipleCoils", *quantity, MAX_WRITE_MULTIPLE_COILS)?;
-            pdu.push(0x0F);
+            pdu.push(WRITE_MULTIPLE_COILS);
             pdu.extend_from_slice(&starting_address.to_be_bytes());
             pdu.extend_from_slice(&quantity.to_be_bytes());
         }
@@ -568,7 +545,7 @@ fn serialize_modbus_response(response: &ModbusResponse) -> Result<Vec<u8>, Modbu
                 *quantity,
                 MAX_WRITE_MULTIPLE_REGISTERS,
             )?;
-            pdu.push(0x10);
+            pdu.push(WRITE_MULTIPLE_REGISTERS);
             pdu.extend_from_slice(&starting_address.to_be_bytes());
             pdu.extend_from_slice(&quantity.to_be_bytes());
         }
@@ -611,23 +588,23 @@ fn deserialize_modbus_response(response: &[u8]) -> Result<ModbusResponse, Modbus
 
     let function_code = response[0];
     match function_code {
-        1 => {
+        READ_COILS => {
             let coils = unpack_bits(response)?;
             Ok(ModbusResponse::ReadCoils { coils })
         }
-        2 => {
+        READ_DISCRETE_INPUTS => {
             let inputs = unpack_bits(response)?;
             Ok(ModbusResponse::ReadDiscreteInputs { inputs })
         }
-        3 => {
+        READ_HOLDING_REGISTERS => {
             let registers = parse_registers(response)?;
             Ok(ModbusResponse::ReadHoldingRegisters { registers })
         }
-        4 => {
+        READ_INPUT_REGISTERS => {
             let registers = parse_registers(response)?;
             Ok(ModbusResponse::ReadInputRegisters { registers })
         }
-        5 => {
+        WRITE_SINGLE_COIL => {
             require_exact_len(response, 5, "Write Single Coil")?;
             let address = u16::from_be_bytes([response[1], response[2]]);
             let coil_value = u16::from_be_bytes([response[3], response[4]]);
@@ -642,13 +619,13 @@ fn deserialize_modbus_response(response: &[u8]) -> Result<ModbusResponse, Modbus
             };
             Ok(ModbusResponse::WriteSingleCoil { address, value })
         }
-        6 => {
+        WRITE_SINGLE_REGISTER => {
             require_exact_len(response, 5, "Write Single Register")?;
             let address = u16::from_be_bytes([response[1], response[2]]);
             let value = u16::from_be_bytes([response[3], response[4]]);
             Ok(ModbusResponse::WriteSingleRegister { address, value })
         }
-        15 => {
+        WRITE_MULTIPLE_COILS => {
             require_exact_len(response, 5, "Write Multiple Coils")?;
             let starting_address = u16::from_be_bytes([response[1], response[2]]);
             let quantity = u16::from_be_bytes([response[3], response[4]]);
@@ -657,7 +634,7 @@ fn deserialize_modbus_response(response: &[u8]) -> Result<ModbusResponse, Modbus
                 quantity,
             })
         }
-        16 => {
+        WRITE_MULTIPLE_REGISTERS => {
             require_exact_len(response, 5, "Write Multiple Registers")?;
             let starting_address = u16::from_be_bytes([response[1], response[2]]);
             let quantity = u16::from_be_bytes([response[3], response[4]]);
@@ -1502,10 +1479,9 @@ mod tests {
 
     #[test]
     fn align_write_multiple_coils_with_oversized_request_quantity_errors() {
-        // Bypass `ModbusRequest::serialize` validation by constructing the
-        // request directly with a length that exceeds u16::MAX. This is the
-        // only way to exercise the defensive `u16::try_from` branch in
-        // `align_response_to_request`.
+        // Bypass `ModbusRequest::serialize` validation by constructing an
+        // impossible request directly. The saturated echo quantity cannot match
+        // any protocol-legal write-multiple response quantity.
         let request = ModbusRequest::WriteMultipleCoils {
             starting_address: 0,
             values: vec![true; usize::from(u16::MAX) + 1],
@@ -1540,6 +1516,23 @@ mod tests {
             }
             other => panic!("expected RequestResponseMismatch, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn align_to_request_allows_exception_for_oversized_hand_built_request() {
+        let request = ModbusRequest::WriteMultipleRegisters {
+            starting_address: 0,
+            values: vec![0; usize::from(u16::MAX) + 1],
+        };
+        let response = ModbusResponse::Exception {
+            function_code: FunctionCode::try_from(WRITE_MULTIPLE_REGISTERS).unwrap(),
+            code: ExceptionCode::IllegalDataValue,
+        };
+
+        assert_eq!(
+            response.clone().align_to_request(&request).unwrap(),
+            response
+        );
     }
 
     #[test]

@@ -4,7 +4,9 @@
 use crate::error::ModbusError;
 use crate::limits::{
     MAX_READ_COILS, MAX_READ_DISCRETE_INPUTS, MAX_READ_HOLDING_REGISTERS, MAX_READ_INPUT_REGISTERS,
-    MAX_WRITE_MULTIPLE_COILS, MAX_WRITE_MULTIPLE_REGISTERS,
+    MAX_WRITE_MULTIPLE_COILS, MAX_WRITE_MULTIPLE_REGISTERS, READ_COILS, READ_DISCRETE_INPUTS,
+    READ_HOLDING_REGISTERS, READ_INPUT_REGISTERS, WRITE_MULTIPLE_COILS, WRITE_MULTIPLE_REGISTERS,
+    WRITE_SINGLE_COIL, WRITE_SINGLE_REGISTER,
 };
 use crate::response::{pack_bits_payload, unpack_bits_payload};
 
@@ -161,17 +163,90 @@ impl ModbusRequest {
         serialize_modbus_request(self)
     }
 
+    /// Extracts the scalar fields a response has to be checked against.
+    pub(crate) fn echo(&self) -> RequestEcho {
+        RequestEcho::from_request(self)
+    }
+
     pub(crate) fn function_code(&self) -> u8 {
         match self {
-            ModbusRequest::ReadCoils { .. } => 0x01,
-            ModbusRequest::ReadDiscreteInputs { .. } => 0x02,
-            ModbusRequest::ReadHoldingRegisters { .. } => 0x03,
-            ModbusRequest::ReadInputRegisters { .. } => 0x04,
-            ModbusRequest::WriteSingleCoil { .. } => 0x05,
-            ModbusRequest::WriteSingleRegister { .. } => 0x06,
-            ModbusRequest::WriteMultipleCoils { .. } => 0x0F,
-            ModbusRequest::WriteMultipleRegisters { .. } => 0x10,
+            ModbusRequest::ReadCoils { .. } => READ_COILS,
+            ModbusRequest::ReadDiscreteInputs { .. } => READ_DISCRETE_INPUTS,
+            ModbusRequest::ReadHoldingRegisters { .. } => READ_HOLDING_REGISTERS,
+            ModbusRequest::ReadInputRegisters { .. } => READ_INPUT_REGISTERS,
+            ModbusRequest::WriteSingleCoil { .. } => WRITE_SINGLE_COIL,
+            ModbusRequest::WriteSingleRegister { .. } => WRITE_SINGLE_REGISTER,
+            ModbusRequest::WriteMultipleCoils { .. } => WRITE_MULTIPLE_COILS,
+            ModbusRequest::WriteMultipleRegisters { .. } => WRITE_MULTIPLE_REGISTERS,
         }
+    }
+}
+
+/// The scalar request fields that a response must agree with.
+///
+/// Every request PDU this crate supports has the same layout after the function
+/// code: a two-byte address followed by a two-byte quantity, or — for the
+/// single-write functions — the written value in the same position. Response
+/// alignment never inspects anything else, so carrying just these five bytes
+/// lets the server dispatch validate a response without cloning a request
+/// payload that can hold up to 123 registers or 1968 coils.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RequestEcho {
+    pub(crate) function_code: u8,
+    pub(crate) address: u16,
+    /// Quantity for reads and multi-writes, written value for single writes.
+    pub(crate) quantity: u16,
+}
+
+impl RequestEcho {
+    fn from_request(request: &ModbusRequest) -> Self {
+        let function_code = request.function_code();
+        let (address, quantity) = match request {
+            ModbusRequest::ReadCoils {
+                starting_address,
+                quantity,
+            }
+            | ModbusRequest::ReadDiscreteInputs {
+                starting_address,
+                quantity,
+            }
+            | ModbusRequest::ReadHoldingRegisters {
+                starting_address,
+                quantity,
+            }
+            | ModbusRequest::ReadInputRegisters {
+                starting_address,
+                quantity,
+            } => (*starting_address, *quantity),
+            ModbusRequest::WriteSingleCoil { address, value } => {
+                (*address, if *value { 0xFF00 } else { 0x0000 })
+            }
+            ModbusRequest::WriteSingleRegister { address, value } => (*address, *value),
+            ModbusRequest::WriteMultipleCoils {
+                starting_address,
+                values,
+            } => (
+                *starting_address,
+                u16::try_from(values.len()).unwrap_or(u16::MAX),
+            ),
+            ModbusRequest::WriteMultipleRegisters {
+                starting_address,
+                values,
+            } => (
+                *starting_address,
+                u16::try_from(values.len()).unwrap_or(u16::MAX),
+            ),
+        };
+        Self {
+            function_code,
+            address,
+            quantity,
+        }
+    }
+
+    /// Reconstructs the boolean written by a write-single-coil request.
+    pub(crate) fn coil_value(self) -> bool {
+        self.quantity == 0xFF00
     }
 }
 
@@ -250,13 +325,13 @@ impl TryFrom<&[u8]> for ModbusRequest {
     fn try_from(pdu: &[u8]) -> Result<Self, Self::Error> {
         require_min_len(pdu, 1)?;
         match pdu[0] {
-            0x01 => parse_read_request(pdu, MAX_READ_COILS, |starting_address, quantity| {
+            READ_COILS => parse_read_request(pdu, MAX_READ_COILS, |starting_address, quantity| {
                 ModbusRequest::ReadCoils {
                     starting_address,
                     quantity,
                 }
             }),
-            0x02 => parse_read_request(
+            READ_DISCRETE_INPUTS => parse_read_request(
                 pdu,
                 MAX_READ_DISCRETE_INPUTS,
                 |starting_address, quantity| ModbusRequest::ReadDiscreteInputs {
@@ -264,7 +339,7 @@ impl TryFrom<&[u8]> for ModbusRequest {
                     quantity,
                 },
             ),
-            0x03 => parse_read_request(
+            READ_HOLDING_REGISTERS => parse_read_request(
                 pdu,
                 MAX_READ_HOLDING_REGISTERS,
                 |starting_address, quantity| ModbusRequest::ReadHoldingRegisters {
@@ -272,7 +347,7 @@ impl TryFrom<&[u8]> for ModbusRequest {
                     quantity,
                 },
             ),
-            0x04 => parse_read_request(
+            READ_INPUT_REGISTERS => parse_read_request(
                 pdu,
                 MAX_READ_INPUT_REGISTERS,
                 |starting_address, quantity| ModbusRequest::ReadInputRegisters {
@@ -280,7 +355,7 @@ impl TryFrom<&[u8]> for ModbusRequest {
                     quantity,
                 },
             ),
-            0x05 => {
+            WRITE_SINGLE_COIL => {
                 require_exact_len(pdu, 5)?;
                 let address = parse_u16(pdu, 1);
                 let raw_value = parse_u16(pdu, 3);
@@ -291,14 +366,14 @@ impl TryFrom<&[u8]> for ModbusRequest {
                 };
                 Ok(ModbusRequest::WriteSingleCoil { address, value })
             }
-            0x06 => {
+            WRITE_SINGLE_REGISTER => {
                 require_exact_len(pdu, 5)?;
                 Ok(ModbusRequest::WriteSingleRegister {
                     address: parse_u16(pdu, 1),
                     value: parse_u16(pdu, 3),
                 })
             }
-            0x0F => {
+            WRITE_MULTIPLE_COILS => {
                 let (starting_address, quantity, declared) = parse_multi_write_header(pdu)?;
                 validate_parsed_quantity(quantity, MAX_WRITE_MULTIPLE_COILS)?;
                 let expected_count = (usize::from(quantity) + 7) / 8;
@@ -314,7 +389,7 @@ impl TryFrom<&[u8]> for ModbusRequest {
                     values,
                 })
             }
-            0x10 => {
+            WRITE_MULTIPLE_REGISTERS => {
                 let (starting_address, quantity, declared) = parse_multi_write_header(pdu)?;
                 validate_parsed_quantity(quantity, MAX_WRITE_MULTIPLE_REGISTERS)?;
                 let expected_count = usize::from(quantity) * 2;
@@ -344,7 +419,7 @@ fn serialize_modbus_request(pdu: &ModbusRequest) -> Result<Vec<u8>, ModbusError>
             starting_address,
             quantity,
         } => {
-            frame.push(1);
+            frame.push(READ_COILS);
             frame.extend_from_slice(&starting_address.to_be_bytes());
             frame.extend_from_slice(&quantity.to_be_bytes());
         }
@@ -352,7 +427,7 @@ fn serialize_modbus_request(pdu: &ModbusRequest) -> Result<Vec<u8>, ModbusError>
             starting_address,
             quantity,
         } => {
-            frame.push(2);
+            frame.push(READ_DISCRETE_INPUTS);
             frame.extend_from_slice(&starting_address.to_be_bytes());
             frame.extend_from_slice(&quantity.to_be_bytes());
         }
@@ -360,7 +435,7 @@ fn serialize_modbus_request(pdu: &ModbusRequest) -> Result<Vec<u8>, ModbusError>
             starting_address,
             quantity,
         } => {
-            frame.push(3);
+            frame.push(READ_HOLDING_REGISTERS);
             frame.extend_from_slice(&starting_address.to_be_bytes());
             frame.extend_from_slice(&quantity.to_be_bytes());
         }
@@ -368,18 +443,18 @@ fn serialize_modbus_request(pdu: &ModbusRequest) -> Result<Vec<u8>, ModbusError>
             starting_address,
             quantity,
         } => {
-            frame.push(4);
+            frame.push(READ_INPUT_REGISTERS);
             frame.extend_from_slice(&starting_address.to_be_bytes());
             frame.extend_from_slice(&quantity.to_be_bytes());
         }
         ModbusRequest::WriteSingleCoil { address, value } => {
-            frame.push(5u8);
+            frame.push(WRITE_SINGLE_COIL);
             frame.extend_from_slice(&address.to_be_bytes());
             let coil_value: u16 = if *value { 0xFF00 } else { 0x0000 };
             frame.extend_from_slice(&coil_value.to_be_bytes());
         }
         ModbusRequest::WriteSingleRegister { address, value } => {
-            frame.push(6u8);
+            frame.push(WRITE_SINGLE_REGISTER);
             frame.extend_from_slice(&address.to_be_bytes());
             frame.extend_from_slice(&value.to_be_bytes());
         }
@@ -390,7 +465,7 @@ fn serialize_modbus_request(pdu: &ModbusRequest) -> Result<Vec<u8>, ModbusError>
             // `ModbusRequest::serialize` validates the public API bounds first.
             // Keep the conversions defensive here as a backstop for tests that
             // intentionally bypass validation inside this module.
-            frame.push(15u8);
+            frame.push(WRITE_MULTIPLE_COILS);
             let quantity = u16::try_from(values.len()).map_err(|_| {
                 ModbusError::ValidationError(format!(
                     "WriteMultipleCoils quantity must fit in u16, got {}",
@@ -416,7 +491,7 @@ fn serialize_modbus_request(pdu: &ModbusRequest) -> Result<Vec<u8>, ModbusError>
             // `ModbusRequest::serialize` validates the public API bounds first.
             // Keep the conversions defensive here as a backstop for tests that
             // intentionally bypass validation inside this module.
-            frame.push(16u8);
+            frame.push(WRITE_MULTIPLE_REGISTERS);
             let quantity = u16::try_from(values.len()).map_err(|_| {
                 ModbusError::ValidationError(format!(
                     "WriteMultipleRegisters quantity must fit in u16, got {}",
@@ -844,6 +919,82 @@ mod tests {
         for (bytes, expected) in fixtures {
             assert_eq!(ModbusRequest::try_from(bytes.as_slice()).unwrap(), expected);
         }
+    }
+
+    #[test]
+    fn request_echo_matches_the_serialized_wire_fields() {
+        // The echo exists so response alignment never has to keep the request
+        // payload around. It must be exactly bytes 0..5 of the request PDU.
+        let requests = [
+            ModbusRequest::ReadCoils {
+                starting_address: 0x0010,
+                quantity: 9,
+            },
+            ModbusRequest::ReadDiscreteInputs {
+                starting_address: 0x0011,
+                quantity: 3,
+            },
+            ModbusRequest::ReadHoldingRegisters {
+                starting_address: 0x0012,
+                quantity: 2,
+            },
+            ModbusRequest::ReadInputRegisters {
+                starting_address: 0x0013,
+                quantity: 1,
+            },
+            ModbusRequest::WriteSingleCoil {
+                address: 0x0014,
+                value: true,
+            },
+            ModbusRequest::WriteSingleCoil {
+                address: 0x0015,
+                value: false,
+            },
+            ModbusRequest::WriteSingleRegister {
+                address: 0x0016,
+                value: 0x1234,
+            },
+            ModbusRequest::WriteMultipleCoils {
+                starting_address: 0x0017,
+                values: vec![true, false, true],
+            },
+            ModbusRequest::WriteMultipleRegisters {
+                starting_address: 0x0018,
+                values: vec![0x1111, 0x2222],
+            },
+        ];
+        for request in requests {
+            let bytes = request.serialize().unwrap();
+            let echo = request.echo();
+            assert_eq!(echo.function_code, bytes[0], "{request:?}");
+            assert_eq!(
+                echo.address,
+                u16::from_be_bytes([bytes[1], bytes[2]]),
+                "{request:?}"
+            );
+            assert_eq!(
+                echo.quantity,
+                u16::from_be_bytes([bytes[3], bytes[4]]),
+                "{request:?}"
+            );
+        }
+
+        assert!(
+            ModbusRequest::WriteSingleCoil {
+                address: 0,
+                value: true
+            }
+            .echo()
+            .coil_value()
+        );
+        assert!(
+            !ModbusRequest::WriteSingleCoil {
+                address: 0,
+                value: false
+            }
+            .echo()
+            .coil_value()
+        );
     }
 
     #[test]

@@ -30,5 +30,8 @@ pub use response::{ExceptionCode, FunctionCode, InvalidFunctionCode, ModbusRespo
 mod word_order;
 pub use word_order::{WordOrder, WordOrderError};
 
+/// Server abstractions and reference data stores.
+pub mod server;
+
 pub mod tcp;
 pub use tcp::ConnectionStatus;
