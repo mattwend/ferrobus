@@ -26,7 +26,12 @@ jobs:
       - run: cargo fmt -- --check
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo test --all-features
+      # The examples that do not need the `cli` feature must build for a user who
+      # depends on this crate with default features only.
+      - run: cargo build --examples
       - run: cargo doc --all-features --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
 
   cargo-deny:
     name: Cargo deny

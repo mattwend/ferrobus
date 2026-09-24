@@ -55,6 +55,8 @@ While the crate is below `1.0.0`, breaking changes are released in minor version
   now carry `function_code: FunctionCode` and `code: ExceptionCode` instead of
   raw `u8` fields. Pattern-match the typed values and use
   `u8::from(function_code)` when the raw function code is needed.
+- Client sockets set `TCP_NODELAY`. Modbus frames are small, so Nagle plus
+  delayed ACK added latency to every request/response exchange.
 
 ### Removed
 
