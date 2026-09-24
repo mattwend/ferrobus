@@ -37,9 +37,11 @@ mod test_support;
 mod timeouts;
 
 mod tcp_connection;
+mod tcp_server;
 pub use flow::ModbusTcpFlowControl;
 pub use retry::ModbusTcpRetry;
 pub use socket::ModbusTcpSocket;
 pub use status::ConnectionStatus;
 pub use tcp_connection::ModbusTcpConnection;
+pub use tcp_server::{BoundModbusTcpServer, ModbusTcpServer, ModbusTcpServerTimeouts};
 pub use timeouts::ModbusTcpTimeouts;

@@ -122,6 +122,11 @@ impl ModbusTcpConnection {
             .await
             .map_err(|_| ModbusError::ConnectTimeout)?
             .map_err(|error| ModbusError::ConnectError(Arc::new(error)))?;
+        // Modbus request frames are small; Nagle plus delayed ACK would add
+        // latency to every request/response exchange.
+        if let Err(error) = stream.set_nodelay(true) {
+            debug!(host, port, %error, "failed to disable Nagle on Modbus TCP connection");
+        }
         debug!(host, port, "connected to Modbus TCP server");
         Ok(stream)
     }

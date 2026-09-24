@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2025 ferrobus contributors
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use thiserror::Error;
@@ -23,6 +24,15 @@ pub enum ModbusError {
     /// TCP connection establishment exceeded the configured timeout.
     #[error("TCP connect timed out")]
     ConnectTimeout,
+
+    /// TCP listener bind failed.
+    #[error("failed to bind {addr}: {source}")]
+    BindError {
+        /// Address the server attempted to bind.
+        addr: SocketAddr,
+        /// Original bind or local-address I/O error.
+        source: Arc<std::io::Error>,
+    },
 
     /// Writing bytes to the TCP stream failed.
     #[error("TCP write error: {0}")]
@@ -108,6 +118,16 @@ impl PartialEq for ModbusError {
             (Self::ConnectError(lhs), Self::ConnectError(rhs))
             | (Self::WriteError(lhs), Self::WriteError(rhs))
             | (Self::ReadError(lhs), Self::ReadError(rhs)) => io_errors_equal(lhs, rhs),
+            (
+                Self::BindError {
+                    addr: lhs_addr,
+                    source: lhs_source,
+                },
+                Self::BindError {
+                    addr: rhs_addr,
+                    source: rhs_source,
+                },
+            ) => lhs_addr == rhs_addr && io_errors_equal(lhs_source, rhs_source),
             (Self::ConnectTimeout, Self::ConnectTimeout)
             | (Self::WriteTimeout, Self::WriteTimeout)
             | (Self::ReadTimeout, Self::ReadTimeout)

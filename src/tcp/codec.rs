@@ -10,7 +10,7 @@ use thiserror::Error;
 use tokio_util::codec::{Decoder, Encoder};
 
 use crate::error::ModbusError;
-use crate::tcp::frame::{MBAP_HEADER_LEN, response_body_len_from_header};
+use crate::tcp::frame::{MBAP_HEADER_LEN, body_len_from_header};
 
 /// Error emitted by the MBAP codec.
 ///
@@ -43,7 +43,7 @@ impl Decoder for MbapCodec {
 
         let mut header = [0_u8; MBAP_HEADER_LEN];
         header.copy_from_slice(&src[..MBAP_HEADER_LEN]);
-        let body_len = response_body_len_from_header(header)?;
+        let body_len = body_len_from_header(header)?;
         let frame_len = MBAP_HEADER_LEN + body_len;
         if src.len() < frame_len {
             return Ok(None);
