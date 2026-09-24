@@ -1612,34 +1612,68 @@ mod tests {
         assert_ne!(ExceptionCode::from(0x01), ExceptionCode::Unknown(0x01));
     }
 
-    #[test]
-    fn serialize_response_fixtures() {
-        let fixtures = [
+    /// Responses paired with their wire bytes and the request that produced them.
+    ///
+    /// Shared by the serializer fixture test and the serialize -> parse ->
+    /// align round-trip test.
+    #[allow(clippy::too_many_lines)]
+    fn response_fixtures() -> Vec<(ModbusRequest, ModbusResponse, Vec<u8>)> {
+        vec![
             (
+                ModbusRequest::ReadCoils {
+                    starting_address: 0x0010,
+                    quantity: 3,
+                },
                 ModbusResponse::ReadCoils {
                     coils: vec![true, false, true],
                 },
                 vec![0x01, 0x01, 0x05],
             ),
             (
+                ModbusRequest::ReadCoils {
+                    starting_address: 0x0010,
+                    quantity: 9,
+                },
+                ModbusResponse::ReadCoils {
+                    coils: vec![true, true, true, true, true, true, true, true, true],
+                },
+                vec![0x01, 0x02, 0xFF, 0x01],
+            ),
+            (
+                ModbusRequest::ReadDiscreteInputs {
+                    starting_address: 0x0010,
+                    quantity: 4,
+                },
                 ModbusResponse::ReadDiscreteInputs {
                     inputs: vec![false, true, false, true],
                 },
                 vec![0x02, 0x01, 0x0A],
             ),
             (
+                ModbusRequest::ReadHoldingRegisters {
+                    starting_address: 0x0010,
+                    quantity: 2,
+                },
                 ModbusResponse::ReadHoldingRegisters {
                     registers: vec![0x1234, 0x5678],
                 },
                 vec![0x03, 0x04, 0x12, 0x34, 0x56, 0x78],
             ),
             (
+                ModbusRequest::ReadInputRegisters {
+                    starting_address: 0x0010,
+                    quantity: 1,
+                },
                 ModbusResponse::ReadInputRegisters {
                     registers: vec![0x1234],
                 },
                 vec![0x04, 0x02, 0x12, 0x34],
             ),
             (
+                ModbusRequest::WriteSingleCoil {
+                    address: 0x0010,
+                    value: true,
+                },
                 ModbusResponse::WriteSingleCoil {
                     address: 0x0010,
                     value: true,
@@ -1647,6 +1681,21 @@ mod tests {
                 vec![0x05, 0x00, 0x10, 0xFF, 0x00],
             ),
             (
+                ModbusRequest::WriteSingleCoil {
+                    address: 0x0010,
+                    value: false,
+                },
+                ModbusResponse::WriteSingleCoil {
+                    address: 0x0010,
+                    value: false,
+                },
+                vec![0x05, 0x00, 0x10, 0x00, 0x00],
+            ),
+            (
+                ModbusRequest::WriteSingleRegister {
+                    address: 0x0010,
+                    value: 0x1234,
+                },
                 ModbusResponse::WriteSingleRegister {
                     address: 0x0010,
                     value: 0x1234,
@@ -1654,6 +1703,10 @@ mod tests {
                 vec![0x06, 0x00, 0x10, 0x12, 0x34],
             ),
             (
+                ModbusRequest::WriteMultipleCoils {
+                    starting_address: 0x0010,
+                    values: vec![true, false, true],
+                },
                 ModbusResponse::WriteMultipleCoils {
                     starting_address: 0x0010,
                     quantity: 3,
@@ -1661,15 +1714,50 @@ mod tests {
                 vec![0x0F, 0x00, 0x10, 0x00, 0x03],
             ),
             (
+                ModbusRequest::WriteMultipleRegisters {
+                    starting_address: 0x0010,
+                    values: vec![0x1111, 0x2222],
+                },
                 ModbusResponse::WriteMultipleRegisters {
                     starting_address: 0x0010,
                     quantity: 2,
                 },
                 vec![0x10, 0x00, 0x10, 0x00, 0x02],
             ),
-        ];
-        for (response, expected) in fixtures {
-            assert_eq!(response.serialize().unwrap(), expected);
+            (
+                ModbusRequest::ReadHoldingRegisters {
+                    starting_address: 0x0010,
+                    quantity: 2,
+                },
+                ModbusResponse::Exception {
+                    function_code: FunctionCode::normalize_for_exception(0x03),
+                    code: ExceptionCode::IllegalDataAddress,
+                },
+                vec![0x83, 0x02],
+            ),
+        ]
+    }
+
+    #[test]
+    fn serialize_response_fixtures() {
+        for (_request, response, expected) in response_fixtures() {
+            assert_eq!(response.serialize().unwrap(), expected, "{response:?}");
+        }
+    }
+
+    #[test]
+    fn every_serialized_response_is_accepted_by_the_client_parser() {
+        // Server direction: whatever `serialize` emits has to be something the
+        // client's own parser accepts and aligns back to the original value.
+        // Bit reads come back padded to a byte boundary, which alignment trims.
+        for (request, response, _bytes) in response_fixtures() {
+            let bytes = response.serialize().unwrap();
+            let parsed = ModbusResponse::try_from(bytes.as_slice())
+                .unwrap_or_else(|error| panic!("parser rejected {response:?}: {error}"));
+            let aligned = parsed
+                .align_to_request(&request)
+                .unwrap_or_else(|error| panic!("alignment rejected {response:?}: {error}"));
+            assert_eq!(aligned, response);
         }
     }
 }

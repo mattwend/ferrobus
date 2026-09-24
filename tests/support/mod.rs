@@ -2,6 +2,7 @@
 // Copyright (c) 2025 ferrobus contributors
 
 #![allow(
+    dead_code,
     missing_docs,
     unreachable_pub,
     clippy::cast_possible_truncation,
@@ -12,8 +13,11 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
+use ferrobus::server::ModbusServer;
+use ferrobus::tcp::ModbusTcpServer;
 use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream};
+use tokio::task::JoinHandle;
 use tokio::time::sleep;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -92,6 +96,30 @@ where
     });
 
     Ok(addr)
+}
+
+pub async fn spawn_tcp_server<S: ModbusServer>(
+    server: ModbusTcpServer<S>,
+) -> (SocketAddr, tokio::sync::oneshot::Sender<()>) {
+    let (addr, shutdown, _task) = spawn_tcp_server_with_task(server).await;
+    (addr, shutdown)
+}
+
+pub async fn spawn_tcp_server_with_task<S: ModbusServer>(
+    server: ModbusTcpServer<S>,
+) -> (SocketAddr, tokio::sync::oneshot::Sender<()>, JoinHandle<()>) {
+    let bound = server.bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+    let addr = bound.local_addr();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move {
+        bound
+            .serve_with_shutdown(async move {
+                let _shutdown = shutdown_rx.await;
+            })
+            .await
+            .unwrap();
+    });
+    (addr, shutdown_tx, task)
 }
 
 pub async fn spawn_slow_server(delay: Duration) -> std::io::Result<SocketAddr> {

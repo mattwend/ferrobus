@@ -856,9 +856,12 @@ mod tests {
         assert!(result.is_err());
     }
 
-    #[test]
-    fn parse_all_supported_request_functions() {
-        let fixtures = [
+    /// Wire bytes paired with the request they must parse into.
+    ///
+    /// Shared by the parser, serializer, and round-trip tests so all three stay
+    /// pinned to the same corpus.
+    fn request_fixtures() -> Vec<(Vec<u8>, ModbusRequest)> {
+        vec![
             (
                 vec![0x01, 0x00, 0x10, 0x00, 0x02],
                 ModbusRequest::ReadCoils {
@@ -915,10 +918,90 @@ mod tests {
                     values: vec![0x1234, 0x5678],
                 },
             ),
-        ];
-        for (bytes, expected) in fixtures {
+        ]
+    }
+
+    #[test]
+    fn parse_all_supported_request_functions() {
+        for (bytes, expected) in request_fixtures() {
             assert_eq!(ModbusRequest::try_from(bytes.as_slice()).unwrap(), expected);
         }
+    }
+
+    #[test]
+    fn every_request_fixture_round_trips_through_serialize_and_parse() {
+        // The client serializer and the server parser have to agree byte for
+        // byte: `serialize` output must parse back into an identical request,
+        // and every parser fixture must serialize back to its own wire bytes.
+        for (bytes, request) in request_fixtures() {
+            let serialized = request.serialize().unwrap();
+            assert_eq!(serialized, bytes, "{request:?}");
+            assert_eq!(
+                ModbusRequest::try_from(serialized.as_slice()).unwrap(),
+                request
+            );
+        }
+    }
+
+    #[test]
+    fn parse_rejects_quantities_above_the_protocol_limit() {
+        let cases = [
+            (0x01u8, MAX_READ_COILS),
+            (0x02, MAX_READ_DISCRETE_INPUTS),
+            (0x03, MAX_READ_HOLDING_REGISTERS),
+            (0x04, MAX_READ_INPUT_REGISTERS),
+        ];
+        for (function_code, limit) in cases {
+            let over = limit + 1;
+            let mut pdu = vec![function_code, 0x00, 0x00];
+            pdu.extend_from_slice(&over.to_be_bytes());
+            assert_eq!(
+                ModbusRequest::try_from(pdu.as_slice()).unwrap_err(),
+                RequestParseError::QuantityOutOfRange {
+                    quantity: over,
+                    limit
+                },
+                "function code 0x{function_code:02X}"
+            );
+
+            // The limit itself must still be accepted.
+            let mut at_limit = vec![function_code, 0x00, 0x00];
+            at_limit.extend_from_slice(&limit.to_be_bytes());
+            assert!(ModbusRequest::try_from(at_limit.as_slice()).is_ok());
+
+            let zero = vec![function_code, 0x00, 0x00, 0x00, 0x00];
+            assert_eq!(
+                ModbusRequest::try_from(zero.as_slice()).unwrap_err(),
+                RequestParseError::QuantityOutOfRange { quantity: 0, limit }
+            );
+        }
+    }
+
+    #[test]
+    fn parse_rejects_multi_write_quantities_above_the_protocol_limit() {
+        let over_coils = MAX_WRITE_MULTIPLE_COILS + 1;
+        let mut coils = vec![0x0F, 0x00, 0x00];
+        coils.extend_from_slice(&over_coils.to_be_bytes());
+        coils.push(0x00);
+        assert_eq!(
+            ModbusRequest::try_from(coils.as_slice()).unwrap_err(),
+            RequestParseError::QuantityOutOfRange {
+                quantity: over_coils,
+                limit: MAX_WRITE_MULTIPLE_COILS
+            }
+        );
+
+        let over_registers = MAX_WRITE_MULTIPLE_REGISTERS + 1;
+        let mut registers = vec![0x10, 0x00, 0x00];
+        registers.extend_from_slice(&over_registers.to_be_bytes());
+        registers.push(0x00);
+        assert_eq!(
+            ModbusRequest::try_from(registers.as_slice()).unwrap_err(),
+            RequestParseError::QuantityOutOfRange {
+                quantity: over_registers,
+                limit: MAX_WRITE_MULTIPLE_REGISTERS
+            }
+        );
     }
 
     #[test]
