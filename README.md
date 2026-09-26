@@ -224,6 +224,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```
 
 Custom backends implement `server::ModbusServer`; see `examples/custom_server.rs`.
+`ModbusTcpServer::new` caps concurrent connection tasks at
+`ferrobus::tcp::DEFAULT_MAX_CONNECTIONS` by default; use `with_max_connections` to tune the
+limit for your deployment.
 
 ## Word order for wide values
 

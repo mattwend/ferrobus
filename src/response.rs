@@ -324,26 +324,31 @@ impl ModbusResponse {
     ///
     /// Returns the validated response, trimming bit-packed read results to the requested count.
     pub fn align_to_request(self, request: &ModbusRequest) -> Result<ModbusResponse, ModbusError> {
-        self.align_to_echo(request.echo())
+        self.align_to_echo_with_bit_alignment(request.echo(), BitAlignment::AllowPackedPadding)
     }
 
-    /// Aligns this response with the scalar fields of the request that produced it.
-    ///
-    /// Alignment only ever looks at the function code, address, and quantity, so
-    /// callers that already dropped the request payload (the server dispatch) can
-    /// validate a response without retaining or cloning it.
     #[allow(clippy::too_many_lines)]
-    pub(crate) fn align_to_echo(self, echo: RequestEcho) -> Result<ModbusResponse, ModbusError> {
+    pub(crate) fn align_to_echo_with_bit_alignment(
+        self,
+        echo: RequestEcho,
+        bit_alignment: BitAlignment,
+    ) -> Result<ModbusResponse, ModbusError> {
         let requested = echo.quantity;
         match (echo.function_code, &self) {
             (_, ModbusResponse::Exception { .. }) => Ok(self),
             (READ_COILS, ModbusResponse::ReadCoils { coils }) => {
-                validate_bit_count("ReadCoils", requested, coils.len())?;
+                validate_bit_count("ReadCoils", requested, coils.len(), bit_alignment)?;
+                if bit_alignment == BitAlignment::Exact {
+                    return Ok(self);
+                }
                 let trimmed = coils[..requested as usize].to_vec();
                 Ok(ModbusResponse::ReadCoils { coils: trimmed })
             }
             (READ_DISCRETE_INPUTS, ModbusResponse::ReadDiscreteInputs { inputs }) => {
-                validate_bit_count("ReadDiscreteInputs", requested, inputs.len())?;
+                validate_bit_count("ReadDiscreteInputs", requested, inputs.len(), bit_alignment)?;
+                if bit_alignment == BitAlignment::Exact {
+                    return Ok(self);
+                }
                 let trimmed = inputs[..requested as usize].to_vec();
                 Ok(ModbusResponse::ReadDiscreteInputs { inputs: trimmed })
             }
@@ -567,10 +572,19 @@ fn serialize_modbus_response(response: &ModbusResponse) -> Result<Vec<u8>, Modbu
     Ok(pdu)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BitAlignment {
+    /// Decoded wire responses may include up to seven trailing packed padding bits.
+    AllowPackedPadding,
+    /// Typed server handlers return semantic values and must match the requested count.
+    Exact,
+}
+
 fn validate_bit_count(
     function_name: &str,
     requested: u16,
     returned_bits: usize,
+    bit_alignment: BitAlignment,
 ) -> Result<(), ModbusError> {
     let requested = usize::from(requested);
     if returned_bits < requested {
@@ -578,7 +592,12 @@ fn validate_bit_count(
             "{function_name}: requested {requested} bits but got {returned_bits}"
         )));
     }
-    if returned_bits > requested + 7 {
+    if bit_alignment == BitAlignment::Exact && returned_bits != requested {
+        return Err(ModbusError::RequestResponseMismatch(format!(
+            "{function_name}: requested {requested} bits but got {returned_bits}"
+        )));
+    }
+    if bit_alignment == BitAlignment::AllowPackedPadding && returned_bits > requested + 7 {
         return Err(ModbusError::RequestResponseMismatch(format!(
             "{function_name}: requested {requested} bits but got {returned_bits}, more than one packed byte of padding"
         )));

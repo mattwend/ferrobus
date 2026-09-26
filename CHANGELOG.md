@@ -57,6 +57,10 @@ While the crate is below `1.0.0`, breaking changes are released in minor version
   `u8::from(function_code)` when the raw function code is needed.
 - Client sockets set `TCP_NODELAY`. Modbus frames are small, so Nagle plus
   delayed ACK added latency to every request/response exchange.
+- `ModbusTcpServer::new` now applies a bounded default connection cap exposed as
+  `tcp::DEFAULT_MAX_CONNECTIONS`; use `with_max_connections` to tune it.
+- Server dispatch now rejects custom bit-read responses whose typed value count
+  does not exactly match the request quantity.
 
 ### Removed
 

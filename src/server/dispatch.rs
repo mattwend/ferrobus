@@ -6,7 +6,7 @@
 use tracing::error;
 
 use crate::request::RequestParseError;
-use crate::response::FunctionCode;
+use crate::response::{BitAlignment, FunctionCode};
 use crate::server::ModbusServer;
 use crate::{ExceptionCode, ModbusRequest, ModbusResponse};
 
@@ -37,7 +37,7 @@ pub(crate) async fn process_pdu<S: ModbusServer>(
         Err(code) => return exception_pdu(function_code, code),
     };
 
-    let response = match response.align_to_echo(echo) {
+    let response = match response.align_to_echo_with_bit_alignment(echo, BitAlignment::Exact) {
         Ok(response) => response,
         Err(error) => {
             error!(%error, "ModbusServer returned a mismatched response");
@@ -240,6 +240,7 @@ mod tests {
         }
     }
 
+    const READ_ONE_COIL: [u8; 5] = [0x01, 0x00, 0x00, 0x00, 0x01];
     const READ_ONE_HOLDING: [u8; 5] = [0x03, 0x00, 0x00, 0x00, 0x01];
 
     #[tokio::test]
@@ -273,6 +274,17 @@ mod tests {
         assert_eq!(
             process_pdu(&server, 1, &READ_ONE_HOLDING).await,
             vec![0x83, 0x04]
+        );
+    }
+
+    #[tokio::test]
+    async fn handler_returning_bit_padding_is_a_contract_violation() {
+        let server = ScriptedServer::new(Ok(ModbusResponse::ReadCoils {
+            coils: vec![true; 8],
+        }));
+        assert_eq!(
+            process_pdu(&server, 1, &READ_ONE_COIL).await,
+            vec![0x81, 0x04]
         );
     }
 

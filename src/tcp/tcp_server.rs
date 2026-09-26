@@ -26,6 +26,9 @@ use crate::tcp::frame::MBAP_HEADER_LEN;
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(50);
 const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Default cap for concurrent Modbus TCP connection tasks.
+pub const DEFAULT_MAX_CONNECTIONS: usize = 128;
+
 /// Configuration for a Modbus TCP server before binding.
 pub struct ModbusTcpServer<S: ModbusServer> {
     server: Arc<S>,
@@ -43,7 +46,7 @@ pub struct BoundModbusTcpServer<S: ModbusServer> {
 /// Per-connection server I/O timeouts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ModbusTcpServerTimeouts {
-    /// Maximum time to read a header or PDU body before disconnecting an idle client.
+    /// Maximum time to read one complete frame before disconnecting an idle client.
     pub read_timeout: Duration,
     /// Maximum time to write one response frame.
     pub write_timeout: Duration,
@@ -59,13 +62,18 @@ impl Default for ModbusTcpServerTimeouts {
 }
 
 impl<S: ModbusServer> ModbusTcpServer<S> {
-    /// Creates a server configuration with default timeouts.
+    /// Creates a server configuration with default timeouts and connection limit.
+    ///
+    /// The default connection limit is [`DEFAULT_MAX_CONNECTIONS`]. Use
+    /// [`Self::with_max_connections`] to choose a limit appropriate for the deployment.
     #[must_use]
     pub fn new(server: S) -> Self {
         Self {
             server: Arc::new(server),
             timeouts: ModbusTcpServerTimeouts::default(),
-            max_connections: None,
+            max_connections: Some(
+                NonZeroUsize::new(DEFAULT_MAX_CONNECTIONS).unwrap_or(NonZeroUsize::MIN),
+            ),
         }
     }
 
@@ -317,4 +325,20 @@ async fn handle_connection<S: ModbusServer>(
         }
     }
     drop(permit);
+}
+
+#[cfg(test)]
+#[allow(clippy::panic, clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use crate::server::InMemoryStore;
+
+    #[test]
+    fn new_uses_bounded_connection_limit() {
+        let config = ModbusTcpServer::new(InMemoryStore::new(1, 1, 1, 1).unwrap());
+        assert_eq!(
+            config.max_connections.map(NonZeroUsize::get),
+            Some(DEFAULT_MAX_CONNECTIONS)
+        );
+    }
 }
