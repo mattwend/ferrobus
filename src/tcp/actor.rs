@@ -193,7 +193,20 @@ impl Actor {
         Ok(())
     }
 
+    /// Admits one queued request, or retires it without touching the wire.
+    ///
+    /// A dropped reply channel is the caller telling us it stopped waiting — its own
+    /// deadline elapsed, or its task was cancelled — and such a request must not be
+    /// transmitted. The caller has already concluded the request did not happen, so a
+    /// late write would execute at the device with nobody left to observe the outcome,
+    /// which turns the caller's retry into a duplicate. Queued requests are checked here
+    /// only to skip a pointless dial; [`Self::write_on_wire`] holds the authoritative
+    /// check, because the dial itself can outlive the caller.
     async fn dispatch(&mut self, cmd: RequestCommand) {
+        if cmd.reply.is_closed() {
+            trace!("discarding queued request whose caller stopped waiting");
+            return;
+        }
         if cmd.queue_deadline <= Instant::now() {
             notify_waiter(cmd.reply, Err(ModbusError::QueueTimeout));
             return;
@@ -212,7 +225,16 @@ impl Actor {
         self.write_on_wire(cmd).await;
     }
 
+    /// Serializes one request and puts it on the socket.
+    ///
+    /// The abandonment check is repeated here because it is the last point before the
+    /// bytes leave: everything upstream of it — queue wait, dial — can outlive the
+    /// caller that submitted the request.
     async fn write_on_wire(&mut self, cmd: RequestCommand) {
+        if cmd.reply.is_closed() {
+            trace!("discarding request whose caller stopped waiting before the write");
+            return;
+        }
         let tid = match self.allocate_tid() {
             Ok(tid) => tid,
             Err(error) => {
@@ -729,6 +751,58 @@ mod tests {
         ));
         assert!(actor.pending.is_empty());
         assert!(actor.framed.is_none());
+    }
+
+    /// A caller that stopped waiting while its request sat in the queue must not cost a
+    /// dial: the request is retired before the connect path is entered.
+    #[tokio::test]
+    async fn dispatch_discards_abandoned_request_without_dialing() {
+        let addr = accept_and_hold_server().await;
+        let (mut actor, _connected_rx) = actor_for_addr(addr);
+        let (reply, response) = oneshot::channel();
+        drop(response);
+
+        actor
+            .dispatch(request_command(
+                1,
+                reply,
+                Instant::now() + Duration::from_secs(5),
+            ))
+            .await;
+
+        assert!(actor.framed.is_none());
+        assert_eq!(actor.generation, 0);
+        assert!(actor.pending.is_empty());
+    }
+
+    /// The last check before the bytes leave: a request whose caller went away while the
+    /// actor was queueing or dialing must never reach the socket, because a write nobody
+    /// waits for is an unobservable device mutation and makes the caller's retry a
+    /// duplicate.
+    #[tokio::test]
+    async fn write_on_wire_discards_abandoned_request_without_transmitting() {
+        let (client, mut server) = loopback_stream_pair().await;
+        let (mut actor, _connected_rx) = connected_actor_with_stream(client);
+        let (reply, response) = oneshot::channel();
+        drop(response);
+
+        actor
+            .write_on_wire(request_command(
+                1,
+                reply,
+                Instant::now() + Duration::from_secs(5),
+            ))
+            .await;
+
+        assert!(actor.pending.is_empty());
+        assert_eq!(actor.next_tid, 0, "no transaction id may be consumed");
+        let mut byte = [0u8; 1];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), server.read(&mut byte))
+                .await
+                .is_err(),
+            "no frame may reach the peer"
+        );
     }
 
     /// Calling `ensure_connected` when a framed socket is already present must be a no-op.

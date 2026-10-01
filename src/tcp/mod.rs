@@ -3,14 +3,19 @@
 
 //! Modbus TCP framing and transport helpers.
 //!
-//! The public construction surface is split into two phases:
-//! [`ModbusTcpSocket`] stores configurable settings without opening a network
-//! connection, then [`ModbusTcpSocket::connect`] validates those settings,
-//! eagerly opens the first TCP connection, and returns a live
-//! [`ModbusTcpConnection`] actor handle. [`ModbusTcpConnection::open`] is the
-//! default-configuration shortcut. Internal submodules keep ADU/MBAP frame
-//! construction, actor-based socket ownership, MBAP codec framing, and
-//! retry/timeout configuration separated by concern.
+//! The public construction surface is split into two phases and
+//! [`ModbusTcpSocket`] is its only entry point: a socket stores configurable
+//! settings without opening a network connection, then one of two consuming
+//! methods validates those settings, spawns the background actor, and returns a
+//! live [`ModbusTcpConnection`] handle. [`ModbusTcpSocket::connect`] eagerly
+//! opens the first TCP connection and fails if it cannot, discarding the actor
+//! it just spawned. [`ModbusTcpSocket::spawn`] is the variant for callers that
+//! need the handle before the peer is reachable: it validates and spawns without
+//! dialing, leaving the first connect to the actor's on-demand connect or to an
+//! explicit [`ModbusTcpConnection::connect`], so the same actor can be retried
+//! after a failure. Internal submodules keep ADU/MBAP frame construction,
+//! actor-based socket ownership, MBAP codec framing, and retry/timeout
+//! configuration separated by concern.
 //!
 //! The live handle also owns the connection lifecycle:
 //! [`ModbusTcpConnection::connect`] and [`ModbusTcpConnection::disconnect`]

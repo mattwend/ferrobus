@@ -15,6 +15,7 @@ use tracing::debug;
 use crate::tcp::actor::{ControlCommand, RequestCommand};
 use crate::tcp::frame::MBAP_HEADER_LEN;
 use crate::tcp::retry::{ModbusTcpRetry, retry_transient};
+#[cfg(test)]
 use crate::tcp::socket::ModbusTcpSocket;
 use crate::tcp::status::ConnectionStatus;
 #[cfg(test)]
@@ -23,19 +24,43 @@ use crate::{ModbusRequest, ModbusResponse, error::ModbusError};
 
 /// Live Modbus TCP client handle.
 ///
-/// Construct a handle with [`ModbusTcpSocket::connect`] when custom timeouts,
-/// flow control, retry, or an initial transaction-id seed are needed. Use
-/// [`ModbusTcpConnection::open`] for the default configuration shortcut. Both
-/// paths spawn the background actor and eagerly open the first TCP connection
-/// before returning this live handle.
+/// This is a handle to a live background actor, not a guarantee that a TCP
+/// socket is currently open: a handle whose actor has never dialed, or whose
+/// socket was torn down, is still valid and usable.
+///
+/// Every handle is constructed through [`ModbusTcpSocket`](crate::tcp::ModbusTcpSocket),
+/// which stores construction-time settings and offers two consuming paths that
+/// differ only in when the first TCP connection is opened.
+/// [`ModbusTcpSocket::connect`](crate::tcp::ModbusTcpSocket::connect) spawns the
+/// actor and eagerly opens the first socket, so it fails when the peer is
+/// unreachable and the freshly spawned actor is then dropped with the handle
+/// that was never returned.
+/// [`ModbusTcpSocket::spawn`](crate::tcp::ModbusTcpSocket::spawn) returns the
+/// same live handle without dialing, for a caller that must own the handle
+/// before its peer is reachable; that handle reports [`ConnectionStatus`]
+/// `{ connected: false, generation: 0 }` until the socket is opened by
+/// [`Self::connect`] or by the actor's on-demand connect on the first request.
+/// A caller that must retain the actor across an initial connection failure has
+/// to take the `spawn` path.
 ///
 /// Clones are lightweight command senders to a single background actor that owns
 /// the TCP socket, pending response map, and transaction-id counter. The actor
-/// reconnects lazily after transport teardown, applies bounded in-flight flow
-/// control, and uses a bounded request channel as backpressure. Queue wait is
-/// bounded by flow-control settings; response timeout starts when the actor
-/// writes the request on the socket. Use [`Self::with_unit_id`] to derive another
-/// live handle that shares the same actor with a different default unit id.
+/// applies bounded in-flight flow control and uses a bounded request channel as
+/// backpressure. Queue wait is bounded by flow-control settings; response timeout
+/// starts when the actor writes the request on the socket. Use
+/// [`Self::with_unit_id`] to derive another live handle that shares the same actor
+/// with a different default unit id.
+///
+/// Reconnection is on-demand, not a background loop. Any read/write/EOF failure
+/// tears the socket down, and the next request to reach the actor opens a fresh
+/// one. There is no reconnect timer, task, or backoff inside the actor: reconnect
+/// *policy* stays with the caller, and [`ModbusTcpRetry`](crate::tcp::ModbusTcpRetry)
+/// covers same-call retry.
+///
+/// Do not wrap this handle in `Mutex<Option<ModbusTcpConnection>>` and discard it
+/// on the first I/O error. Dropping the handle stops requests from ever reaching
+/// the actor, which is exactly what defeats its on-demand reconnect. Keep the
+/// handle and watch [`ConnectionStatus::generation`] instead.
 ///
 /// The connection lifecycle is driven from this handle: [`Self::connect`] and
 /// [`Self::disconnect`] open and close the actor's socket without replacing the
@@ -69,28 +94,6 @@ impl ModbusTcpConnection {
             queue_timeout,
             retry,
         }
-    }
-
-    /// Opens a connection to a Modbus TCP server with default construction settings.
-    ///
-    /// `host` may be a DNS name or numeric IP address. `port` is the TCP port,
-    /// and `unit_id` is the default Modbus unit id used by the returned live
-    /// handle. This is a shortcut for configuring a [`ModbusTcpSocket`] with
-    /// defaults and awaiting [`ModbusTcpSocket::connect`].
-    ///
-    /// This associated function was named `connect` before `0.2.0`; that name
-    /// now belongs to the live-handle method [`Self::connect`].
-    ///
-    /// # Errors
-    ///
-    /// Returns validation, connection, timeout, or actor-termination errors from
-    /// [`ModbusTcpSocket::connect`].
-    pub async fn open(
-        host: impl Into<String>,
-        port: u16,
-        unit_id: u8,
-    ) -> Result<Self, ModbusError> {
-        ModbusTcpSocket::new(host, port, unit_id).connect().await
     }
 
     /// Returns a new handle with a different default unit id.
@@ -131,9 +134,10 @@ impl ModbusTcpConnection {
     /// [`ConnectionStatus::generation`] unchanged. A successful dial increments
     /// the generation by one.
     ///
-    /// Unlike [`Self::open`], this reuses the existing background actor. No
-    /// second actor is spawned and every clone of this handle, including those
-    /// from [`Self::with_unit_id`], observes the reopened socket.
+    /// Unlike [`ModbusTcpSocket::connect`](crate::tcp::ModbusTcpSocket::connect),
+    /// this reuses the existing background actor. No second actor is spawned and
+    /// every clone of this handle, including those from [`Self::with_unit_id`],
+    /// observes the reopened socket.
     ///
     /// # Errors
     ///
@@ -144,10 +148,10 @@ impl ModbusTcpConnection {
     /// # Examples
     ///
     /// ```no_run
-    /// use ferrobus::tcp::ModbusTcpConnection;
+    /// use ferrobus::tcp::ModbusTcpSocket;
     ///
     /// # async fn run() -> Result<(), ferrobus::ModbusError> {
-    /// let connection = ModbusTcpConnection::open("127.0.0.1", 502, 1).await?;
+    /// let connection = ModbusTcpSocket::new("127.0.0.1", 502, 1).connect().await?;
     /// let before = connection.status().generation;
     /// connection.disconnect().await;
     ///
@@ -195,10 +199,10 @@ impl ModbusTcpConnection {
     /// # Examples
     ///
     /// ```no_run
-    /// use ferrobus::tcp::ModbusTcpConnection;
+    /// use ferrobus::tcp::ModbusTcpSocket;
     ///
     /// # async fn run() -> Result<(), ferrobus::ModbusError> {
-    /// let connection = ModbusTcpConnection::open("127.0.0.1", 502, 1).await?;
+    /// let connection = ModbusTcpSocket::new("127.0.0.1", 502, 1).connect().await?;
     /// let mut negotiated_at = connection.status().generation;
     ///
     /// // ... later, before trusting negotiated device state ...
@@ -232,10 +236,10 @@ impl ModbusTcpConnection {
     /// # Examples
     ///
     /// ```no_run
-    /// use ferrobus::tcp::ModbusTcpConnection;
+    /// use ferrobus::tcp::ModbusTcpSocket;
     ///
     /// # async fn run() -> Result<(), ferrobus::ModbusError> {
-    /// let connection = ModbusTcpConnection::open("127.0.0.1", 502, 1).await?;
+    /// let connection = ModbusTcpSocket::new("127.0.0.1", 502, 1).spawn()?;
     /// let mut status = connection.watch_status();
     ///
     /// tokio::spawn(async move {
@@ -319,10 +323,87 @@ impl ModbusTcpConnection {
         response.align_to_request(pdu)
     }
 
+    /// Reads holding registers using this connection's default unit id.
+    ///
+    /// This is a typed convenience wrapper around [`Self::send_message`]. The lower-level method
+    /// aligns every response to the request through [`ModbusResponse::align_to_request`], so a
+    /// successful response can only be [`ModbusResponse::ReadHoldingRegisters`].
+    ///
+    /// # Errors
+    ///
+    /// Returns transport, protocol, validation, exception-response, or
+    /// request/response mismatch errors.
+    #[must_use = "read_holding_registers returns a future whose output reports request success or failure"]
+    pub async fn read_holding_registers(
+        &self,
+        starting_address: u16,
+        quantity: u16,
+    ) -> Result<Vec<u16>, ModbusError> {
+        let request = ModbusRequest::ReadHoldingRegisters {
+            starting_address,
+            quantity,
+        };
+
+        match self.send_message(&request).await? {
+            ModbusResponse::ReadHoldingRegisters { registers } => Ok(registers),
+            response => Err(unexpected_response("read_holding_registers", &response)),
+        }
+    }
+
+    /// Writes one holding register using this connection's default unit id.
+    ///
+    /// This is a typed convenience wrapper around [`Self::send_message`]. The lower-level method
+    /// aligns every response to the request through [`ModbusResponse::align_to_request`], so a
+    /// successful response can only be [`ModbusResponse::WriteSingleRegister`].
+    ///
+    /// # Errors
+    ///
+    /// Returns transport, protocol, validation, exception-response, or
+    /// request/response mismatch errors.
+    #[must_use = "write_single_register returns a future whose output reports request success or failure"]
+    pub async fn write_single_register(&self, address: u16, value: u16) -> Result<(), ModbusError> {
+        let request = ModbusRequest::WriteSingleRegister { address, value };
+
+        match self.send_message(&request).await? {
+            ModbusResponse::WriteSingleRegister { .. } => Ok(()),
+            response => Err(unexpected_response("write_single_register", &response)),
+        }
+    }
+
+    /// Writes consecutive holding registers using this connection's default unit id.
+    ///
+    /// This is a typed convenience wrapper around [`Self::send_message`]. The lower-level method
+    /// aligns every response to the request through [`ModbusResponse::align_to_request`], so a
+    /// successful response can only be [`ModbusResponse::WriteMultipleRegisters`].
+    ///
+    /// # Errors
+    ///
+    /// Returns transport, protocol, validation, exception-response, or
+    /// request/response mismatch errors.
+    #[must_use = "write_multiple_registers returns a future whose output reports request success or failure"]
+    pub async fn write_multiple_registers(
+        &self,
+        starting_address: u16,
+        values: &[u16],
+    ) -> Result<(), ModbusError> {
+        let request = ModbusRequest::WriteMultipleRegisters {
+            starting_address,
+            values: values.to_vec(),
+        };
+
+        match self.send_message(&request).await? {
+            ModbusResponse::WriteMultipleRegisters { .. } => Ok(()),
+            response => Err(unexpected_response("write_multiple_registers", &response)),
+        }
+    }
+
     /// Sends one request using this connection's default unit id.
     ///
     /// Modbus exception PDUs are surfaced as [`ModbusError::ExceptionResponse`]. Gateway-busy
     /// exception codes may be retried transparently when this handle has retry enabled.
+    ///
+    /// Dropping the returned future cancels the request if the actor has not written it yet;
+    /// once written, it may still be executed by the device.
     ///
     /// # Errors
     ///
@@ -337,6 +418,9 @@ impl ModbusTcpConnection {
     ///
     /// Modbus exception PDUs are surfaced as [`ModbusError::ExceptionResponse`]. Gateway-busy
     /// exception codes may be retried transparently when this handle has retry enabled.
+    ///
+    /// Dropping the returned future cancels the request if the actor has not written it yet;
+    /// once written, it may still be executed by the device.
     ///
     /// # Errors
     ///
@@ -365,6 +449,12 @@ impl ModbusTcpConnection {
             }
         }
     }
+}
+
+fn unexpected_response(operation: &str, response: &ModbusResponse) -> ModbusError {
+    ModbusError::RequestResponseMismatch(format!(
+        "unexpected response for {operation}: {response:?}"
+    ))
 }
 
 pub(crate) fn actor_terminated_error() -> ModbusError {
