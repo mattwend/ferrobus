@@ -24,7 +24,9 @@ Small Rust Modbus library with typed request/response PDUs and a reusable Modbus
     when the first connect happens
   - connection lifecycle on the live handle: `connect`, `disconnect`, and a subscribable
     `ConnectionStatus` with a monotonic generation counter
-  - reusable actor-owned connections with bounded request-channel backpressure
+  - reusable actor-owned connections with bounded request-queue backpressure
+  - three request priorities (`Normal`, `High`, `Urgent`) per handle or per request
+  - lock-free queue statistics for detecting a growing or stalled request backlog
   - configurable in-flight window for slow gateway-backed buses
   - retry of transient I/O failures and gateway-busy exception responses
   - per-phase timeouts for connect, write, queue wait, and on-wire response wait
@@ -248,6 +250,50 @@ let connection = ModbusTcpSocket::new("localhost", 502, 1)
 bounded backlog that applies backpressure to callers. Invalid flow-control settings return
 `ModbusError::ValidationError` from both construction paths; use
 `ModbusTcpFlowControl::serial_gateway()` for RTU gateways that drain one serial bus sequentially.
+
+### Request priorities and queue statistics
+
+Requests wait in a bounded queue with three priority levels before the actor writes them. The
+actor always dispatches the oldest request of the highest non-empty level, and when the queue is
+full, freed slots go to the highest parked level first. All existing methods use the handle's
+default priority, `Priority::Normal` unless changed:
+
+```rust,no_run
+use std::time::Duration;
+
+use ferrobus::ModbusRequest;
+use ferrobus::tcp::{ModbusTcpFlowControl, ModbusTcpSocket, Priority};
+
+#[tokio::main]
+async fn main() -> Result<(), ferrobus::ModbusError> {
+    let polling = ModbusTcpSocket::new("192.0.2.10", 502, 1)
+        .with_flow_control(ModbusTcpFlowControl::serial_gateway())
+        .connect()
+        .await?;
+
+    // A derived handle sharing the same connection, for a whole control path.
+    let control = polling.with_priority(Priority::High);
+    control.write_single_register(1034, 500).await?;
+
+    // A single request with its own priority and a short queue timeout.
+    polling
+        .request(&ModbusRequest::WriteSingleCoil { address: 0, value: false })
+        .priority(Priority::Urgent)
+        .queue_timeout(Duration::from_millis(200))
+        .send()
+        .await?;
+
+    // Lock-free snapshot for monitoring the backlog.
+    let normal = polling.queue_stats().normal;
+    println!("queued={} avg_wait={:?}", normal.queued, normal.avg_queue_wait);
+    Ok(())
+}
+```
+
+Priorities only reorder requests that are not on the wire yet, so they work best with a small
+`max_in_flight` such as `serial_gateway()`. Ordering is strict: lower levels wait while higher
+ones keep arriving, bounded by their queue timeout. Priorities reduce latency; they are not a
+safety function, and an emergency stop must not depend on Modbus.
 
 By default, transient TCP connect/write/read/queue failures and gateway-busy exception responses
 (`0x05`, `0x06`, `0x0A`, `0x0B`) are retried with exponential backoff starting at 500 ms,

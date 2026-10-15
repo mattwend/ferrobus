@@ -15,11 +15,16 @@ pub struct ModbusTcpFlowControl {
     pub max_in_flight: usize,
     /// Maximum number of admitted-but-not-yet-on-wire requests buffered in the actor.
     ///
-    /// This value is used as the actual bounded `mpsc` request-channel capacity. The default is
-    /// `COMMAND_CHANNEL_CAPACITY`, keeping the documented queue depth and channel capacity tied
-    /// to one constant.
+    /// This is the capacity of the priority-ordered request queue, shared by all
+    /// [`Priority`](crate::tcp::Priority) levels. When it is full, callers park until a slot
+    /// frees, and freed slots go to the highest parked level first. The default is
+    /// `COMMAND_CHANNEL_CAPACITY`.
     pub max_queue_depth: usize,
     /// Maximum time a request may wait between submission and reaching the wire.
+    ///
+    /// This covers both waiting for admission to a full queue and waiting in the queue.
+    /// [`RequestBuilder::queue_timeout`](crate::tcp::RequestBuilder::queue_timeout) overrides
+    /// it per request.
     pub queue_timeout: Duration,
     /// Time a timed-out/cancelled transaction id remains reserved.
     ///

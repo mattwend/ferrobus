@@ -7,8 +7,9 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
 use crate::error::ModbusError;
-use crate::tcp::actor::{Actor, RequestCommand, control_channel_capacity};
+use crate::tcp::actor::{Actor, control_channel_capacity};
 use crate::tcp::flow::ModbusTcpFlowControl;
+use crate::tcp::queue::request_queue;
 use crate::tcp::retry::ModbusTcpRetry;
 use crate::tcp::status::ConnectionStatus;
 use crate::tcp::tcp_connection::ModbusTcpConnection;
@@ -198,7 +199,7 @@ impl ModbusTcpSocket {
     }
 
     pub(crate) fn spawn_actor(self) -> (ModbusTcpConnection, JoinHandle<()>) {
-        let (req_tx, req_rx) = mpsc::channel::<RequestCommand>(self.flow_control.max_queue_depth);
+        let (req_tx, req_rx) = request_queue(self.flow_control.max_queue_depth);
         let (ctrl_tx, ctrl_rx) = mpsc::channel(control_channel_capacity());
         let (connected_tx, connected) = watch::channel(ConnectionStatus::disconnected());
         let actor = Actor::new(

@@ -14,6 +14,8 @@ use tracing::debug;
 
 use crate::tcp::actor::{ControlCommand, RequestCommand};
 use crate::tcp::frame::MBAP_HEADER_LEN;
+use crate::tcp::queue::{Priority, QueueStats, RequestSender};
+use crate::tcp::request_builder::RequestBuilder;
 use crate::tcp::retry::{ModbusTcpRetry, retry_transient};
 #[cfg(test)]
 use crate::tcp::socket::ModbusTcpSocket;
@@ -45,11 +47,12 @@ use crate::{ModbusRequest, ModbusResponse, error::ModbusError};
 ///
 /// Clones are lightweight command senders to a single background actor that owns
 /// the TCP socket, pending response map, and transaction-id counter. The actor
-/// applies bounded in-flight flow control and uses a bounded request channel as
-/// backpressure. Queue wait is bounded by flow-control settings; response timeout
-/// starts when the actor writes the request on the socket. Use
-/// [`Self::with_unit_id`] to derive another live handle that shares the same actor
-/// with a different default unit id.
+/// applies bounded in-flight flow control and uses a bounded, priority-ordered
+/// request queue as backpressure. Queue wait is bounded by flow-control settings;
+/// response timeout starts when the actor writes the request on the socket. Use
+/// [`Self::with_unit_id`] or [`Self::with_priority`] to derive another live handle
+/// that shares the same actor with a different default unit id or [`Priority`],
+/// and [`Self::request`] to override either for a single request.
 ///
 /// Reconnection is on-demand, not a background loop. Any read/write/EOF failure
 /// tears the socket down, and the next request to reach the actor opens a fresh
@@ -69,9 +72,10 @@ use crate::{ModbusRequest, ModbusResponse, error::ModbusError};
 /// socket currently in use.
 #[derive(Clone, Debug)]
 pub struct ModbusTcpConnection {
-    req_tx: mpsc::Sender<RequestCommand>,
+    req_tx: RequestSender,
     ctrl_tx: mpsc::Sender<ControlCommand>,
     unit_id: u8,
+    priority: Priority,
     connected: watch::Receiver<ConnectionStatus>,
     queue_timeout: Duration,
     retry: Option<ModbusTcpRetry>,
@@ -79,7 +83,7 @@ pub struct ModbusTcpConnection {
 
 impl ModbusTcpConnection {
     pub(crate) fn from_actor_parts(
-        req_tx: mpsc::Sender<RequestCommand>,
+        req_tx: RequestSender,
         ctrl_tx: mpsc::Sender<ControlCommand>,
         unit_id: u8,
         connected: watch::Receiver<ConnectionStatus>,
@@ -90,6 +94,7 @@ impl ModbusTcpConnection {
             req_tx,
             ctrl_tx,
             unit_id,
+            priority: Priority::default(),
             connected,
             queue_timeout,
             retry,
@@ -99,17 +104,125 @@ impl ModbusTcpConnection {
     /// Returns a new handle with a different default unit id.
     ///
     /// The returned handle shares the same background actor, TCP session,
-    /// in-flight request window, and retry policy. It does not spawn another
-    /// actor or open another TCP connection.
+    /// request queue, in-flight request window, retry policy, and default
+    /// priority. It does not spawn another actor or open another TCP connection.
     #[must_use]
     pub fn with_unit_id(&self, unit_id: u8) -> Self {
         Self {
-            req_tx: self.req_tx.clone(),
-            ctrl_tx: self.ctrl_tx.clone(),
             unit_id,
-            connected: self.connected.clone(),
+            ..self.clone()
+        }
+    }
+
+    /// Returns a new handle with a different default [`Priority`].
+    ///
+    /// Every request sent through the returned handle, including the existing
+    /// methods such as [`Self::send_message`] and
+    /// [`Self::write_single_register`], is queued at `priority`. The handle this
+    /// is called on keeps its own priority. Both share the same background actor,
+    /// TCP session, request queue, in-flight request window, retry policy, and
+    /// default unit id, so this is how one shared connection serves a control
+    /// path at a higher level than a polling path.
+    ///
+    /// Handles start at [`Priority::Normal`]. Use [`Self::request`] to override the
+    /// priority of a single request.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use ferrobus::tcp::{ModbusTcpSocket, Priority};
+    ///
+    /// # async fn run() -> Result<(), ferrobus::ModbusError> {
+    /// let polling = ModbusTcpSocket::new("127.0.0.1", 502, 1).connect().await?;
+    /// let control = polling.with_priority(Priority::High);
+    ///
+    /// // Overtakes any polling requests still waiting in the shared queue.
+    /// control.write_single_register(1034, 500).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn with_priority(&self, priority: Priority) -> Self {
+        Self {
+            priority,
+            ..self.clone()
+        }
+    }
+
+    /// Returns the default [`Priority`] of requests sent through this handle.
+    #[must_use]
+    pub fn priority(&self) -> Priority {
+        self.priority
+    }
+
+    /// Returns a statistics snapshot of the request queue shared by this
+    /// handle's actor.
+    ///
+    /// Reading the statistics is lock-free and does not involve the actor, so it
+    /// stays cheap and responsive while the bus is congested. See [`QueueStats`]
+    /// and [`LevelStats`](crate::tcp::LevelStats) for the fields and for the
+    /// signals of a growing or stalled queue.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use std::time::Duration;
+    ///
+    /// use ferrobus::tcp::{ModbusTcpSocket, Priority};
+    ///
+    /// # async fn run() -> Result<(), ferrobus::ModbusError> {
+    /// let connection = ModbusTcpSocket::new("127.0.0.1", 502, 1).connect().await?;
+    ///
+    /// let stats = connection.queue_stats();
+    /// let normal = stats.level(Priority::Normal);
+    /// if normal.avg_queue_wait > Some(Duration::from_secs(1)) {
+    ///     // Back off: poll less often or drop low-value reads.
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn queue_stats(&self) -> QueueStats {
+        self.req_tx.stats()
+    }
+
+    /// Starts building a single request with per-request options.
+    ///
+    /// The builder defaults to this handle's unit id, [`Priority`], and queue
+    /// timeout; each can be overridden before [`RequestBuilder::send`]. The
+    /// response is validated exactly like [`Self::send_message`].
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use std::time::Duration;
+    ///
+    /// use ferrobus::ModbusRequest;
+    /// use ferrobus::tcp::{ModbusTcpSocket, Priority};
+    ///
+    /// # async fn run() -> Result<(), ferrobus::ModbusError> {
+    /// let connection = ModbusTcpSocket::new("127.0.0.1", 502, 1).connect().await?;
+    ///
+    /// let response = connection
+    ///     .request(&ModbusRequest::WriteSingleCoil { address: 0, value: false })
+    ///     .priority(Priority::Urgent)
+    ///     .queue_timeout(Duration::from_millis(200))
+    ///     .send()
+    ///     .await?;
+    /// # let _ = response;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn request<'a>(&'a self, pdu: &'a ModbusRequest) -> RequestBuilder<'a> {
+        RequestBuilder::new(self, pdu, self.options(self.unit_id))
+    }
+
+    /// Returns this handle's default send options for `unit_id`.
+    pub(crate) fn options(&self, unit_id: u8) -> SendOptions {
+        SendOptions {
+            unit_id,
+            priority: self.priority,
             queue_timeout: self.queue_timeout,
-            retry: self.retry,
         }
     }
 
@@ -271,20 +384,23 @@ impl ModbusTcpConnection {
 
     async fn send_once(
         &self,
-        unit_id: u8,
+        options: SendOptions,
         pdu: &ModbusRequest,
     ) -> Result<ModbusResponse, ModbusError> {
+        let SendOptions {
+            unit_id,
+            priority,
+            queue_timeout,
+        } = options;
         let (reply, response) = oneshot::channel();
         let command = RequestCommand {
             unit_id,
             pdu: pdu.clone(),
             reply,
-            queue_deadline: tokio::time::Instant::now() + self.queue_timeout,
+            queue_deadline: tokio::time::Instant::now() + queue_timeout,
+            priority,
         };
-        self.req_tx
-            .send(command)
-            .await
-            .map_err(|_| actor_terminated_error())?;
+        self.req_tx.send(command).await?;
 
         let response_buffer = match response.await {
             Ok(Ok(frame)) => frame,
@@ -432,8 +548,20 @@ impl ModbusTcpConnection {
         unit_id: u8,
         pdu: &ModbusRequest,
     ) -> Result<ModbusResponse, ModbusError> {
+        self.send_with_options(self.options(unit_id), pdu).await
+    }
+
+    /// Sends one request with explicit options, applying the handle's retry policy.
+    ///
+    /// Every retry attempt is queued again at the same priority with a fresh queue
+    /// deadline.
+    pub(crate) async fn send_with_options(
+        &self,
+        options: SendOptions,
+        pdu: &ModbusRequest,
+    ) -> Result<ModbusResponse, ModbusError> {
         match self.retry {
-            None => self.send_once(unit_id, pdu).await,
+            None => self.send_once(options, pdu).await,
             Some(retry) => {
                 let connection = self.clone();
                 let pdu = pdu.clone();
@@ -441,7 +569,7 @@ impl ModbusTcpConnection {
                     || {
                         let connection = connection.clone();
                         let pdu = pdu.clone();
-                        async move { connection.send_once(unit_id, &pdu).await }
+                        async move { connection.send_once(options, &pdu).await }
                     },
                     retry,
                 )
@@ -449,6 +577,14 @@ impl ModbusTcpConnection {
             }
         }
     }
+}
+
+/// Per-request options resolved from the handle defaults and builder overrides.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SendOptions {
+    pub(crate) unit_id: u8,
+    pub(crate) priority: Priority,
+    pub(crate) queue_timeout: Duration,
 }
 
 fn unexpected_response(operation: &str, response: &ModbusResponse) -> ModbusError {
@@ -468,6 +604,7 @@ pub(crate) fn actor_terminated_error() -> ModbusError {
 #[allow(clippy::panic, clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::tcp::queue::request_queue;
     use crate::tcp::test_support::accept_and_hold_server;
     use tokio::net::TcpListener;
 
@@ -567,7 +704,7 @@ mod tests {
 
     #[tokio::test]
     async fn with_unit_id_keeps_retry_policy_and_overrides_unit() {
-        let (req_tx, _req_rx) = mpsc::channel(1);
+        let (req_tx, _req_rx) = request_queue(1);
         let (ctrl_tx, _ctrl_rx) = mpsc::channel(1);
         let (_connected_tx, connected) = watch::channel(ConnectionStatus::disconnected());
         let connection = ModbusTcpConnection::from_actor_parts(
@@ -583,14 +720,16 @@ mod tests {
         assert_eq!(child.unit_id, 7);
     }
 
+    /// A sender parked on a full request queue waits for a slot, but only until its
+    /// queue deadline: the parked time counts against the queue timeout.
     #[tokio::test]
-    async fn send_once_backpressures_on_full_request_channel() {
-        let (req_tx, _req_rx) = mpsc::channel(1);
+    async fn send_once_backpressures_on_full_request_queue_until_queue_timeout() {
+        let (req_tx, _req_rx) = request_queue(1);
         let (ctrl_tx, _ctrl_rx) = mpsc::channel(1);
         let (_connected_tx, connected) = watch::channel(ConnectionStatus::disconnected());
         let (reply, _response) = oneshot::channel();
         req_tx
-            .try_send(RequestCommand {
+            .send(RequestCommand {
                 unit_id: 1,
                 pdu: ModbusRequest::ReadHoldingRegisters {
                     starting_address: 0,
@@ -598,34 +737,108 @@ mod tests {
                 },
                 reply,
                 queue_deadline: tokio::time::Instant::now() + Duration::from_secs(1),
+                priority: Priority::Normal,
             })
+            .await
             .unwrap();
         let connection = ModbusTcpConnection::from_actor_parts(
             req_tx,
             ctrl_tx,
             1,
             connected,
-            Duration::from_millis(10),
+            Duration::from_millis(50),
             None,
         );
+        let request = ModbusRequest::ReadHoldingRegisters {
+            starting_address: 0,
+            quantity: 1,
+        };
 
-        let result = timeout(
+        let parked = timeout(
             Duration::from_millis(10),
-            connection.send_once(
-                1,
-                &ModbusRequest::ReadHoldingRegisters {
-                    starting_address: 0,
-                    quantity: 1,
-                },
-            ),
+            connection.send_once(connection.options(1), &request),
         )
         .await;
+        assert!(parked.is_err(), "a full queue must park the sender");
 
-        assert!(result.is_err());
+        let result = timeout(
+            Duration::from_secs(1),
+            connection.send_once(connection.options(1), &request),
+        )
+        .await
+        .expect("the queue timeout must release a parked sender");
+        assert!(matches!(result, Err(ModbusError::QueueTimeout)));
+        assert_eq!(connection.queue_stats().normal.expired_total, 1);
+    }
+
+    /// `with_priority` derives a handle with its own default priority while the
+    /// original keeps `Normal`; `with_unit_id` preserves the priority.
+    #[tokio::test]
+    async fn with_priority_derives_handle_and_survives_unit_override() {
+        let connection = handle_with_dead_actor();
+
+        let control = connection.with_priority(Priority::High);
+        let sibling = control.with_unit_id(9);
+
+        assert_eq!(connection.priority(), Priority::Normal);
+        assert_eq!(control.priority(), Priority::High);
+        assert_eq!(sibling.priority(), Priority::High);
+        assert_eq!(sibling.unit_id, 9);
+    }
+
+    /// Existing methods queue at the handle's priority; the builder overrides
+    /// priority, unit id, and queue timeout for a single request only.
+    #[tokio::test]
+    async fn request_builder_overrides_handle_defaults() {
+        let (req_tx, mut req_rx) = request_queue(4);
+        let (ctrl_tx, _ctrl_rx) = mpsc::channel(1);
+        let (_connected_tx, connected) = watch::channel(ConnectionStatus::disconnected());
+        let connection = ModbusTcpConnection::from_actor_parts(
+            req_tx,
+            ctrl_tx,
+            1,
+            connected,
+            Duration::from_secs(5),
+            None,
+        )
+        .with_priority(Priority::High);
+        let request = ModbusRequest::ReadHoldingRegisters {
+            starting_address: 0,
+            quantity: 1,
+        };
+
+        let default_send = connection.send_message(&request);
+        let builder_send = connection
+            .request(&request)
+            .priority(Priority::Urgent)
+            .unit_id(7)
+            .queue_timeout(Duration::from_millis(100))
+            .send();
+        let observe = async {
+            let mut seen = Vec::new();
+            for _ in 0..2 {
+                let command = req_rx.recv().await.unwrap();
+                let remaining = command
+                    .queue_deadline
+                    .saturating_duration_since(tokio::time::Instant::now());
+                seen.push((command.priority, command.unit_id, remaining));
+                drop(command.reply);
+            }
+            seen
+        };
+        let (_, _, mut seen) = tokio::join!(default_send, builder_send, observe);
+        seen.sort_by_key(|(priority, _, _)| *priority);
+
+        assert_eq!(seen[0].0, Priority::High);
+        assert_eq!(seen[0].1, 1);
+        assert!(seen[0].2 > Duration::from_secs(1));
+        assert_eq!(seen[1].0, Priority::Urgent);
+        assert_eq!(seen[1].1, 7);
+        assert!(seen[1].2 <= Duration::from_millis(100));
     }
 
     fn handle_with_dead_actor() -> ModbusTcpConnection {
-        let (req_tx, req_rx) = mpsc::channel(1);
+        let (req_tx, req_rx) = request_queue(1);
         let (ctrl_tx, ctrl_rx) = mpsc::channel(1);
         let (_connected_tx, connected) = watch::channel(ConnectionStatus::disconnected());
         drop(req_rx);
@@ -659,7 +872,7 @@ mod tests {
 
         let result = connection
             .send_once(
-                1,
+                connection.options(1),
                 &ModbusRequest::ReadHoldingRegisters {
                     starting_address: 0,
                     quantity: 1,
@@ -677,7 +890,7 @@ mod tests {
     /// public disconnect call must return after logging the terminated actor.
     #[tokio::test]
     async fn disconnect_returns_when_actor_drops_ack() {
-        let (req_tx, _req_rx) = mpsc::channel(1);
+        let (req_tx, _req_rx) = request_queue(1);
         let (ctrl_tx, mut ctrl_rx) = mpsc::channel(1);
         let (_connected_tx, connected) = watch::channel(ConnectionStatus::disconnected());
         let connection = ModbusTcpConnection::from_actor_parts(
@@ -701,7 +914,7 @@ mod tests {
     /// a terminated-actor transport error.
     #[tokio::test]
     async fn send_once_reports_dropped_response_waiter() {
-        let (req_tx, mut req_rx) = mpsc::channel(1);
+        let (req_tx, mut req_rx) = request_queue(1);
         let (ctrl_tx, _ctrl_rx) = mpsc::channel(1);
         let (_connected_tx, connected) = watch::channel(ConnectionStatus::disconnected());
         let connection = ModbusTcpConnection::from_actor_parts(
@@ -720,7 +933,7 @@ mod tests {
 
         let result = connection
             .send_once(
-                1,
+                connection.options(1),
                 &ModbusRequest::ReadHoldingRegisters {
                     starting_address: 0,
                     quantity: 1,
@@ -736,7 +949,7 @@ mod tests {
 
     #[tokio::test]
     async fn send_once_rejects_short_frame_before_header_indexing() {
-        let (req_tx, mut req_rx) = mpsc::channel(1);
+        let (req_tx, mut req_rx) = request_queue(1);
         let (ctrl_tx, _ctrl_rx) = mpsc::channel(1);
         let (_connected_tx, connected) = watch::channel(ConnectionStatus::disconnected());
         let connection = ModbusTcpConnection::from_actor_parts(
@@ -755,7 +968,7 @@ mod tests {
 
         let result = connection
             .send_once(
-                1,
+                connection.options(1),
                 &ModbusRequest::ReadHoldingRegisters {
                     starting_address: 0,
                     quantity: 1,
@@ -913,7 +1126,7 @@ mod tests {
     /// see a terminated-actor error rather than waiting forever.
     #[tokio::test]
     async fn handle_connect_reports_dropped_ack() {
-        let (req_tx, _req_rx) = mpsc::channel(1);
+        let (req_tx, _req_rx) = request_queue(1);
         let (ctrl_tx, mut ctrl_rx) = mpsc::channel(1);
         let (_connected_tx, connected) = watch::channel(ConnectionStatus::disconnected());
         let connection = ModbusTcpConnection::from_actor_parts(

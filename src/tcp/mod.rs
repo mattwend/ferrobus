@@ -23,12 +23,20 @@
 //! [`ModbusTcpConnection::status`] or
 //! [`ModbusTcpConnection::watch_status`] — reports whether a socket is open and
 //! how many sockets this actor has established.
+//!
+//! Requests wait in a bounded queue with three [`Priority`] levels before the
+//! actor writes them. Existing request methods use the handle's default
+//! priority, which [`ModbusTcpConnection::with_priority`] changes for a derived
+//! handle; [`ModbusTcpConnection::request`] sets it per request. Queue health is
+//! observable through [`ModbusTcpConnection::queue_stats`].
 
 mod actor;
 mod adu;
 mod codec;
 mod flow;
 mod frame;
+mod queue;
+mod request_builder;
 mod retry;
 mod socket;
 mod status;
@@ -38,6 +46,8 @@ mod timeouts;
 
 mod tcp_connection;
 pub use flow::ModbusTcpFlowControl;
+pub use queue::{LevelStats, Priority, QueueStats};
+pub use request_builder::RequestBuilder;
 pub use retry::ModbusTcpRetry;
 pub use socket::ModbusTcpSocket;
 pub use status::ConnectionStatus;

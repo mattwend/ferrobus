@@ -17,6 +17,7 @@ use tracing::{debug, trace, warn};
 use crate::tcp::adu::build_modbus_tcp_adu;
 use crate::tcp::codec::{MbapCodec, MbapCodecError};
 use crate::tcp::flow::ModbusTcpFlowControl;
+use crate::tcp::queue::{Priority, RequestReceiver};
 use crate::tcp::status::ConnectionStatus;
 use crate::tcp::tcp_connection::ModbusTcpConnection;
 use crate::tcp::timeouts::ModbusTcpTimeouts;
@@ -47,6 +48,8 @@ pub(crate) struct RequestCommand {
     pub(crate) reply: oneshot::Sender<Result<Vec<u8>, ModbusError>>,
     /// Absolute queue deadline anchored when the handle submits the request.
     pub(crate) queue_deadline: Instant,
+    /// Queue level the request is scheduled at.
+    pub(crate) priority: Priority,
 }
 
 /// Small control-channel capacity used by connection handles.
@@ -70,7 +73,7 @@ pub(crate) struct Actor {
     timeouts: ModbusTcpTimeouts,
     flow: ModbusTcpFlowControl,
     ctrl_rx: mpsc::Receiver<ControlCommand>,
-    req_rx: mpsc::Receiver<RequestCommand>,
+    req_rx: RequestReceiver,
     connected_tx: watch::Sender<ConnectionStatus>,
     framed: Option<Framed<TcpStream, MbapCodec>>,
     pending: HashMap<u16, PendingEntry>,
@@ -91,7 +94,7 @@ impl Actor {
         flow: ModbusTcpFlowControl,
         transaction_id: u16,
         ctrl_rx: mpsc::Receiver<ControlCommand>,
-        req_rx: mpsc::Receiver<RequestCommand>,
+        req_rx: RequestReceiver,
         connected_tx: watch::Sender<ConnectionStatus>,
     ) -> Self {
         Self {
@@ -134,7 +137,7 @@ impl Actor {
                         notify_waiter(ack, ());
                     }
                 },
-                req = self.req_rx.recv(), if window_has_room => match req {
+                req = self.req_rx.recv_when(window_has_room), if !self.req_closed => match req {
                     None => self.req_closed = true,
                     Some(cmd) => self.dispatch(cmd).await,
                 },
@@ -205,10 +208,11 @@ impl Actor {
     async fn dispatch(&mut self, cmd: RequestCommand) {
         if cmd.reply.is_closed() {
             trace!("discarding queued request whose caller stopped waiting");
+            self.req_rx.record_abandoned(cmd.priority);
             return;
         }
         if cmd.queue_deadline <= Instant::now() {
-            notify_waiter(cmd.reply, Err(ModbusError::QueueTimeout));
+            self.expire(cmd);
             return;
         }
         if self.framed.is_none() {
@@ -218,11 +222,17 @@ impl Actor {
                 return;
             }
             if cmd.queue_deadline <= Instant::now() {
-                notify_waiter(cmd.reply, Err(ModbusError::QueueTimeout));
+                self.expire(cmd);
                 return;
             }
         }
         self.write_on_wire(cmd).await;
+    }
+
+    /// Fails a dequeued request whose queue deadline has passed.
+    fn expire(&self, cmd: RequestCommand) {
+        self.req_rx.record_expired(cmd.priority);
+        notify_waiter(cmd.reply, Err(ModbusError::QueueTimeout));
     }
 
     /// Serializes one request and puts it on the socket.
@@ -233,6 +243,7 @@ impl Actor {
     async fn write_on_wire(&mut self, cmd: RequestCommand) {
         if cmd.reply.is_closed() {
             trace!("discarding request whose caller stopped waiting before the write");
+            self.req_rx.record_abandoned(cmd.priority);
             return;
         }
         let tid = match self.allocate_tid() {
@@ -283,10 +294,10 @@ impl Actor {
         }
     }
 
-    /// Fails every request currently buffered in the command channel with `error`.
+    /// Fails every request currently buffered in the request queue with `error`.
     ///
     /// A single `try_recv` pass is deliberate. A sender that was parked on a full
-    /// channel at failure time deposits its request once this drain frees capacity, and
+    /// queue at failure time deposits its request once this drain frees capacity, and
     /// the `run` loop re-dispatches it on the next iteration — where it is either failed
     /// by a fresh (still-failing) connect attempt or short-circuited by its elapsed
     /// queue deadline. In the worst case, that straggler can observe one additional
@@ -294,7 +305,7 @@ impl Actor {
     /// servicing control commands and pending-response deadlines, and could not fail
     /// parked senders deterministically anyway (their wake ordering is runtime-defined).
     fn fail_backlog(&mut self, error: &ModbusError) {
-        while let Ok(cmd) = self.req_rx.try_recv() {
+        while let Some(cmd) = self.req_rx.try_recv() {
             notify_waiter(cmd.reply, Err(error.clone()));
         }
     }
@@ -438,11 +449,12 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::*;
+    use crate::tcp::queue::request_queue;
     use crate::tcp::test_support::{accept_and_hold_server, dead_server_addr};
 
     fn actor_with_seed(seed: u16) -> Actor {
         let (_ctrl_tx, ctrl_rx) = mpsc::channel(1);
-        let (_req_tx, req_rx) = mpsc::channel(1);
+        let (_req_tx, req_rx) = request_queue(1);
         let (connected_tx, _connected_rx) = watch::channel(ConnectionStatus::disconnected());
         Actor::new(
             "127.0.0.1".to_string(),
@@ -578,7 +590,7 @@ mod tests {
     #[tokio::test]
     async fn fail_backlog_drains_queued_requests_after_connect_failure() {
         let (_ctrl_tx, ctrl_rx) = mpsc::channel(1);
-        let (req_tx, req_rx) = mpsc::channel(2);
+        let (req_tx, req_rx) = request_queue(2);
         let (connected_tx, _connected_rx) = watch::channel(ConnectionStatus::disconnected());
         let mut actor = Actor::new(
             "127.0.0.1".to_string(),
@@ -602,6 +614,7 @@ mod tests {
                 pdu: read_holding_registers(1),
                 reply: first_reply,
                 queue_deadline: Instant::now() + Duration::from_secs(1),
+                priority: Priority::Normal,
             })
             .await
             .unwrap();
@@ -611,6 +624,7 @@ mod tests {
                 pdu: read_holding_registers(1),
                 reply: second_reply,
                 queue_deadline: Instant::now() + Duration::from_secs(1),
+                priority: Priority::Normal,
             })
             .await
             .unwrap();
@@ -640,7 +654,7 @@ mod tests {
         drop(listener);
 
         let (ctrl_tx, ctrl_rx) = mpsc::channel(1);
-        let (req_tx, req_rx) = mpsc::channel(2);
+        let (req_tx, req_rx) = request_queue(2);
         let (connected_tx, _connected_rx) = watch::channel(ConnectionStatus::disconnected());
         let actor = Actor::new(
             dead_addr.ip().to_string(),
@@ -670,6 +684,7 @@ mod tests {
                     pdu: read_holding_registers(1),
                     reply,
                     queue_deadline: Instant::now() + Duration::from_secs(5),
+                    priority: Priority::Normal,
                 })
                 .await
                 .unwrap();
@@ -731,6 +746,7 @@ mod tests {
             pdu: read_holding_registers(quantity),
             reply,
             queue_deadline,
+            priority: Priority::Normal,
         }
     }
 
@@ -826,7 +842,7 @@ mod tests {
             std::future::pending::<()>().await;
         });
         let (_ctrl_tx, ctrl_rx) = mpsc::channel(1);
-        let (_req_tx, req_rx) = mpsc::channel(1);
+        let (_req_tx, req_rx) = request_queue(1);
         let (connected_tx, connected_rx) = watch::channel(ConnectionStatus::disconnected());
         drop(connected_rx);
         let mut actor = Actor::new(
@@ -1105,7 +1121,7 @@ mod tests {
         stream: TcpStream,
     ) -> (Actor, watch::Receiver<ConnectionStatus>) {
         let (_ctrl_tx, ctrl_rx) = mpsc::channel(1);
-        let (_req_tx, req_rx) = mpsc::channel(1);
+        let (_req_tx, req_rx) = request_queue(1);
         let (connected_tx, connected_rx) = watch::channel(ConnectionStatus {
             connected: true,
             generation: 1,
@@ -1131,7 +1147,7 @@ mod tests {
 
     fn actor_for_addr(addr: std::net::SocketAddr) -> (Actor, watch::Receiver<ConnectionStatus>) {
         let (_ctrl_tx, ctrl_rx) = mpsc::channel(1);
-        let (_req_tx, req_rx) = mpsc::channel(1);
+        let (_req_tx, req_rx) = request_queue(1);
         let (connected_tx, connected_rx) = watch::channel(ConnectionStatus::disconnected());
         let actor = Actor::new(
             addr.ip().to_string(),
