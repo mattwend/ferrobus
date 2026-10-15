@@ -35,8 +35,24 @@ While the crate is below `1.0.0`, breaking changes are released in minor version
   peer is reachable. It validates, spawns the actor, and returns without
   resolving the host or dialing; the returned handle reports
   `{ connected: false, generation: 0 }`.
+- Request priorities: `tcp::Priority` with `Normal` (default), `High`, and
+  `Urgent`. The request queue dispatches the oldest request of the highest
+  non-empty level, and when it is full, freed slots go to the highest parked
+  level first. `ModbusTcpConnection::with_priority` derives a handle sharing the
+  same connection with a different default priority; all existing request
+  methods keep their signatures and use the handle's priority.
+- `ModbusTcpConnection::request` returning a `tcp::RequestBuilder` to set the
+  priority, unit id, and queue timeout of a single request.
+- `ModbusTcpConnection::queue_stats` returning a lock-free `tcp::QueueStats`
+  snapshot with per-level `tcp::LevelStats`: queued and parked gauges,
+  enqueued/dequeued/expired/abandoned counters, last and average queue wait, and
+  the time since the last dequeue.
 
 ### Changed
+
+- The request queue is now a lock-free bucket queue with one FIFO lane per
+  priority level, replacing the single bounded `mpsc` channel.
+  `max_queue_depth` still bounds the total across all levels.
 
 - **Breaking:** `ModbusTcpSocket` is now the only entry point for constructing a
   `ModbusTcpConnection`. Replace `ModbusTcpConnection::connect(host, port, unit_id).await`
@@ -52,6 +68,10 @@ While the crate is below `1.0.0`, breaking changes are released in minor version
   never part of a release; construct through `ModbusTcpSocket` instead.
 
 ### Fixed
+
+- Time a caller spends parked on a full request queue now counts against its
+  queue timeout. Previously a parked caller could wait without bound and only
+  learned of the timeout once its request reached the actor.
 
 - Reject malformed padding in Modbus responses instead of accepting the frame.
 - Queued requests whose caller stopped waiting (dropped future, elapsed caller

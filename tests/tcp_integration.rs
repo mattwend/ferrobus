@@ -5,6 +5,7 @@
     missing_docs,
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
+    clippy::expect_used,
     clippy::panic,
     clippy::uninlined_format_args,
     clippy::unwrap_used
@@ -23,7 +24,7 @@ mod support;
 use ferrobus::ModbusError;
 use ferrobus::tcp::{
     ConnectionStatus, ModbusTcpConnection, ModbusTcpFlowControl, ModbusTcpRetry, ModbusTcpSocket,
-    ModbusTcpTimeouts,
+    ModbusTcpTimeouts, Priority,
 };
 use ferrobus::{ModbusRequest, ModbusResponse};
 
@@ -1314,4 +1315,172 @@ async fn socket_connect_reports_connect_failure() {
         error,
         ModbusError::ConnectError(_) | ModbusError::ConnectTimeout
     ));
+}
+
+/// Queue expiration must run while a serial gateway's in-flight slot is occupied,
+/// and an expired register write must never reach the device later.
+#[tokio::test]
+async fn queued_write_expires_before_the_in_flight_request_completes() {
+    let (on_wire_tx, on_wire_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+    let addr = spawn_mock_server(move |mut stream| async move {
+        let first = read_request_frame(&mut stream).await.unwrap();
+        on_wire_tx.send(()).unwrap();
+        release_rx.await.unwrap();
+        stream
+            .write_all(&build_tcp_response_frame(
+                first.transaction_id,
+                first.unit_id,
+                &first.pdu,
+            ))
+            .await
+            .unwrap();
+        let next = read_request_frame(&mut stream).await.unwrap();
+        assert_eq!(
+            next.pdu,
+            [6, 0, 2, 0, 2],
+            "the expired write must be skipped"
+        );
+        stream
+            .write_all(&build_tcp_response_frame(
+                next.transaction_id,
+                next.unit_id,
+                &next.pdu,
+            ))
+            .await
+            .unwrap();
+        done_tx.send(()).unwrap();
+    })
+    .await;
+    let connection = ModbusTcpSocket::new(addr.ip().to_string(), addr.port(), 1)
+        .with_flow_control(ModbusTcpFlowControl::serial_gateway())
+        .with_retry(None)
+        .connect()
+        .await
+        .unwrap();
+    let expired = ModbusRequest::WriteSingleRegister {
+        address: 1,
+        value: 1,
+    };
+    tokio::time::timeout(Duration::from_secs(1), async {
+        let (blocker, ()) = tokio::join!(connection.write_single_register(0, 0), async {
+            on_wire_rx.await.unwrap();
+            let result = connection
+                .request(&expired)
+                .queue_timeout(Duration::from_millis(10))
+                .send()
+                .await;
+            assert!(matches!(result, Err(ModbusError::QueueTimeout)));
+            assert_eq!(connection.queue_stats().normal.expired_total, 1);
+            assert_eq!(connection.queue_stats().queued, 0);
+            release_tx.send(()).unwrap();
+        });
+        blocker.unwrap();
+        connection.write_single_register(2, 2).await.unwrap();
+        done_rx.await.unwrap();
+    })
+    .await
+    .expect("queue timeout must not wait for the in-flight response");
+}
+
+/// With one request on the wire of a serial gateway, requests queued behind it are
+/// written in priority order — urgent, high, then normal in submission order — while
+/// the handle's own default priority and per-request overrides are honoured, and the
+/// queue statistics reflect the backlog.
+#[tokio::test]
+async fn queued_requests_are_written_in_priority_order() {
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+    let (order_tx, order_rx) = tokio::sync::oneshot::channel::<Vec<u16>>();
+    let (on_wire_tx, on_wire_rx) = tokio::sync::watch::channel(false);
+    let addr = spawn_mock_server(move |mut stream| async move {
+        let mut order = Vec::new();
+        let mut release = Some(release_rx);
+        for _ in 0..5 {
+            let request = read_request_frame(&mut stream).await.unwrap();
+            order.push(u16::from_be_bytes([request.pdu[1], request.pdu[2]]));
+            // Hold the first response until every other request is queued.
+            if let Some(release) = release.take() {
+                on_wire_tx.send(true).unwrap();
+                release.await.unwrap();
+            }
+            let response = build_tcp_response_frame(
+                request.transaction_id,
+                request.unit_id,
+                &[0x03, 0x02, 0x00, 0x00],
+            );
+            stream.write_all(&response).await.unwrap();
+        }
+        order_tx.send(order).unwrap();
+    })
+    .await;
+    let connection = ModbusTcpSocket::new(addr.ip().to_string(), addr.port(), 1)
+        .with_flow_control(ModbusTcpFlowControl::serial_gateway())
+        .connect()
+        .await
+        .unwrap();
+    let control = connection.with_priority(Priority::High);
+    let read = |address| ModbusRequest::ReadHoldingRegisters {
+        starting_address: address,
+        quantity: 1,
+    };
+    let (blocker, normal_a, high, normal_b, urgent) =
+        (read(0), read(10), read(20), read(11), read(30));
+    // The other requests are submitted only once the blocker occupies the wire.
+    let on_wire = || {
+        let mut on_wire = on_wire_rx.clone();
+        async move {
+            on_wire.wait_for(|on_wire| *on_wire).await.unwrap();
+        }
+    };
+
+    let all = async {
+        tokio::try_join!(
+            connection.send_message(&blocker),
+            async {
+                on_wire().await;
+                connection.send_message(&normal_a).await
+            },
+            async {
+                on_wire().await;
+                control.send_message(&high).await
+            },
+            async {
+                on_wire().await;
+                connection.send_message(&normal_b).await
+            },
+            async {
+                on_wire().await;
+                connection
+                    .request(&urgent)
+                    .priority(Priority::Urgent)
+                    .send()
+                    .await
+            },
+        )
+    };
+    let release = async {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while connection.queue_stats().queued < 4 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("four requests must queue behind the one on the wire");
+        let stats = connection.queue_stats();
+        assert_eq!(stats.normal.queued, 2);
+        assert_eq!(stats.level(Priority::High).queued, 1);
+        assert_eq!(stats.urgent.queued, 1);
+        release_tx.send(()).unwrap();
+    };
+    let (responses, ()) = tokio::join!(all, release);
+    responses.unwrap();
+
+    assert_eq!(order_rx.await.unwrap(), [0, 30, 20, 10, 11]);
+    let stats = connection.queue_stats();
+    assert_eq!(stats.queued, 0);
+    assert_eq!(stats.normal.dequeued_total, 3);
+    assert_eq!(stats.high.dequeued_total, 1);
+    assert_eq!(stats.urgent.dequeued_total, 1);
+    assert!(stats.urgent.last_queue_wait.is_some());
 }
